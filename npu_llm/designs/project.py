@@ -15,7 +15,7 @@ from aie.utils import config
 
 SRC = Path(__file__).resolve().parents[1] / "kernels/project_w8bf16.cc"
 RMS_SRC = Path(__file__).resolve().parents[1] / "kernels/rmsnorm_bf16.cc"
-ROWS = 32
+DEFAULT_ROWS = 32
 
 
 @iron.jit(aiecc_flags=["--alloc-scheme=basic-sequential"])
@@ -27,7 +27,9 @@ def project(
     *,
     M: CompileTime[int],
     K: CompileTime[int],
+    rows: CompileTime[int] = DEFAULT_ROWS,
 ):
+    ROWS = rows
     w_ty = np.ndarray[(M, K), np.dtype[np.int8]]
     s_ty = np.ndarray[(M,), np.dtype[np.float32]]
     x_ty = np.ndarray[(K,), np.dtype[bfloat16]]
@@ -115,7 +117,9 @@ def norm_project(
     *,
     M: CompileTime[int],
     K: CompileTime[int],
+    rows: CompileTime[int] = DEFAULT_ROWS,
 ):
+    ROWS = rows
     w_ty = np.ndarray[(M, K), np.dtype[np.int8]]
     s_ty = np.ndarray[(M,), np.dtype[np.float32]]
     x_ty = np.ndarray[(K,), np.dtype[bfloat16]]
@@ -213,7 +217,9 @@ def project_residual(
     *,
     M: CompileTime[int],
     K: CompileTime[int],
+    rows: CompileTime[int] = DEFAULT_ROWS,
 ):
+    ROWS = rows
     w_ty = np.ndarray[(M, K), np.dtype[np.int8]]
     s_ty = np.ndarray[(M,), np.dtype[np.float32]]
     x_ty = np.ndarray[(K,), np.dtype[bfloat16]]

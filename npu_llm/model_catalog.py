@@ -1,4 +1,4 @@
-"""Known SmolLM checkpoints compatible with the fixed XDNA1 graph."""
+"""Known checkpoints compatible with the implemented XDNA1 graphs."""
 
 import json
 from pathlib import Path
@@ -19,6 +19,11 @@ MODEL_PRESETS = {
         "repo_id": "HuggingFaceTB/smollm2-135M-SFT-Only",
         "directory": "SmolLM2-135M-SFT-Only-xdna1-w8a16",
         "display_name": "SmolLM2 135M SFT-Only (XDNA1)",
+    },
+    "qwen2.5-0.5b-xdna1": {
+        "repo_id": "Qwen/Qwen2.5-0.5B-Instruct",
+        "directory": "Qwen2.5-0.5B-Instruct-xdna1-w8a16",
+        "display_name": "Qwen2.5 0.5B Instruct (XDNA1 experimental)",
     },
 }
 

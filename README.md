@@ -1,8 +1,9 @@
 # Hawk Point NPU LLM
 
-Run compatible SmolLM 135M transformer checkpoints on the first-generation AMD
-XDNA NPU in Phoenix and Hawk Point Ryzen AI processors. The implementation uses
-MLIR-AIE/IRON and targets the `npu1` AIE2 array directly.
+Run compatible SmolLM 135M and Qwen2.5 0.5B transformer checkpoints on the
+first-generation AMD XDNA NPU in Phoenix and Hawk Point Ryzen AI processors.
+The implementation uses MLIR-AIE/IRON and targets the `npu1` AIE2 array
+directly.
 
 The GPU is not used. The CPU handles tokenization, orchestration, final argmax,
 printing, and reference validation. Decoder projections, RMSNorm, RoPE,
@@ -34,15 +35,20 @@ the sunlight in all directions, including blue light. When sunlight enters
 the Earth's atmosphere,
 ```
 
+The experimental Qwen2.5 0.5B path was also validated against the upstream
+BF16 Transformers checkpoint with a 15-token ChatML prompt. Both runtimes
+selected token `40` (`I`) as the first response token. After the initial
+compile, Qwen prefill ran at about 9.5 seconds per token on the same NPU.
+
 ## What is included
 
 - Interactive, multi-turn terminal chat with `/reset`, `/stats`, and `/exit`
-- Three selectable SmolLM 135M checkpoints
+- Four selectable checkpoints across the SmolLM and Qwen families
 - OpenAI-compatible `GET /v1/models`
 - OpenAI-compatible `POST /v1/chat/completions`
 - Streaming chat completions over server-sent events
 - One-command API or API + Open WebUI launcher
-- SmolLM2 weight converter and hardware acceptance tests
+- Weight converter and hardware component/acceptance tests
 - AIE2 C++ kernels and IRON graph definitions
 
 Conversation history is retained by the client and automatically trimmed to
@@ -55,10 +61,13 @@ the newest tokens that fit the current 64-token hardware context.
 | `smollm2-135m-xdna1` | `HuggingFaceTB/SmolLM2-135M-Instruct` | Default assistant |
 | `smollm-135m-xdna1` | `HuggingFaceTB/SmolLM-135M-Instruct` | Previous-generation assistant |
 | `smollm2-135m-sft-xdna1` | `HuggingFaceTB/smollm2-135M-SFT-Only` | SFT comparison/research |
+| `qwen2.5-0.5b-xdna1` | `Qwen/Qwen2.5-0.5B-Instruct` | Larger experimental assistant |
 
 The converter rejects checkpoints whose hidden size, intermediate size, layer
-count, attention layout, or vocabulary do not match the fixed hardware graph.
-SmolLM2-360M and SmolLM2-1.7B are therefore not silently accepted.
+count, attention layout, or vocabulary do not match one of the implemented
+hardware graphs. A model name alone is not enough: unsupported variants such
+as SmolLM2-360M, SmolLM2-1.7B, or larger Qwen checkpoints are not silently
+accepted.
 
 ## Requirements
 
@@ -110,8 +119,12 @@ Or choose one or more explicitly:
 ```bash
 python scripts/prepare_model.py \
   --model smollm2-135m-xdna1 \
-  --model smollm-135m-xdna1
+  --model qwen2.5-0.5b-xdna1
 ```
+
+Qwen2.5 0.5B creates roughly 1.7 GiB of converted runtime files. Its decoder
+uses the numerically stable BF16 projection path and is substantially slower
+than the fused SmolLM path.
 
 Use `--models-dir /path/to/storage` to keep the source and converted weights on
 another disk. Pass that same directory to the launcher with `--models-dir`.
@@ -214,9 +227,9 @@ python npu_llm/tools/convert_smollm2.py \
   npu_llm/models/SmolLM2-135M-Instruct-xdna1-w8a16
 ```
 
-The converted directory is approximately 442 MiB. It retains BF16 decoder
-weights for numerically stable generation and per-output-channel INT8 weights
-for the W8/BF16 kernels and LM head.
+A converted SmolLM directory is approximately 442 MiB; Qwen2.5 0.5B is
+approximately 1.7 GiB. The format retains BF16 decoder weights for numerically
+stable generation and per-output-channel INT8 weights for W8/BF16 kernels.
 
 ## Tests
 
@@ -238,6 +251,7 @@ Component examples:
 
 ```bash
 python npu_llm/tests/test_elementwise_npu.py
+python npu_llm/tests/test_qwen_components_npu.py
 python npu_llm/designs/rmsnorm.py --dev npu --size 576 -w 2 -i 5
 python npu_llm/designs/rope.py --dev npu --heads 12 --position 7 -w 2 -i 5
 ```
@@ -247,9 +261,10 @@ python npu_llm/designs/rope.py --dev npu --heads 12 --position 7 -w 2 -i 5
 Each generated token follows this path:
 
 1. Fetch the token embedding into an XRT buffer.
-2. Run all 30 SmolLM2 decoder layers using the fused AIE2 layer graph.
+2. Run the decoder layers using the fused SmolLM graph or the generalized
+   Qwen BF16 graph.
 3. Keep the 64-token K/V cache in NPU-addressable XRT buffers.
-4. Apply final RMSNorm and the W8/BF16 LM head on the NPU.
+4. Apply final RMSNorm and the model-specific LM head on the NPU.
 5. Copy logits to the host for argmax and token decoding.
 
 The decoder-layer xclbin is compiled once and reused for all layers and token
@@ -259,7 +274,9 @@ objects; there is no CPU tensor-operation fallback.
 ## Limitations
 
 - The attention kernel currently has a fixed 64-token context.
-- Only the compatible SmolLM 135M checkpoints listed above are supported.
+- Only the exact checkpoints and architectures listed above are supported.
+- Qwen2.5 0.5B support is experimental and much slower than SmolLM because it
+  uses generalized, unfused BF16 decoder graphs.
 - Generation is greedy; sampling parameters are accepted neither by the
   runtime nor the API.
 - The Python host currently invokes the resident decoder once per layer and
@@ -271,5 +288,5 @@ objects; there is no CPU tensor-operation fallback.
 
 Apache License 2.0 with LLVM exception. See `LICENSE`.
 
-SmolLM2 model files are downloaded separately and remain subject to their own
-upstream license and terms.
+Model files are downloaded separately and remain subject to their respective
+upstream licenses and terms.

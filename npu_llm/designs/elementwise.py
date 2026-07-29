@@ -116,7 +116,7 @@ def swiglu(GateUp: In, C: Out, *, size: CompileTime[int]):
     input_ty = np.ndarray[(2 * size,), np.dtype[bfloat16]]
     output_ty = np.ndarray[(size,), np.dtype[bfloat16]]
     tile = np.ndarray[(TILE,), np.dtype[bfloat16]]
-    fn = _extern("swiglu_split_bf16", [tile, tile, tile])
+    fn = _extern("swiglu_split_precise_bf16", [tile, tile, tile])
     fg, fu, fc = ObjectFifo(tile), ObjectFifo(tile), ObjectFifo(tile)
 
     def core(of_g, of_u, of_c, kernel):

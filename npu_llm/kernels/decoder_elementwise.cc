@@ -57,4 +57,28 @@ void swiglu_split_bf16(const bfloat16 *__restrict gate,
   }
 }
 
+void swiglu_split_precise_bf16(const bfloat16 *__restrict gate,
+                               const bfloat16 *__restrict up,
+                               bfloat16 *__restrict output) {
+  for (int i = 0; i < TILE_SIZE; i += 16) {
+    const auto g = aie::load_v<16>(gate + i);
+    const auto u = aie::load_v<16>(up + i);
+    const auto negative_g = aie::neg(g);
+    aie::accum<accfloat, 16> exponential_acc = getExpBf16(negative_g);
+    const auto exponential = exponential_acc.template to_vector<float>();
+    for (int lane = 0; lane < 16; ++lane) {
+      const float gate_float = static_cast<float>(g[lane]);
+      const float up_float = static_cast<float>(u[lane]);
+      const float sigmoid =
+          gate_float > 8.0f
+              ? 1.0f
+              : (gate_float < -8.0f
+                     ? 0.0f
+                     : aie::inv(1.0f + exponential[lane]));
+      output[i + lane] =
+          static_cast<bfloat16>(gate_float * sigmoid * up_float);
+    }
+  }
+}
+
 } // extern "C"

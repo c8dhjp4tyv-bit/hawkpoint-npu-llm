@@ -18,8 +18,18 @@ def main():
         )
     )
     model = XDNA1Model(model_dir)
-    assert model.layer(0)["qkv"].shape == (960, 576)
-    assert model.quantized("lm_head").shape == (49152, 576)
+    metadata = model.metadata
+    qkv_rows = (
+        metadata["attention_heads"] + 2 * metadata["kv_heads"]
+    ) * metadata["head_dim"]
+    assert model.layer(0)["qkv"].shape == (
+        qkv_rows,
+        metadata["hidden_size"],
+    )
+    assert model.quantized("lm_head").shape == (
+        metadata["vocab_size"],
+        metadata["hidden_size"],
+    )
     tokenizer = SmolLMTokenizer(model_dir)
     ids = tokenizer.encode_chat([{"role": "user", "content": "Hello"}])
     assert len(ids) > 4

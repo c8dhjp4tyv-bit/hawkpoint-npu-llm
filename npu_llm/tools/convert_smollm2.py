@@ -1,4 +1,4 @@
-"""Convert SmolLM2 safetensors to the XDNA1 NPU runtime format."""
+"""Convert supported Hugging Face safetensors to the XDNA1 runtime format."""
 
 import argparse
 import json
@@ -9,7 +9,7 @@ from ml_dtypes import bfloat16  # noqa: F401 - registers BF16 with NumPy
 from safetensors import safe_open
 
 
-EXPECTED_ARCHITECTURE = {
+SMOLLM_ARCHITECTURE = {
     "hidden_size": 576,
     "intermediate_size": 1536,
     "num_attention_heads": 9,
@@ -17,6 +17,20 @@ EXPECTED_ARCHITECTURE = {
     "num_hidden_layers": 30,
     "vocab_size": 49152,
 }
+QWEN_ARCHITECTURE = {
+    "hidden_size": 896,
+    "intermediate_size": 4864,
+    "num_attention_heads": 14,
+    "num_key_value_heads": 2,
+    "num_hidden_layers": 24,
+    "vocab_size": 151936,
+}
+SUPPORTED_ARCHITECTURES = {
+    "llama": SMOLLM_ARCHITECTURE,
+    "qwen2": QWEN_ARCHITECTURE,
+}
+# Backward-compatible name used by the lightweight converter test.
+EXPECTED_ARCHITECTURE = SMOLLM_ARCHITECTURE
 
 
 def _tensor_files(model_dir: Path):
@@ -86,9 +100,16 @@ def write_raw(out_dir, name, array, dtype, manifest):
 
 
 def _validate_architecture(config):
+    family = config.get("model_type")
+    expected_architecture = SUPPORTED_ARCHITECTURES.get(family)
+    if expected_architecture is None:
+        raise ValueError(
+            f"unsupported model_type {family!r}; expected one of "
+            + ", ".join(sorted(SUPPORTED_ARCHITECTURES))
+        )
     mismatches = {
         name: (config.get(name), expected)
-        for name, expected in EXPECTED_ARCHITECTURE.items()
+        for name, expected in expected_architecture.items()
         if config.get(name) != expected
     }
     if mismatches:
@@ -97,9 +118,13 @@ def _validate_architecture(config):
             for name, (actual, expected) in mismatches.items()
         )
         raise ValueError(
-            "model is incompatible with the fixed SmolLM 135M XDNA1 graph: "
+            "model is incompatible with the selected XDNA1 graph: "
             + details
         )
+    head_dim = int(config["hidden_size"]) // int(config["num_attention_heads"])
+    if head_dim != 64:
+        raise ValueError(f"head_dim={head_dim} is unsupported; expected 64")
+    return family
 
 
 def convert(
@@ -111,12 +136,17 @@ def convert(
     display_name=None,
 ):
     config = json.loads((model_dir / "config.json").read_text())
-    _validate_architecture(config)
+    model_family = _validate_architecture(config)
     out_dir.mkdir(parents=True, exist_ok=True)
     reader = TensorReader(model_dir)
     layers = int(config["num_hidden_layers"])
     manifest = {
-        "format": "xdna1-smollm2-w8a16-v1",
+        "format": (
+            "xdna1-qwen2-w8a16-v1"
+            if model_family == "qwen2"
+            else "xdna1-smollm2-w8a16-v1"
+        ),
+        "model_family": model_family,
         "hidden_size": int(config["hidden_size"]),
         "intermediate_size": int(config["intermediate_size"]),
         "attention_heads": int(config["num_attention_heads"]),
@@ -127,9 +157,10 @@ def convert(
         "layers": layers,
         "vocab_size": int(config["vocab_size"]),
         "rope_theta": float(config.get("rope_theta", 10000.0)),
+        "rms_norm_eps": float(config.get("rms_norm_eps", 1e-5)),
         "context_length": 64,
-        "activation_dtype": "int16",
-        "accumulator_dtype": "int32",
+        "activation_dtype": "bfloat16",
+        "accumulator_dtype": "float32",
         "tensors": {},
     }
     if model_id:
@@ -154,6 +185,19 @@ def convert(
             ],
             axis=0,
         )
+        qkv_bias = np.concatenate(
+            [
+                (
+                    reader.get(f"{attn}.{name}_proj.bias")
+                    if reader.has(f"{attn}.{name}_proj.bias")
+                    else np.zeros(
+                        reader.get(f"{attn}.{name}_proj.weight").shape[0],
+                        dtype=np.float32,
+                    )
+                )
+                for name in ("q", "k", "v")
+            ]
+        )
         gate_up = np.concatenate(
             [
                 reader.get(f"{mlp}.gate_proj.weight"),
@@ -162,6 +206,13 @@ def convert(
             axis=0,
         )
         write_quantized(out_dir, f"layer{layer:02d}.qkv", qkv, manifest)
+        write_raw(
+            out_dir,
+            f"layer{layer:02d}.qkv_bias",
+            qkv_bias,
+            np.float16,
+            manifest,
+        )
         write_quantized(
             out_dir,
             f"layer{layer:02d}.o_proj",

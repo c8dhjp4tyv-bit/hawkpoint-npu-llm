@@ -40,11 +40,10 @@ void project_dequant_bf16(const float *__restrict input,
 void project_residual_add_bf16(const bfloat16 *__restrict projection,
                                const bfloat16 *__restrict residual,
                                bfloat16 *__restrict output) {
-  for (int row = 0; row < DIM_M; row += 16) {
-    const auto p = aie::load_v<16>(projection + row);
-    const auto r = aie::load_v<16>(residual + row);
-    aie::store_v(output + row, aie::add(p, r));
-  }
+  for (int row = 0; row < DIM_M; ++row)
+    output[row] = static_cast<bfloat16>(
+        static_cast<float>(projection[row]) +
+        static_cast<float>(residual[row]));
 }
 
 } // extern "C"
