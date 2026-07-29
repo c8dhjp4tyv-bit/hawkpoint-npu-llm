@@ -7,11 +7,12 @@ die() {
 }
 
 [[ "$(id -u)" -eq 0 ]] || die "install-stage.sh must run as root"
-[[ "$#" -eq 3 ]] || die "usage: $0 STAGE VERSION BACKEND"
+[[ "$#" -eq 4 ]] || die "usage: $0 STAGE VERSION BACKEND GPU_LAYERS"
 
 stage="$(realpath "$1")"
 version="$2"
 backend="$3"
+gpu_layers="$4"
 stamp="$(date +%Y%m%d-%H%M%S)"
 runtime_backup="/usr/local/lib/ollama.pre-xdna-${stamp}"
 binary_backup="/usr/local/bin/ollama.pre-xdna-${stamp}"
@@ -73,6 +74,7 @@ install -d -m 0755 /etc/systemd/system/ollama.service.d
         'Environment="GGML_XDNA_XCLBIN=/usr/local/lib/ollama/xdna/experts.xclbin"'
     printf '%s\n' \
         'Environment="GGML_XDNA_INSTS=/usr/local/lib/ollama/xdna/insts.bin"'
+    printf 'Environment="OLLAMA_XDNA_GPU_LAYERS=%s"\n' "${gpu_layers}"
     if [[ "${backend}" != "cpu" ]]; then
         printf 'Environment="OLLAMA_LLM_LIBRARY=%s"\n' "${backend}"
     fi

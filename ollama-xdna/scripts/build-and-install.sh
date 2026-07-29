@@ -10,6 +10,7 @@ install_result=1
 allow_unsupported=0
 resume=0
 jobs="${OLLAMA_XDNA_JOBS:-8}"
+gpu_layers="${OLLAMA_XDNA_GPU_LAYERS:-0}"
 rebuild_runtime=0
 
 die() {
@@ -25,6 +26,7 @@ Usage: $0 [options]
   --build-root PATH     Keep build files at PATH
   --resume              Continue an interrupted --build-root build
   --jobs COUNT          Parallel jobs (default: 8)
+  --gpu-layers COUNT    Default GPU layers when XDNA is active (default: 0)
   --rebuild-runtime     Rebuild CPU/GPU payload instead of reusing installed one
   --no-install          Build and validate without replacing system Ollama
   --allow-unsupported   Try the patch on a newer Ollama tag
@@ -61,6 +63,11 @@ while [[ "$#" -gt 0 ]]; do
             jobs="$2"
             shift 2
             ;;
+        --gpu-layers)
+            [[ "$#" -ge 2 ]] || die "--gpu-layers requires a value"
+            gpu_layers="$2"
+            shift 2
+            ;;
         --rebuild-runtime)
             rebuild_runtime=1
             shift
@@ -85,6 +92,8 @@ case "${backend}" in
 esac
 
 [[ "${jobs}" =~ ^[1-9][0-9]*$ ]] || die "--jobs must be a positive integer"
+[[ "${gpu_layers}" =~ ^[0-9]+$ ]] ||
+    die "--gpu-layers must be a non-negative integer"
 
 if [[ "${tag}" != "${SUPPORTED_TAG}" && "${allow_unsupported}" -ne 1 ]]; then
     die "${tag} is unvalidated; use --allow-unsupported to attempt a 3-way apply"
@@ -253,7 +262,7 @@ GGML_XDNA_INSTS="${stage}/lib/ollama/xdna/insts.bin" \
 echo "Validated stage: ${stage}"
 if [[ "${install_result}" -eq 1 ]]; then
     pkexec "${PROJECT_ROOT}/scripts/install-stage.sh" \
-        "${stage}" "${tag#v}" "${backend}"
+        "${stage}" "${tag#v}" "${backend}" "${gpu_layers}"
 else
     echo "System Ollama was not changed (--no-install)."
 fi

@@ -2,10 +2,17 @@
 """Small OpenAI-compatible HTTP server for the XDNA1 SmolLM2 runtime."""
 
 import argparse
+from collections import defaultdict, deque
+from dataclasses import dataclass
 import gc
+import hmac
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
+import logging
+import os
 from pathlib import Path
+import socket
+import ssl
 import sys
 import threading
 import time
@@ -36,8 +43,43 @@ def _validate_messages(value):
             raise ValueError(f"unsupported message role: {role!r}")
         if not isinstance(content, str):
             raise ValueError("message content must be a string")
+        if len(content) > 32_768:
+            raise ValueError("message content exceeds 32768 characters")
         messages.append({"role": role, "content": content})
     return messages
+
+
+@dataclass(frozen=True)
+class ServerConfig:
+    api_key: str
+    cors_origins: tuple = (
+        "http://127.0.0.1:3000",
+        "http://localhost:3000",
+    )
+    max_body_bytes: int = 1_048_576
+    request_timeout: float = 120.0
+    queue_capacity: int = 2
+    rate_limit_per_minute: int = 30
+
+
+class RateLimiter:
+    def __init__(self, requests_per_minute):
+        self.limit = requests_per_minute
+        self._requests = defaultdict(deque)
+        self._lock = threading.Lock()
+
+    def allow(self, client):
+        if self.limit <= 0:
+            return True
+        now = time.monotonic()
+        with self._lock:
+            history = self._requests[client]
+            while history and now - history[0] >= 60:
+                history.popleft()
+            if len(history) >= self.limit:
+                return False
+            history.append(now)
+            return True
 
 
 class CompletionEngine:
@@ -113,7 +155,11 @@ class CompletionEngine:
             yield from decoder.generate_messages(messages, max_tokens)
 
 
-def make_handler(engine):
+def make_handler(engine, config=None):
+    config = config or ServerConfig(api_key="test-only")
+    slots = threading.BoundedSemaphore(config.queue_capacity + 1)
+    limiter = RateLimiter(config.rate_limit_per_minute)
+
     class Handler(BaseHTTPRequestHandler):
         server_version = "HawkPointNPU/1.0"
 
@@ -123,10 +169,16 @@ def make_handler(engine):
                 f"{fmt % args}\n"
             )
 
+        def _cors(self):
+            origin = self.headers.get("Origin")
+            if origin and origin in config.cors_origins:
+                self.send_header("Access-Control-Allow-Origin", origin)
+                self.send_header("Vary", "Origin")
+
         def _headers(self, status=200, content_type="application/json"):
             self.send_response(status)
             self.send_header("Content-Type", content_type)
-            self.send_header("Access-Control-Allow-Origin", "*")
+            self._cors()
             self.send_header(
                 "Access-Control-Allow-Headers",
                 "Authorization, Content-Type",
@@ -139,7 +191,7 @@ def make_handler(engine):
             self.send_response(status)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(body)))
-            self.send_header("Access-Control-Allow-Origin", "*")
+            self._cors()
             self.end_headers()
             self.wfile.write(body)
 
@@ -153,6 +205,14 @@ def make_handler(engine):
                 },
                 status,
             )
+
+        def _authorized(self):
+            supplied = self.headers.get("Authorization", "")
+            expected = f"Bearer {config.api_key}"
+            if hmac.compare_digest(supplied, expected):
+                return True
+            self._error("missing or invalid bearer token", 401, "authentication_error")
+            return False
 
         def do_OPTIONS(self):
             self._headers(204)
@@ -168,6 +228,8 @@ def make_handler(engine):
                 )
                 return
             if self.path.rstrip("/") == "/v1/models":
+                if not self._authorized():
+                    return
                 self._json(
                     {
                         "object": "list",
@@ -181,9 +243,26 @@ def make_handler(engine):
             if self.path.rstrip("/") != "/v1/chat/completions":
                 self._error("not found", 404)
                 return
+            if not self._authorized():
+                return
+            client = self.client_address[0]
+            if not limiter.allow(client):
+                self._error("rate limit exceeded", 429, "rate_limit_error")
+                return
             try:
-                length = int(self.headers.get("Content-Length", "0"))
+                raw_length = self.headers.get("Content-Length")
+                if raw_length is None:
+                    self._error("Content-Length is required", 411)
+                    return
+                length = int(raw_length)
+                if length <= 0:
+                    raise ValueError("request body cannot be empty")
+                if length > config.max_body_bytes:
+                    self._error("request body is too large", 413)
+                    return
                 request = json.loads(self.rfile.read(length))
+                if not isinstance(request, dict):
+                    raise ValueError("request body must be a JSON object")
                 messages = _validate_messages(request.get("messages"))
                 model_id = request.get("model") or engine.default_model_id
                 if not engine.has_model(model_id):
@@ -202,10 +281,18 @@ def make_handler(engine):
                 self._error(exc)
                 return
 
-            if request.get("stream", False):
-                self._stream(model_id, messages, max_tokens)
-            else:
-                self._complete(model_id, messages, max_tokens)
+            if not slots.acquire(blocking=False):
+                self._error("NPU request queue is full", 429, "server_overloaded")
+                return
+            self.connection.settimeout(config.request_timeout)
+            self._deadline = time.monotonic() + config.request_timeout
+            try:
+                if request.get("stream", False):
+                    self._stream(model_id, messages, max_tokens)
+                else:
+                    self._complete(model_id, messages, max_tokens)
+            finally:
+                slots.release()
 
         def _complete(self, model_id, messages, max_tokens):
             pieces = []
@@ -214,11 +301,17 @@ def make_handler(engine):
                 for text, final_stats in engine.generate(
                     model_id, messages, max_tokens
                 ):
+                    if time.monotonic() > self._deadline:
+                        raise TimeoutError
                     pieces.append(text)
                     if final_stats is not None:
                         stats = final_stats
-            except Exception as exc:
-                self._error(exc, 500)
+            except (TimeoutError, socket.timeout):
+                self._error("inference request timed out", 504, "timeout_error")
+                return
+            except Exception:
+                logging.exception("inference request failed")
+                self._error("internal inference error", 500, "server_error")
                 return
             stats = stats or {}
             prompt_tokens = int(stats.get("prompt_tokens", 0))
@@ -279,6 +372,8 @@ def make_handler(engine):
                 for text, final_stats in engine.generate(
                     model_id, messages, max_tokens
                 ):
+                    if time.monotonic() > self._deadline:
+                        raise TimeoutError
                     if text:
                         send(
                             {
@@ -317,10 +412,17 @@ def make_handler(engine):
                 )
                 self.wfile.write(b"data: [DONE]\n\n")
                 self.wfile.flush()
-            except (BrokenPipeError, ConnectionResetError):
+            except (BrokenPipeError, ConnectionResetError, socket.timeout):
                 pass
+            except Exception:
+                logging.exception("streaming inference request failed")
 
     return Handler
+
+
+class BoundedHTTPServer(ThreadingHTTPServer):
+    daemon_threads = True
+    request_queue_size = 16
 
 
 def main():
@@ -329,6 +431,23 @@ def main():
     )
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8000)
+    parser.add_argument(
+        "--api-key",
+        default=os.environ.get("HAWKPOINT_API_KEY"),
+        help="Bearer token (or set HAWKPOINT_API_KEY)",
+    )
+    parser.add_argument(
+        "--cors-origin",
+        action="append",
+        dest="cors_origins",
+        help="allowed browser origin; may be repeated",
+    )
+    parser.add_argument("--max-body-bytes", type=int, default=1_048_576)
+    parser.add_argument("--request-timeout", type=float, default=120)
+    parser.add_argument("--queue-capacity", type=int, default=2)
+    parser.add_argument("--rate-limit-per-minute", type=int, default=30)
+    parser.add_argument("--tls-cert", type=Path)
+    parser.add_argument("--tls-key", type=Path)
     parser.add_argument(
         "--model",
         type=Path,
@@ -352,6 +471,16 @@ def main():
         help="percentage of leading decoder layers to run on the NPU",
     )
     args = parser.parse_args()
+    if not args.api_key:
+        parser.error("--api-key or HAWKPOINT_API_KEY is required")
+    if args.max_body_bytes < 1024:
+        parser.error("--max-body-bytes must be at least 1024")
+    if args.request_timeout <= 0:
+        parser.error("--request-timeout must be positive")
+    if args.queue_capacity < 0:
+        parser.error("--queue-capacity cannot be negative")
+    if bool(args.tls_cert) != bool(args.tls_key):
+        parser.error("--tls-cert and --tls-key must be provided together")
     if args.npu_percent is not None and not 0 <= args.npu_percent <= 100:
         parser.error("--npu-percent must be between 0 and 100")
     if args.npu_layers is not None and args.npu_layers < 0:
@@ -390,9 +519,26 @@ def main():
     engine = CompletionEngine(models, decoder_factory=decoder_factory)
     if not args.no_prewarm:
         engine.prewarm_default()
-    server = ThreadingHTTPServer((args.host, args.port), make_handler(engine))
+    config = ServerConfig(
+        api_key=args.api_key,
+        cors_origins=tuple(args.cors_origins or ServerConfig.cors_origins),
+        max_body_bytes=args.max_body_bytes,
+        request_timeout=args.request_timeout,
+        queue_capacity=args.queue_capacity,
+        rate_limit_per_minute=args.rate_limit_per_minute,
+    )
+    server = BoundedHTTPServer(
+        (args.host, args.port),
+        make_handler(engine, config),
+    )
+    scheme = "http"
+    if args.tls_cert:
+        context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        context.load_cert_chain(args.tls_cert, args.tls_key)
+        server.socket = context.wrap_socket(server.socket, server_side=True)
+        scheme = "https"
     print("Installed models: " + ", ".join(models), flush=True)
-    print(f"OpenAI-compatible API: http://{args.host}:{args.port}/v1", flush=True)
+    print(f"OpenAI-compatible API: {scheme}://{args.host}:{args.port}/v1", flush=True)
     try:
         server.serve_forever()
     except KeyboardInterrupt:

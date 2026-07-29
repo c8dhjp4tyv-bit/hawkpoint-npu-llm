@@ -13,6 +13,10 @@ kernels.
 > Experimental research project. It is not affiliated with or supported by
 > AMD, Xilinx, Hugging Face, or the Open WebUI project.
 
+The versioned support boundary is in [SUPPORT.md](SUPPORT.md), release changes
+are in [CHANGELOG.md](CHANGELOG.md), and responsible disclosure is described
+in [SECURITY.md](SECURITY.md). An alpha tag does not mean production-ready.
+
 ## Choose a runtime
 
 This repository now contains two independent XDNA1 paths:
@@ -117,7 +121,7 @@ accepted.
 - A Phoenix or Hawk Point Ryzen AI system exposing `RyzenAI-npu1`
 - Linux with a working `amdxdna`/XRT stack and matching NPU firmware
 - A working MLIR-AIE/IRON environment with Peano
-- Python 3.12 packages listed in `requirements.txt`
+- Python 3.12 packages hash-locked in `requirements.lock`
 - Docker with Compose support, only for the Open WebUI option
 
 This project was validated with NPU firmware `1.5.5.391`. Driver, firmware,
@@ -143,13 +147,15 @@ same environment:
 ```bash
 git clone https://github.com/c8dhjp4tyv-bit/hawkpoint-npu-llm.git
 cd hawkpoint-npu-llm
-python -m pip install -r requirements.txt
+python -m pip install --require-hashes -r requirements.lock
 python scripts/prepare_model.py
 ```
 
 `prepare_model.py` downloads the upstream Hugging Face model and creates the
 XDNA1 runtime representation under `npu_llm/models/`. Model weights are not
-stored in this Git repository.
+stored in this Git repository. Checkpoints use immutable revisions recorded in
+`npu_llm/model_catalog.py`. Conversion occurs in a sibling staging directory;
+only a complete, checksum-verified package replaces the previous model.
 
 Prepare every supported model:
 
@@ -205,10 +211,11 @@ python launcher.py openwebui --npu-percent 60
 python launcher.py openwebui --npu-layers 4
 ```
 
-The Open WebUI container is preconfigured to reach the host API at
-`http://host.docker.internal:8000/v1`. Its model picker displays every
-installed checkpoint returned by `/v1/models`. Its data is kept in a Docker
-volume.
+The pinned Open WebUI container uses Linux host networking so it can reach the
+API while both processes stay bound to `127.0.0.1`. Its model picker displays
+every installed checkpoint returned by `/v1/models`. Its data is kept in a
+Docker volume, and the launcher gives it the same randomly generated API key
+as the native server.
 
 Run the terminal chatbot:
 
@@ -225,17 +232,23 @@ python npu_llm/chat.py \
 
 ## OpenAI-compatible API
 
-No API key is required. Clients that require one may use any non-empty value,
-for example `local-npu`.
+The launcher generates a random bearer token and prints it in API-only mode.
+Set a stable token when another local client must reconnect:
 
 ```bash
-curl http://localhost:8000/v1/models
+export HAWKPOINT_API_KEY="$(python -c 'import secrets; print(secrets.token_urlsafe(32))')"
+python launcher.py api
+```
+
+```bash
+curl http://localhost:8000/v1/models \
+  -H "Authorization: Bearer $HAWKPOINT_API_KEY"
 ```
 
 ```bash
 curl http://localhost:8000/v1/chat/completions \
   -H "Content-Type: application/json" \
-  -H "Authorization: Bearer local-npu" \
+  -H "Authorization: Bearer $HAWKPOINT_API_KEY" \
   -d '{
     "model": "smollm2-135m-xdna1",
     "messages": [
@@ -285,10 +298,16 @@ caches; NPU layers retain NPU-resident KV caches. Only the boundary hidden
 state moves between devices once per generated token.
 
 The server serializes requests because one physical NPU execution context is
-shared. It binds to `127.0.0.1` in API-only mode and `0.0.0.0` when it must be
-reachable from the local Open WebUI container. Open WebUI itself is published
-only on `127.0.0.1:3000`. The API has no authentication, so use the Open WebUI
-mode only on a trusted network or protect port 8000 with a firewall.
+shared. One active request and two queued requests are admitted by default;
+additional work receives `429` instead of accumulating waiting inference
+threads. Defaults also include a 1 MiB request limit, 120-second socket
+timeout, 30 requests/minute/client rate limit, bearer authentication, safe
+internal errors, and an explicit browser-origin allowlist.
+
+Both launcher modes bind the API to `127.0.0.1`; Open WebUI also binds only to
+localhost. To run the server directly with TLS, pass `--tls-cert CERT.pem
+--tls-key KEY.pem`. For non-local deployment, use a trusted TLS reverse proxy
+and keep the backend private.
 
 ## Convert a model manually
 
@@ -301,6 +320,8 @@ python npu_llm/tools/convert_smollm2.py \
 A converted SmolLM directory is approximately 442 MiB; Qwen2.5 0.5B is
 approximately 1.7 GiB. The format retains BF16 decoder weights for numerically
 stable generation and per-output-channel INT8 weights for W8/BF16 kernels.
+The runtime verifies package sizes and SHA-256 hashes before memory mapping
+weights; packages created by an older converter must be reconverted.
 
 ## Tests
 
@@ -317,6 +338,11 @@ Run the complete hardware acceptance test:
 ```bash
 python npu_llm/tests/validate_chat_npu.py
 ```
+
+The manual self-hosted workflow additionally performs fresh pinned downloads
+and conversion, model switching, 1,000 completions, and an Ollama build with
+`--jobs 8`. See [SUPPORT.md](SUPPORT.md) for the release gate and
+[BENCHMARKS.md](BENCHMARKS.md) for the controlled comparison protocol.
 
 Component examples:
 

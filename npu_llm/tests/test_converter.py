@@ -1,5 +1,7 @@
 import importlib.util
+import hashlib
 from pathlib import Path
+import tempfile
 
 import numpy as np
 
@@ -40,7 +42,50 @@ def test_architecture_validation():
     assert CONVERTER._validate_architecture(qwen) == "qwen2"
 
 
+def test_atomic_publish_and_failed_conversion_preserves_previous():
+    original = CONVERTER._convert_into
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        source = root / "source"
+        output = root / "output"
+        source.mkdir()
+        output.mkdir()
+        (output / "old.bin").write_bytes(b"old")
+
+        def successful(_source, staging, **_metadata):
+            data = b"complete-model"
+            (staging / "weights.bin").write_bytes(data)
+            return {
+                "files": {
+                    "weights.bin": {
+                        "size": len(data),
+                        "sha256": hashlib.sha256(data).hexdigest(),
+                    }
+                }
+            }
+
+        CONVERTER._convert_into = successful
+        CONVERTER.convert(source, output)
+        assert not (output / "old.bin").exists()
+        assert (output / "weights.bin").read_bytes() == b"complete-model"
+
+        def failing(_source, staging, **_metadata):
+            (staging / "partial.bin").write_bytes(b"partial")
+            raise OSError("simulated disk-full failure")
+
+        CONVERTER._convert_into = failing
+        try:
+            CONVERTER.convert(source, output)
+            raise AssertionError("failed conversion unexpectedly succeeded")
+        except OSError:
+            pass
+        assert (output / "weights.bin").read_bytes() == b"complete-model"
+        assert not (output / "partial.bin").exists()
+    CONVERTER._convert_into = original
+
+
 if __name__ == "__main__":
     test_per_channel_quantization()
     test_architecture_validation()
+    test_atomic_publish_and_failed_conversion_preserves_previous()
     print("PASS!")

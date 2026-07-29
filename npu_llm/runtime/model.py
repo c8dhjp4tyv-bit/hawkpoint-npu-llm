@@ -1,3 +1,4 @@
+import hashlib
 import json
 from pathlib import Path
 
@@ -23,7 +24,25 @@ class XDNA1Model:
     def __init__(self, model_dir):
         self.root = Path(model_dir)
         self.metadata = json.loads((self.root / "metadata.json").read_text())
+        self._verify_integrity()
         self.tensors = self.metadata["tensors"]
+
+    def _verify_integrity(self):
+        files = self.metadata.get("files")
+        if not files:
+            raise RuntimeError(
+                "model package has no integrity manifest; reconvert the model"
+            )
+        for name, expected in files.items():
+            path = self.root / name
+            if not path.is_file() or path.stat().st_size != expected["size"]:
+                raise RuntimeError(f"model package file is missing or truncated: {name}")
+            digest = hashlib.sha256()
+            with path.open("rb") as stream:
+                for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                    digest.update(chunk)
+            if digest.hexdigest() != expected["sha256"]:
+                raise RuntimeError(f"model package checksum mismatch: {name}")
 
     def quantized(self, name):
         return QuantizedTensor(self.root, self.tensors[name])

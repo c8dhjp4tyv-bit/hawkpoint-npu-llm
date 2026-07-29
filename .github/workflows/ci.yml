@@ -17,6 +17,13 @@ jobs:
           python-version: "3.12"
       - name: Compile Python sources
         run: python -m compileall -q .
+      - name: Install locked Python dependencies
+        run: python -m pip install --require-hashes -r requirements.lock
+      - name: Test converter
+        run: |
+          python npu_llm/tests/test_converter.py
+          cd npu_llm
+          python tests/test_model_integrity.py
       - name: Test OpenAI-compatible protocol
         run: python tests/test_api_server.py
 
@@ -40,3 +47,7 @@ jobs:
             https://github.com/ollama/ollama.git /tmp/ollama
           git -C /tmp/ollama apply --check \
             "$GITHUB_WORKSPACE/ollama-xdna/patches/ollama-v0.32.5-xdna.patch"
+          git -C /tmp/ollama apply \
+            "$GITHUB_WORKSPACE/ollama-xdna/patches/ollama-v0.32.5-xdna.patch"
+          cd /tmp/ollama
+          go test ./api ./cmd ./discover ./llm ./server

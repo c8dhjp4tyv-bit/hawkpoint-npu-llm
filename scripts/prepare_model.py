@@ -17,13 +17,15 @@ from npu_llm.model_catalog import DEFAULT_MODEL_ID, MODEL_PRESETS
 def prepare(model_id, models_dir):
     preset = MODEL_PRESETS[model_id]
     repo_id = preset["repo_id"]
+    revision = preset["revision"]
     models_dir = Path(models_dir)
     source = models_dir / "sources" / repo_id.rsplit("/", 1)[1]
     output = models_dir / preset["directory"]
     source.parent.mkdir(parents=True, exist_ok=True)
-    print(f"Downloading {repo_id} to {source}")
+    print(f"Downloading {repo_id}@{revision} to {source}")
     snapshot_download(
         repo_id=repo_id,
+        revision=revision,
         local_dir=source,
         allow_patterns=[
             "*.json",
@@ -41,6 +43,7 @@ def prepare(model_id, models_dir):
         output,
         model_id=model_id,
         source_model=repo_id,
+        source_revision=revision,
         display_name=preset["display_name"],
     )
     print(

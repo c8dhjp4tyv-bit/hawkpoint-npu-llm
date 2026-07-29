@@ -7,21 +7,25 @@ from pathlib import Path
 MODEL_PRESETS = {
     "smollm2-135m-xdna1": {
         "repo_id": "HuggingFaceTB/SmolLM2-135M-Instruct",
+        "revision": "12fd25f77366fa6b3b4b768ec3050bf629380bac",
         "directory": "SmolLM2-135M-Instruct-xdna1-w8a16",
         "display_name": "SmolLM2 135M Instruct (XDNA1)",
     },
     "smollm-135m-xdna1": {
         "repo_id": "HuggingFaceTB/SmolLM-135M-Instruct",
+        "revision": "fcc320f490e08fdb4b99d935b2c58d40bf35b0d0",
         "directory": "SmolLM-135M-Instruct-xdna1-w8a16",
         "display_name": "SmolLM 135M Instruct (XDNA1)",
     },
     "smollm2-135m-sft-xdna1": {
         "repo_id": "HuggingFaceTB/smollm2-135M-SFT-Only",
+        "revision": "79528469cd11749bac3e8e9200fd9c192fbd8979",
         "directory": "SmolLM2-135M-SFT-Only-xdna1-w8a16",
         "display_name": "SmolLM2 135M SFT-Only (XDNA1)",
     },
     "qwen2.5-0.5b-xdna1": {
         "repo_id": "Qwen/Qwen2.5-0.5B-Instruct",
+        "revision": "7ae557604adf67be50417f59c2c2f167def9a775",
         "directory": "Qwen2.5-0.5B-Instruct-xdna1-w8a16",
         "display_name": "Qwen2.5 0.5B Instruct (XDNA1 experimental)",
     },

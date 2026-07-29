@@ -1,0 +1,73 @@
+name: XDNA1 hardware acceptance
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      completions:
+        description: "Number of soak-test completions"
+        default: "1000"
+        required: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: xdna1-hardware
+  cancel-in-progress: false
+
+jobs:
+  hawk-point:
+    runs-on: [self-hosted, linux, x64, xdna1, hawk-point]
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - name: Install locked Python dependencies
+        run: python -m pip install --require-hashes -r requirements.lock
+      - name: Verify fresh host prerequisites
+        run: ./ollama-xdna/scripts/verify-system.sh
+      - name: Verify artifacts and patch
+        run: |
+          cd ollama-xdna/backend/artifacts
+          sha256sum --check SHA256SUMS
+      - name: Download pinned sources and convert every supported model
+        run: |
+          python scripts/prepare_model.py \
+            --all \
+            --models-dir "$RUNNER_TEMP/hawkpoint-models"
+      - name: Native token agreement
+        env:
+          HAWKPOINT_MODEL_DIR: ${{ runner.temp }}/hawkpoint-models/SmolLM2-135M-Instruct-xdna1-w8a16
+        run: |
+          python npu_llm/tests/test_model_runtime.py
+          python npu_llm/tests/validate_chat_npu.py
+      - name: Model switching and long-run API soak
+        env:
+          HAWKPOINT_SOAK_COMPLETIONS: ${{ inputs.completions || '1000' }}
+          HAWKPOINT_API_KEY: hardware-ci-ephemeral-key
+        run: |
+          python npu_llm/api_server.py \
+            --models-dir "$RUNNER_TEMP/hawkpoint-models" \
+            --api-key "$HAWKPOINT_API_KEY" \
+            --rate-limit-per-minute 0 \
+            >"$RUNNER_TEMP/hawkpoint-api.log" 2>&1 &
+          api_pid=$!
+          trap 'kill "$api_pid" 2>/dev/null || true' EXIT
+          for _ in $(seq 1 180); do
+            curl -fsS http://127.0.0.1:8000/health >/dev/null && break
+            sleep 1
+          done
+          python tests/soak_api.py
+      - name: Build patched Ollama without installing
+        run: |
+          ./ollama-xdna/scripts/build-and-install.sh \
+            --backend "${OLLAMA_XDNA_GPU_BACKEND:-cpu}" \
+            --jobs 8 \
+            --no-install
+      - name: Verify rollback script syntax
+        run: bash -n ollama-xdna/scripts/rollback.sh

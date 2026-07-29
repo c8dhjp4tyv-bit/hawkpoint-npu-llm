@@ -1,8 +1,13 @@
 """Convert supported Hugging Face safetensors to the XDNA1 runtime format."""
 
 import argparse
+import hashlib
 import json
+import os
 from pathlib import Path
+import shutil
+import tempfile
+import uuid
 
 import numpy as np
 from ml_dtypes import bfloat16  # noqa: F401 - registers BF16 with NumPy
@@ -127,12 +132,29 @@ def _validate_architecture(config):
     return family
 
 
-def convert(
+def _sha256(path):
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _fsync_directory(path):
+    descriptor = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _convert_into(
     model_dir: Path,
     out_dir: Path,
     *,
     model_id=None,
     source_model=None,
+    source_revision=None,
     display_name=None,
 ):
     config = json.loads((model_dir / "config.json").read_text())
@@ -167,6 +189,8 @@ def convert(
         manifest["model_id"] = model_id
     if source_model:
         manifest["source_model"] = source_model
+    if source_revision:
+        manifest["source_revision"] = source_revision
     if display_name:
         manifest["display_name"] = display_name
 
@@ -248,9 +272,6 @@ def convert(
     lm_head = reader.get(lm_name) if reader.has(lm_name) else embed
     write_quantized(out_dir, "lm_head", lm_head, manifest)
 
-    (out_dir / "metadata.json").write_text(
-        json.dumps(manifest, indent=2, sort_keys=True) + "\n"
-    )
     tokenizer_files = [
         "tokenizer.json",
         "tokenizer_config.json",
@@ -262,7 +283,58 @@ def convert(
         src = model_dir / filename
         if src.exists():
             (out_dir / filename).write_bytes(src.read_bytes())
+    manifest["files"] = {
+        path.name: {
+            "sha256": _sha256(path),
+            "size": path.stat().st_size,
+        }
+        for path in sorted(out_dir.iterdir())
+        if path.is_file() and path.name != "metadata.json"
+    }
+    metadata = out_dir / "metadata.json"
+    metadata.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
+    with metadata.open("rb") as stream:
+        os.fsync(stream.fileno())
     return manifest
+
+
+def convert(model_dir: Path, out_dir: Path, **metadata):
+    """Build and verify a complete model package, then publish it atomically."""
+    model_dir = Path(model_dir)
+    out_dir = Path(out_dir)
+    out_dir.parent.mkdir(parents=True, exist_ok=True)
+    staging = Path(
+        tempfile.mkdtemp(prefix=f".{out_dir.name}.staging-", dir=out_dir.parent)
+    )
+    backup = out_dir.with_name(f".{out_dir.name}.backup-{uuid.uuid4().hex}")
+    try:
+        manifest = _convert_into(model_dir, staging, **metadata)
+        for name, expected in manifest["files"].items():
+            path = staging / name
+            if path.stat().st_size != expected["size"]:
+                raise OSError(f"size verification failed for {name}")
+            if _sha256(path) != expected["sha256"]:
+                raise OSError(f"checksum verification failed for {name}")
+        for path in staging.iterdir():
+            if path.is_file():
+                with path.open("rb") as stream:
+                    os.fsync(stream.fileno())
+        _fsync_directory(staging)
+        if out_dir.exists():
+            os.replace(out_dir, backup)
+        try:
+            os.replace(staging, out_dir)
+            _fsync_directory(out_dir.parent)
+        except Exception:
+            if backup.exists():
+                os.replace(backup, out_dir)
+            raise
+        if backup.exists():
+            shutil.rmtree(backup)
+        return manifest
+    finally:
+        if staging.exists():
+            shutil.rmtree(staging)
 
 
 def main():

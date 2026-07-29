@@ -241,6 +241,22 @@ ollama pull qwen3-coder:30b
 ollama run qwen3-coder:30b
 ```
 
+The patch no longer hardcodes `-ngl 16`. Its safe default is zero GPU layers
+because XDNA's single-context constraint prevents llama-server's normal
+automatic fit probe. Select a measured machine-wide default during install:
+
+```bash
+./ollama-xdna/scripts/build-and-install.sh \
+  --backend cuda_v13 \
+  --gpu-layers 16
+```
+
+The same setting can be supplied as `OLLAMA_XDNA_GPU_LAYERS`. A request or
+Modelfile `num_gpu` option takes precedence, so different Qwen models can use
+different placements without rebuilding. Increase the value only after
+checking GPU VRAM and system RAM; if loading fails, reduce it. This is a
+capacity configuration, not NPU utilization telemetry.
+
 In another terminal:
 
 ```bash
