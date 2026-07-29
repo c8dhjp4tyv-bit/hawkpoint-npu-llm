@@ -19,3 +19,24 @@ jobs:
         run: python -m compileall -q .
       - name: Test OpenAI-compatible protocol
         run: python tests/test_api_server.py
+
+  ollama-patch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install static-analysis tools
+        run: sudo apt-get update && sudo apt-get install -y shellcheck
+      - name: Check shell scripts
+        run: |
+          bash -n ollama-xdna/scripts/*.sh
+          shellcheck ollama-xdna/scripts/*.sh
+      - name: Verify prebuilt AIE artifacts
+        run: |
+          cd ollama-xdna/backend/artifacts
+          sha256sum --check SHA256SUMS
+      - name: Verify the patch against supported Ollama
+        run: |
+          git clone --quiet --filter=blob:none --branch v0.32.5 \
+            https://github.com/ollama/ollama.git /tmp/ollama
+          git -C /tmp/ollama apply --check \
+            "$GITHUB_WORKSPACE/ollama-xdna/patches/ollama-v0.32.5-xdna.patch"

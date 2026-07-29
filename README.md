@@ -13,6 +13,34 @@ kernels.
 > Experimental research project. It is not affiliated with or supported by
 > AMD, Xilinx, Hugging Face, or the Open WebUI project.
 
+## Choose a runtime
+
+This repository now contains two independent XDNA1 paths:
+
+| Runtime | Best use |
+|---|---|
+| Native MLIR-AIE runtime below | Small supported checkpoints with a custom OpenAI-compatible server |
+| [Ollama XDNA1 patch](ollama-xdna/README.md) | Existing Ollama Qwen models shared across CPU, GPU, and NPU |
+
+For the Ollama path, install distro-specific build dependencies first:
+
+```bash
+./ollama-xdna/scripts/install-deps.sh
+./ollama-xdna/scripts/verify-system.sh
+```
+
+Then patch a clean upstream Ollama v0.32.5 checkout, build all matching native
+components, run the XDNA hardware test, and install:
+
+```bash
+./ollama-xdna/scripts/build-and-install.sh --backend cuda_v13
+```
+
+Use `--backend cpu`, `cuda_v12`, `cuda_v13`, `rocm_v7_2`, or `vulkan` to match
+the machine. The complete driver/XRT prerequisites, distro commands, safe
+dry-run, model test, update, API/Open WebUI, and rollback instructions are in
+the [Ollama XDNA1 guide](ollama-xdna/README.md).
+
 ## Demonstrated hardware result
 
 Validated on a Hawk Point XDNA1 NPU (`RyzenAI-npu1`, AIE2, 4 columns):
