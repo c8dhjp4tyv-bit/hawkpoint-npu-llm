@@ -29,6 +29,12 @@ The Qwen release gate uploads its full 32-token CPU/NPU sequence separately.
 That gate checks both paths against a checked-in CPU BF16 reference generated
 from the pinned checkpoint and a fixed long-form prompt; EOS must not occur
 before the end of the sequence.
+The fused prefill benchmark also uploads top-five logits and timings for 32
+positions. Exact argmax differences fail unless both BF16 paths have a
+top-two candidate tie within the documented `0.05` logit margin and the same
+two candidates. This near-tie exception does not weaken the independent exact
+32-token generated-sequence gate. NPU/CPU speedup is evidence, not a release
+correctness condition.
 The same gated hardware job runs 1,000 requests in each of CPU-only, GPU-only,
 CPU+GPU, and CPU+GPU+NPU placement modes with one pinned Qwen model and
 the same prompt, seed, generation length, and five-minute warm-up. It measures

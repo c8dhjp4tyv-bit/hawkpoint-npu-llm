@@ -516,7 +516,28 @@ class NPUDecoder:
             mlp_activation, after_attention, f"{prefix}.down_proj"
         )
 
-    def decode_token(self, token_id, position):
+    @staticmethod
+    def _decode_result(logits, start, diagnostics):
+        logits_f32 = np.asarray(logits, dtype=np.float32)
+        next_token = int(np.argmax(logits_f32))
+        elapsed = time.perf_counter() - start
+        if not diagnostics:
+            return next_token, elapsed
+        top_indices = np.argpartition(logits_f32, -5)[-5:]
+        top_indices = top_indices[
+            np.argsort(logits_f32[top_indices])[::-1]
+        ]
+        return next_token, elapsed, {
+            "top_token_ids": [int(index) for index in top_indices],
+            "top_logits": [
+                float(logits_f32[index]) for index in top_indices
+            ],
+            "top_logit_margin": float(
+                logits_f32[top_indices[0]] - logits_f32[top_indices[1]]
+            ),
+        }
+
+    def decode_token(self, token_id, position, *, diagnostics=False):
         if not 0 <= position < self.context_length:
             raise ValueError("position outside the 64-token context")
         start = time.perf_counter()
@@ -550,8 +571,7 @@ class NPUDecoder:
             for layer in range(self.npu_layers, self.layers):
                 hidden = self.cpu_stage.layer(hidden, layer, position)
             logits = self.cpu_stage.logits(hidden)
-            next_token = int(np.argmax(logits))
-            return next_token, time.perf_counter() - start
+            return self._decode_result(logits, start, diagnostics)
         normalized = iron.zeros(self.hidden_size, dtype=bfloat16, device="npu")
         rmsnorm(
             hidden,
@@ -565,8 +585,7 @@ class NPUDecoder:
             if self.model_family == "qwen2"
             else self._project(normalized, "lm_head")
         )
-        next_token = int(np.argmax(logits.numpy().astype(np.float32)))
-        return next_token, time.perf_counter() - start
+        return self._decode_result(logits.numpy(), start, diagnostics)
 
     def warmup(self):
         """Compile and populate the hot path before the first request."""

@@ -63,7 +63,8 @@ jobs:
             --report "$RUNNER_TEMP/qwen-token-agreement.json"
           python npu_llm/tests/benchmark_qwen_fused.py \
             "$HAWKPOINT_QWEN_MODEL_DIR" \
-            --positions 32
+            --positions 32 \
+            --report "$RUNNER_TEMP/qwen-fused-benchmark.json"
       - name: Model switching and long-run API soak
         env:
           HAWKPOINT_SOAK_COMPLETIONS: ${{ inputs.completions || '1000' }}
@@ -105,6 +106,7 @@ jobs:
           path: |
             ${{ runner.temp }}/hawkpoint-soak-report.json
             ${{ runner.temp }}/qwen-token-agreement.json
+            ${{ runner.temp }}/qwen-fused-benchmark.json
             ${{ runner.temp }}/expected-token-ids.json
             ${{ runner.temp }}/hardware-versions.json
             ${{ runner.temp }}/hawkpoint-api.log

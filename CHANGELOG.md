@@ -5,6 +5,15 @@ versioning while its public API is experimental.
 
 ## [Unreleased]
 
+## [0.1.0-rc.3] - 2026-07-29
+
+- Publish full fused-Qwen top-five logit and latency evidence for 32 prefill
+  positions while retaining the independent exact 32-token generation gate.
+- Classify only bounded BF16 top-two near-ties instead of failing on an
+  unstable intermediate argmax, and fail every non-tie divergence.
+- Remove the stale claim that the fused Qwen NPU path beats the controlled
+  eight-thread CPU baseline.
+
 ## [0.1.0-rc.2] - 2026-07-29
 
 - Replace the Qwen agreement prompt that reached EOS before 32 tokens with a
@@ -46,3 +55,4 @@ versioning while its public API is experimental.
 [0.1.0-alpha.1]: https://github.com/c8dhjp4tyv-bit/hawkpoint-npu-llm/releases/tag/v0.1.0-alpha.1
 [0.1.0-rc.1]: https://github.com/c8dhjp4tyv-bit/hawkpoint-npu-llm/compare/v0.1.0-alpha.1...v0.1.0-rc.1
 [0.1.0-rc.2]: https://github.com/c8dhjp4tyv-bit/hawkpoint-npu-llm/compare/v0.1.0-rc.1...v0.1.0-rc.2
+[0.1.0-rc.3]: https://github.com/c8dhjp4tyv-bit/hawkpoint-npu-llm/compare/v0.1.0-rc.2...v0.1.0-rc.3

@@ -1,6 +1,6 @@
 # Support matrix
 
-This is the release-candidate boundary for `v0.1.0-rc.2`. Anything outside it is
+This is the release-candidate boundary for `v0.1.0-rc.3`. Anything outside it is
 unsupported until a reproducible hardware report is added.
 
 | Component | Validated | Status |

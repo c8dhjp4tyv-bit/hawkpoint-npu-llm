@@ -68,17 +68,12 @@ the sunlight in all directions, including blue light. When sunlight enters
 the Earth's atmosphere,
 ```
 
-The fused Qwen2.5 0.5B path was validated against both the NumPy BF16 runtime
-and the upstream BF16 Transformers checkpoint. On a 12-token prefix of the
-standard `Hello` ChatML prompt, the NPU and CPU selected the same token at all
-12 positions.
-
-| Qwen2.5 0.5B measurement | CPU | Fused NPU |
-|---|---:|---:|
-| Warm median latency | 0.669 s/token | **0.618 s/token** |
-| Warm mean latency | 0.676 s/token | **0.617 s/token** |
-| Median speedup | — | **1.084x** |
-| Token agreement | reference | **12/12** |
+The fused Qwen2.5 0.5B path is checked against both the NumPy BF16 runtime and
+the upstream BF16 checkpoint. Release candidates require an exact checked-in
+32-token generated sequence. A separate 32-position prefill benchmark records
+the top-five logits, BF16 near-ties, and CPU/NPU latency without treating a
+performance regression as a correctness pass or claiming an unmeasured
+speedup.
 
 The API prewarms the default model, moving the roughly 4.2-second compile/load
 cost to server startup. A real four-token `Hello` response produced
@@ -385,7 +380,9 @@ and token position. Layer weights and K/V caches remain in XRT buffer objects.
 - The attention kernel currently has a fixed 64-token context.
 - Only the exact checkpoints and architectures listed above are supported.
 - Qwen2.5 0.5B support remains experimental despite matching the tested BF16
-  reference tokens and beating the current NumPy CPU baseline.
+  generated-token reference. The current eight-thread CPU baseline can be
+  faster than the fused NPU path; consult the release evidence rather than
+  assuming an NPU speedup.
 - Generation is greedy; sampling parameters are accepted neither by the
   runtime nor the API.
 - Current XRT firmware is reliable with two decoder layers per persistent
