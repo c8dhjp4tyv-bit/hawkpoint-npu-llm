@@ -1,6 +1,10 @@
 #include <aie_api/aie.hpp>
 #include <stdint.h>
 
+#ifndef RMS_EPSILON
+#define RMS_EPSILON 1e-5f
+#endif
+
 static inline float reciprocal_sqrt(float value) {
   const float half = 0.5f * value;
   union {
@@ -17,7 +21,7 @@ static inline float reciprocal_sqrt(float value) {
 extern "C" void rmsnorm_bf16(const bfloat16 *__restrict input,
                               const bfloat16 *__restrict gamma,
                               bfloat16 *__restrict output, int32_t cols) {
-  constexpr float epsilon = 1e-5f;
+  constexpr float epsilon = RMS_EPSILON;
   event0();
   float sum_sq = 0.0f;
   for (int i = 0; i < cols; ++i) {

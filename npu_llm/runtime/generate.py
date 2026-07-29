@@ -1,4 +1,4 @@
-"""Host orchestration for the NPU-only SmolLM2 decode graph."""
+"""Host orchestration for the supported NPU-only decode graphs."""
 
 import resource
 import time
@@ -17,6 +17,7 @@ from designs.elementwise import (
     swiglu,
 )
 from designs.project import norm_project, project, project_residual
+from designs.project_bf16 import project_bf16, project_bf16_residual
 from designs.qkv_rope import qkv_rope
 from designs.rmsnorm import rmsnorm
 from designs.tensor_copy import slice_bf16
@@ -30,11 +31,26 @@ class NPUDecoder:
             raise ValueError("the current NPU attention kernel has a fixed 64-token cache")
         set_current_device(from_name("npu", n_cols=4))
         self.model = XDNA1Model(model_dir)
-        self.tokenizer = SmolLMTokenizer(model_dir)
+        self.model_family = self.model.metadata.get("model_family", "llama")
+        default_system = (
+            "You are Qwen, created by Alibaba Cloud. You are a helpful assistant."
+            if self.model_family == "qwen2"
+            else "You are a helpful AI assistant named SmolLM."
+        )
+        self.tokenizer = SmolLMTokenizer(model_dir, default_system=default_system)
         self.context_length = context_length
         self.hidden_size = self.model.metadata["hidden_size"]
+        self.intermediate_size = self.model.metadata["intermediate_size"]
+        self.q_heads = self.model.metadata["attention_heads"]
+        self.kv_heads = self.model.metadata["kv_heads"]
+        self.head_dim = self.model.metadata["head_dim"]
+        self.q_per_kv = self.q_heads // self.kv_heads
+        self.rms_norm_eps = float(
+            self.model.metadata.get("rms_norm_eps", 1e-5)
+        )
         self.layers = self.model.metadata["layers"]
         self._device_weights = {}
+        self._bf16_weights = {}
         self._raw_weights = {}
         self._packed_layer_weights = {}
         self._packed_layer_gammas = {}
@@ -43,7 +59,7 @@ class NPUDecoder:
         self._embedding = self._raw_bf16("token_embedding")
         self.kv_cache = [
             iron.zeros(
-                (1, 3, 2 * 64 * 64),
+                (1, self.kv_heads, 2 * self.context_length * self.head_dim),
                 dtype=bfloat16,
                 device="npu",
             )
@@ -68,6 +84,15 @@ class NPUDecoder:
             )
         return self._device_weights[name]
 
+    def _bf16_projection(self, name):
+        if name not in self._bf16_weights:
+            self._bf16_weights[name] = iron.tensor(
+                self.model.bf16_projection(name),
+                dtype=bfloat16,
+                device="npu",
+            )
+        return self._bf16_weights[name]
+
     def _project(self, activation, name):
         weight, scale, shape = self._quantized(name)
         rows, cols = shape
@@ -79,6 +104,21 @@ class NPUDecoder:
             output,
             M=rows,
             K=cols,
+            rows=self._projection_rows(cols),
+        )
+        return output
+
+    def _project_bf16(self, activation, name):
+        shape = self.model.tensors[name]["shape"]
+        rows, cols = shape
+        output = iron.zeros(rows, dtype=bfloat16, device="npu")
+        project_bf16(
+            self._bf16_projection(name),
+            activation,
+            output,
+            M=rows,
+            K=cols,
+            rows=self._bf16_projection_rows(cols),
         )
         return output
 
@@ -94,6 +134,7 @@ class NPUDecoder:
             output,
             M=rows,
             K=cols,
+            rows=self._projection_rows(cols),
         )
         return output
 
@@ -109,8 +150,32 @@ class NPUDecoder:
             output,
             M=rows,
             K=cols,
+            rows=self._projection_rows(cols),
         )
         return output
+
+    def _project_bf16_residual(self, activation, residual, name):
+        shape = self.model.tensors[name]["shape"]
+        rows, cols = shape
+        output = iron.zeros(rows, dtype=bfloat16, device="npu")
+        project_bf16_residual(
+            self._bf16_projection(name),
+            activation,
+            residual,
+            output,
+            M=rows,
+            K=cols,
+            rows=self._bf16_projection_rows(cols),
+        )
+        return output
+
+    @staticmethod
+    def _projection_rows(input_columns):
+        return 8 if input_columns > 2048 else 32
+
+    @staticmethod
+    def _bf16_projection_rows(input_columns):
+        return 4 if input_columns > 2048 else 32
 
     def _slice(self, tensor, total_size, offset, size):
         output = iron.zeros(size, dtype=bfloat16, device="npu")
@@ -133,15 +198,15 @@ class NPUDecoder:
 
     def _rope_lut(self, position):
         rope_theta = float(self.model.metadata.get("rope_theta", 100000.0))
-        inv_freq = 1.0 / (rope_theta ** (np.arange(0, 64, 2) / 64.0))
+        inv_freq = 1.0 / (
+            rope_theta
+            ** (np.arange(0, self.head_dim, 2) / self.head_dim)
+        )
         angle = position * inv_freq
-        lut = np.concatenate(
-            [
-                np.cos(angle),
-                np.sin(angle),
-                np.array([position, 0.0], np.float32),
-            ]
-        ).astype(np.float32)
+        parts = [np.cos(angle), np.sin(angle)]
+        if self.model_family != "qwen2":
+            parts.append(np.array([position, 0.0], np.float32))
+        lut = np.concatenate(parts).astype(np.float32)
         return iron.tensor(lut.astype(bfloat16), dtype=bfloat16, device="npu")
 
     def _packed_layer(self, layer):
@@ -224,6 +289,8 @@ class NPUDecoder:
         return self._decoder_weights, self._decoder_gammas
 
     def _layer(self, hidden, layer, position, rope_lut):
+        if self.model_family == "qwen2":
+            return self._layer_unfused(hidden, layer, position, rope_lut)
         weights, gammas = self._packed_layer(layer)
         decoder_layer(
             weights,
@@ -236,29 +303,83 @@ class NPUDecoder:
 
     def _layer_unfused(self, hidden, layer, position, rope_lut):
         prefix = f"layer{layer:02d}"
-        qkv = self._norm_project(
-            hidden, f"{prefix}.input_norm", f"{prefix}.qkv"
+        normalized = iron.zeros(
+            self.hidden_size, dtype=bfloat16, device="npu"
         )
-        packed_qkv = iron.zeros((3, 320), dtype=bfloat16, device="npu")
-        qkv_rope(qkv, rope_lut, packed_qkv)
-        attended = iron.zeros((3, 192), dtype=bfloat16, device="npu")
+        rmsnorm(
+            hidden,
+            self._raw_bf16(f"{prefix}.input_norm"),
+            normalized,
+            size=self.hidden_size,
+            epsilon=self.rms_norm_eps,
+        )
+        qkv = self._project_bf16(normalized, f"{prefix}.qkv")
+        biased_qkv = iron.zeros(
+            (self.q_heads + 2 * self.kv_heads) * self.head_dim,
+            dtype=bfloat16,
+            device="npu",
+        )
+        residual_add(
+            qkv,
+            self._raw_bf16(f"{prefix}.qkv_bias"),
+            biased_qkv,
+            size=(self.q_heads + 2 * self.kv_heads) * self.head_dim,
+        )
+        packed_qkv = iron.zeros(
+            (
+                self.kv_heads,
+                (self.q_per_kv + 2) * self.head_dim,
+            ),
+            dtype=bfloat16,
+            device="npu",
+        )
+        qkv_rope(
+            biased_qkv,
+            rope_lut,
+            packed_qkv,
+            q_heads=self.q_heads,
+            kv_heads=self.kv_heads,
+            head_dim=self.head_dim,
+        )
+        attended = iron.zeros(
+            (self.kv_heads, self.q_per_kv * self.head_dim),
+            dtype=bfloat16,
+            device="npu",
+        )
         attention_block(
             packed_qkv,
             self.kv_cache[layer],
             attended,
             position=position,
+            kv_heads=self.kv_heads,
+            q_per_kv=self.q_per_kv,
+            head_dim=self.head_dim,
         )
-        after_attention = self._project_residual(
+        after_attention = self._project_bf16_residual(
             attended, hidden, f"{prefix}.o_proj"
         )
-        gate_up = self._norm_project(
-            after_attention,
-            f"{prefix}.post_attn_norm",
-            f"{prefix}.gate_up",
+        post_normalized = iron.zeros(
+            self.hidden_size, dtype=bfloat16, device="npu"
         )
-        mlp_activation = iron.zeros(1536, dtype=bfloat16, device="npu")
-        swiglu(gate_up, mlp_activation, size=1536)
-        return self._project_residual(
+        rmsnorm(
+            after_attention,
+            self._raw_bf16(f"{prefix}.post_attn_norm"),
+            post_normalized,
+            size=self.hidden_size,
+            epsilon=self.rms_norm_eps,
+        )
+        gate_up = self._project_bf16(
+            post_normalized, f"{prefix}.gate_up"
+        )
+        mlp_activation = iron.zeros(
+            self.intermediate_size, dtype=bfloat16, device="npu"
+        )
+        swiglu(
+            gate_up,
+            mlp_activation,
+            size=self.intermediate_size,
+        )
+        return self._project_bf16_residual(
             mlp_activation, after_attention, f"{prefix}.down_proj"
         )
 
@@ -276,8 +397,13 @@ class NPUDecoder:
             self._raw_bf16("final_norm"),
             normalized,
             size=self.hidden_size,
+            epsilon=self.rms_norm_eps,
         )
-        logits = self._project(normalized, "lm_head")
+        logits = (
+            self._project_bf16(normalized, "lm_head")
+            if self.model_family == "qwen2"
+            else self._project(normalized, "lm_head")
+        )
         next_token = int(np.argmax(logits.numpy().astype(np.float32)))
         return next_token, time.perf_counter() - start
 

@@ -22,14 +22,22 @@ def test_per_channel_quantization():
 
 
 def test_architecture_validation():
-    valid = dict(CONVERTER.EXPECTED_ARCHITECTURE)
-    CONVERTER._validate_architecture(valid)
+    valid = {
+        **CONVERTER.EXPECTED_ARCHITECTURE,
+        "model_type": "llama",
+    }
+    assert CONVERTER._validate_architecture(valid) == "llama"
     invalid = {**valid, "hidden_size": 960}
     try:
         CONVERTER._validate_architecture(invalid)
         raise AssertionError("incompatible architecture unexpectedly accepted")
     except ValueError as exc:
         assert "hidden_size=960" in str(exc)
+    qwen = {
+        **CONVERTER.QWEN_ARCHITECTURE,
+        "model_type": "qwen2",
+    }
+    assert CONVERTER._validate_architecture(qwen) == "qwen2"
 
 
 if __name__ == "__main__":

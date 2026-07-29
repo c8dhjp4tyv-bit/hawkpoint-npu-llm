@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Download and convert supported SmolLM 135M models for XDNA1."""
+"""Download and convert supported language models for XDNA1."""
 
 import argparse
 from pathlib import Path

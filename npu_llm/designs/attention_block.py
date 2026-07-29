@@ -13,9 +13,6 @@ from aie.utils import config
 
 
 SRC = Path(__file__).resolve().parents[1] / "kernels/attention_block_bf16.cc"
-KV_HEADS = 3
-HEAD_DIM = 64
-Q_PER_KV = 3
 CONTEXT = 64
 
 
@@ -26,13 +23,24 @@ def attention_block(
     O: Out,
     *,
     position: CompileTime[int],
+    kv_heads: CompileTime[int] = 3,
+    q_per_kv: CompileTime[int] = 3,
+    head_dim: CompileTime[int] = 64,
 ):
-    packed_ty = np.ndarray[(KV_HEADS, (Q_PER_KV + 2) * HEAD_DIM), np.dtype[bfloat16]]
-    cache_ty = np.ndarray[(KV_HEADS, 2 * CONTEXT * HEAD_DIM), np.dtype[bfloat16]]
-    out_ty = np.ndarray[(KV_HEADS, Q_PER_KV * HEAD_DIM), np.dtype[bfloat16]]
-    packed_slice = np.ndarray[((Q_PER_KV + 2) * HEAD_DIM,), np.dtype[bfloat16]]
-    cache_slice = np.ndarray[(2 * CONTEXT * HEAD_DIM,), np.dtype[bfloat16]]
-    out_slice = np.ndarray[(Q_PER_KV * HEAD_DIM,), np.dtype[bfloat16]]
+    packed_ty = np.ndarray[
+        (kv_heads, (q_per_kv + 2) * head_dim), np.dtype[bfloat16]
+    ]
+    cache_ty = np.ndarray[
+        (kv_heads, 2 * CONTEXT * head_dim), np.dtype[bfloat16]
+    ]
+    out_ty = np.ndarray[
+        (kv_heads, q_per_kv * head_dim), np.dtype[bfloat16]
+    ]
+    packed_slice = np.ndarray[
+        ((q_per_kv + 2) * head_dim,), np.dtype[bfloat16]
+    ]
+    cache_slice = np.ndarray[(2 * CONTEXT * head_dim,), np.dtype[bfloat16]]
+    out_slice = np.ndarray[(q_per_kv * head_dim,), np.dtype[bfloat16]]
     kernel = ExternalFunction(
         "attention_block_bf16",
         source_file=str(SRC),
@@ -44,42 +52,47 @@ def attention_block(
             out_slice,
         ],
         include_dirs=[config.cxx_header_path()],
+        compile_flags=[
+            f"-DQ_PER_KV={q_per_kv}",
+            f"-DHEAD_DIM={head_dim}",
+            f"-DCONTEXT={CONTEXT}",
+        ],
     )
 
     def split(parent, child_ty, width, name):
         return parent.cons().split(
-            [head * width for head in range(KV_HEADS)],
-            obj_types=[child_ty] * KV_HEADS,
-            names=[f"{name}_{head}" for head in range(KV_HEADS)],
-            depths=[1] * KV_HEADS,
+            [head * width for head in range(kv_heads)],
+            obj_types=[child_ty] * kv_heads,
+            names=[f"{name}_{head}" for head in range(kv_heads)],
+            depths=[1] * kv_heads,
         )
 
     packed_parent = ObjectFifo(packed_ty, name="packed_parent", depth=1)
     cache_in_parent = ObjectFifo(cache_ty, name="cache_in_parent", depth=1)
     packed_children = split(
-        packed_parent, packed_slice, (Q_PER_KV + 2) * HEAD_DIM, "packed"
+        packed_parent, packed_slice, (q_per_kv + 2) * head_dim, "packed"
     )
     cache_in_children = split(
-        cache_in_parent, cache_slice, 2 * CONTEXT * HEAD_DIM, "cache_in"
+        cache_in_parent, cache_slice, 2 * CONTEXT * head_dim, "cache_in"
     )
 
     def join(parent, child_ty, width, name):
         return parent.prod().join(
-            [head * width for head in range(KV_HEADS)],
-            obj_types=[child_ty] * KV_HEADS,
-            names=[f"{name}_{head}" for head in range(KV_HEADS)],
-            depths=[1] * KV_HEADS,
+            [head * width for head in range(kv_heads)],
+            obj_types=[child_ty] * kv_heads,
+            names=[f"{name}_{head}" for head in range(kv_heads)],
+            depths=[1] * kv_heads,
         )
 
     cache_out_parent = ObjectFifo(cache_ty, name="cache_out_parent", depth=1)
     o_parent = ObjectFifo(out_ty, name="o_parent", depth=1)
     cache_out_children = join(
-        cache_out_parent, cache_slice, 2 * CONTEXT * HEAD_DIM, "cache_out"
+        cache_out_parent, cache_slice, 2 * CONTEXT * head_dim, "cache_out"
     )
-    o_children = join(o_parent, out_slice, Q_PER_KV * HEAD_DIM, "o")
+    o_children = join(o_parent, out_slice, q_per_kv * head_dim, "o")
 
     workers = []
-    for head in range(KV_HEADS):
+    for head in range(kv_heads):
         packed_f = packed_children[head]
         cache_in_f = cache_in_children[head]
         cache_out_f, of = cache_out_children[head], o_children[head]

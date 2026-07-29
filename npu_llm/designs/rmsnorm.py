@@ -20,13 +20,21 @@ SRC = Path(__file__).resolve().parents[1] / "kernels/rmsnorm_bf16.cc"
 
 
 @iron.jit
-def rmsnorm(A: In, G: In, C: Out, *, size: CompileTime[int]):
+def rmsnorm(
+    A: In,
+    G: In,
+    C: Out,
+    *,
+    size: CompileTime[int],
+    epsilon: CompileTime[float] = 1e-5,
+):
     ty = np.ndarray[(size,), np.dtype[bfloat16]]
     kernel = ExternalFunction(
         "rmsnorm_bf16",
         source_file=str(SRC),
         arg_types=[ty, ty, ty, np.int32],
         include_dirs=[config.cxx_header_path()],
+        compile_flags=[f"-DRMS_EPSILON={epsilon}f"],
     )
     a_fifo = ObjectFifo(ty, name="input")
     g_fifo = ObjectFifo(ty, name="gamma")
