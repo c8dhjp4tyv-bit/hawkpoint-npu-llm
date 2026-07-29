@@ -235,10 +235,36 @@ def test_hard_process_timeout():
         engine.close()
 
 
+def test_worker_error_forces_restart():
+    engine = ProcessCompletionEngine(
+        {"smollm2-135m-xdna1": FailingDecoder()},
+        decoder_factory=None,
+        timeout=2,
+    )
+    try:
+        try:
+            list(
+                engine.generate(
+                    "smollm2-135m-xdna1",
+                    [{"role": "user", "content": "Hello"}],
+                    5,
+                )
+            )
+            raise AssertionError("failing worker unexpectedly completed")
+        except RuntimeError as exc:
+            assert str(exc) == "inference worker request failed"
+        assert engine.worker_restarts == 1
+        assert engine._process is None
+        assert not engine.ready
+    finally:
+        engine.close()
+
+
 def main():
     test_protocol_and_security()
     test_backpressure_and_safe_errors()
     test_hard_process_timeout()
+    test_worker_error_forces_restart()
     print("PASS API security and protocol")
 
 

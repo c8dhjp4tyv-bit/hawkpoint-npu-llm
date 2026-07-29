@@ -22,6 +22,7 @@ jobs:
           python npu_llm/tests/test_converter.py
           python npu_llm/tests/test_model_integrity.py
           python tests/test_api_server.py
+          python tests/test_release_gates.py
 
   hosted-ollama:
     runs-on: ubuntu-latest
@@ -37,6 +38,8 @@ jobs:
         run: |
           git clone --quiet --filter=blob:none --branch v0.32.5 \
             https://github.com/ollama/ollama.git /tmp/ollama
+          test "$(git -C /tmp/ollama rev-parse HEAD)" = \
+            "eec8e0b9458b8a01be0c216a9cc53eefde24ef50"
           git -C /tmp/ollama apply \
             "$GITHUB_WORKSPACE/ollama-xdna/patches/ollama-v0.32.5-xdna.patch"
           cd /tmp/ollama
@@ -52,6 +55,12 @@ jobs:
         run: ./scripts/configure-hardware-runner.sh
       - run: python -m pip install --require-hashes -r requirements.lock
       - run: ./ollama-xdna/scripts/verify-system.sh
+      - name: Verify and capture pinned hardware versions
+        run: |
+          python scripts/verify_hardware_versions.py \
+            --report "$RUNNER_TEMP/hardware-versions.json"
+      - name: Verify dedicated runner install privileges
+        run: sudo -n true
       - name: Fresh pinned conversion
         run: |
           python scripts/prepare_model.py \
@@ -99,6 +108,10 @@ jobs:
       - name: Ollama build, install, inference, and rollback gate
         run: |
           backend="${OLLAMA_XDNA_GPU_BACKEND:-cuda_v13}"
+          model="$(jq -r '.ollama.model' release-pins.json)"
+          model_manifest="$(
+            jq -r '.ollama.model_manifest_sha256' release-pins.json
+          )"
           ./ollama-xdna/scripts/build-and-install.sh \
             --backend "$backend" \
             --jobs 8 \
@@ -109,6 +122,8 @@ jobs:
             --xdna-dir "$RUNNER_TEMP/ollama-release-build/stage/lib/ollama/xdna" \
             --models-dir "$RUNNER_TEMP/ollama-benchmark-models" \
             --output-dir "$RUNNER_TEMP/ollama-placement-matrix" \
+            --model "$model" \
+            --model-manifest-sha256 "$model_manifest" \
             --gpu-library "$backend" \
             --requests 1000 \
             --tokens 16
@@ -127,8 +142,13 @@ jobs:
           installed=1
           curl -fsS http://127.0.0.1:11434/api/version |
             jq -e '.version | endswith("-xdna")'
-          timeout 10m ollama pull qwen2.5:0.5b
-          timeout 5m ollama run qwen2.5:0.5b "Reply with exactly OK."
+          timeout 10m ollama pull "$model"
+          python tests/verify_ollama_manifest.py \
+            --models-dir /var/lib/ollama/.ollama/models \
+            --model "$model" \
+            --sha256 "$model_manifest" \
+            --report "$RUNNER_TEMP/ollama-system-manifest.json"
+          timeout 5m ollama run "$model" "Reply with exactly OK."
           journalctl -u ollama --since "-10 minutes" --no-pager |
             grep -Eq "XDNA (dense Qwen|expert) offload count: [1-9]"
           sudo /usr/local/lib/ollama/xdna/rollback.sh
@@ -144,7 +164,9 @@ jobs:
             ${{ runner.temp }}/hawkpoint-soak-report.json
             ${{ runner.temp }}/qwen-token-agreement.json
             ${{ runner.temp }}/expected-token-ids.json
+            ${{ runner.temp }}/hardware-versions.json
             ${{ runner.temp }}/hawkpoint-api.log
+            ${{ runner.temp }}/ollama-system-manifest.json
             ${{ runner.temp }}/ollama-placement-matrix/
 
   publish:

@@ -13,6 +13,8 @@ import threading
 import time
 from urllib.request import Request, urlopen
 
+from verify_ollama_manifest import verify_manifest
+
 
 def percentile(values, fraction):
     ordered = sorted(values)
@@ -138,6 +140,15 @@ def summary(values):
     }
 
 
+def compare_placement_responses(results, expected_count):
+    hashes = {
+        item["placement"]: item["response_sha256"]
+        for item in results
+        if item["response_sha256"] is not None
+    }
+    return hashes, len(hashes) == expected_count and len(set(hashes.values())) == 1
+
+
 def benchmark_mode(args, mode, index):
     port = args.base_port + index
     environment = {
@@ -174,6 +185,11 @@ def benchmark_mode(args, mode, index):
                 "/api/pull",
                 {"model": args.model, "stream": False},
                 timeout=1200,
+            )
+            verify_manifest(
+                args.models_dir,
+                args.model,
+                args.model_manifest_sha256,
             )
             payload = {
                 "model": args.model,
@@ -288,6 +304,7 @@ def main():
     parser.add_argument("--models-dir", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--model", default="qwen2.5:0.5b")
+    parser.add_argument("--model-manifest-sha256", required=True)
     parser.add_argument("--gpu-library", default="cuda_v13")
     parser.add_argument("--partial-gpu-layers", type=int, default=8)
     parser.add_argument("--requests", type=int, default=100)
@@ -350,12 +367,27 @@ def main():
                     "response_sha256": None,
                 }
             )
+    placement_hashes, cross_placement_agreement = compare_placement_responses(
+        results,
+        len(modes),
+    )
+    gate_failures = [
+        item["placement"]
+        for item in results
+        if item["failures"] or item["successful_requests"] != args.requests
+    ]
+    if not cross_placement_agreement:
+        gate_failures.append("cross_placement_response_mismatch")
     report = {
         "schema_version": 1,
         "model": args.model,
+        "model_manifest_sha256": args.model_manifest_sha256,
         "prompt": args.prompt,
         "generated_tokens": args.tokens,
         "warmup_seconds_per_placement": args.warmup_seconds,
+        "placement_response_sha256": placement_hashes,
+        "cross_placement_response_agreement": cross_placement_agreement,
+        "gate_failures": gate_failures,
         "placements": results,
     }
     json_path = args.output_dir / "ollama-placement-matrix.json"
@@ -394,16 +426,19 @@ def main():
             )
         )
     (args.output_dir / "ollama-placement-matrix.md").write_text(
-        "\n".join(markdown) + "\n"
+        "\n".join(
+            markdown
+            + [
+                "",
+                "Cross-placement response SHA-256 agreement: "
+                + ("PASS" if cross_placement_agreement else "FAIL"),
+            ]
+        )
+        + "\n"
     )
     print("\n".join(markdown))
-    failed = [
-        item["placement"]
-        for item in results
-        if item["failures"] or item["successful_requests"] != args.requests
-    ]
-    if failed:
-        raise SystemExit("benchmark gate failed for: " + ", ".join(failed))
+    if gate_failures:
+        raise SystemExit("benchmark gate failed for: " + ", ".join(gate_failures))
 
 
 if __name__ == "__main__":

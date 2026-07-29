@@ -25,7 +25,9 @@ jobs:
           cd npu_llm
           python tests/test_model_integrity.py
       - name: Test OpenAI-compatible protocol
-        run: python tests/test_api_server.py
+        run: |
+          python tests/test_api_server.py
+          python tests/test_release_gates.py
 
   ollama-patch:
     runs-on: ubuntu-latest
@@ -45,6 +47,8 @@ jobs:
         run: |
           git clone --quiet --filter=blob:none --branch v0.32.5 \
             https://github.com/ollama/ollama.git /tmp/ollama
+          test "$(git -C /tmp/ollama rev-parse HEAD)" = \
+            "eec8e0b9458b8a01be0c216a9cc53eefde24ef50"
           git -C /tmp/ollama apply --check \
             "$GITHUB_WORKSPACE/ollama-xdna/patches/ollama-v0.32.5-xdna.patch"
           git -C /tmp/ollama apply \

@@ -27,6 +27,10 @@ jobs:
         run: python -m pip install --require-hashes -r requirements.lock
       - name: Verify fresh host prerequisites
         run: ./ollama-xdna/scripts/verify-system.sh
+      - name: Verify and capture pinned hardware versions
+        run: |
+          python scripts/verify_hardware_versions.py \
+            --report "$RUNNER_TEMP/hardware-versions.json"
       - name: Verify artifacts and patch
         run: |
           cd ollama-xdna/backend/artifacts
@@ -96,4 +100,5 @@ jobs:
             ${{ runner.temp }}/hawkpoint-soak-report.json
             ${{ runner.temp }}/qwen-token-agreement.json
             ${{ runner.temp }}/expected-token-ids.json
+            ${{ runner.temp }}/hardware-versions.json
             ${{ runner.temp }}/hawkpoint-api.log

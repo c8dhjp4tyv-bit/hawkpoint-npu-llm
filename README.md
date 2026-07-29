@@ -307,9 +307,10 @@ internal errors, and an explicit browser-origin allowlist.
 The HTTP process never owns the XRT context. Inference runs in a persistent
 spawned worker process. If a request deadline expires, the worker is
 terminated, its NPU context is discarded, and the next request creates a fresh
-worker. `GET /health` reports HTTP-process liveness; `GET /ready` returns `200`
-only while a warmed inference worker is available, and `503` after a timeout
-until recovery succeeds.
+worker. A worker-side inference error also terminates that worker so a possibly
+corrupted XRT context is never reused. `GET /health` reports HTTP-process
+liveness; `GET /ready` returns `200` only while a warmed inference worker is
+available, and `503` after an error or timeout until recovery succeeds.
 
 Both launcher modes bind the API to `127.0.0.1`; Open WebUI also binds only to
 localhost. To run the server directly with TLS, pass `--tls-cert CERT.pem
@@ -351,6 +352,8 @@ conversion, Qwen token agreement, measured model switching, 1,000
 completions, and an Ollama install/inference/rollback test with `--jobs 8`
 before its publish job can start. See [SUPPORT.md](SUPPORT.md) for the gate and
 [BENCHMARKS.md](BENCHMARKS.md) for the controlled comparison protocol.
+`release-pins.json` is the machine-readable authority for the Ollama source
+commit, Ollama model manifest, and accepted hardware/software stack.
 
 Component examples:
 

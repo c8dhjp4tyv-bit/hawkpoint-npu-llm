@@ -3,6 +3,7 @@ set -euo pipefail
 
 PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SUPPORTED_TAG="v0.32.5"
+SUPPORTED_COMMIT="eec8e0b9458b8a01be0c216a9cc53eefde24ef50"
 tag="${SUPPORTED_TAG}"
 backend="cpu"
 build_root=""
@@ -122,11 +123,20 @@ if [[ "${resume}" -eq 1 ]]; then
     actual_commit="$(git -C "${source_dir}" rev-parse HEAD)"
     [[ "${actual_commit}" == "${expected_commit}" ]] ||
         die "resume checkout is not based on ${tag}"
+    if [[ "${tag}" == "${SUPPORTED_TAG}" ]]; then
+        [[ "${actual_commit}" == "${SUPPORTED_COMMIT}" ]] ||
+            die "${SUPPORTED_TAG} resolved to untrusted commit ${actual_commit}"
+    fi
     git -C "${source_dir}" diff --check
 else
     [[ ! -e "${source_dir}" ]] || die "${source_dir} already exists"
     git clone --quiet --filter=blob:none --branch "${tag}" \
         https://github.com/ollama/ollama.git "${source_dir}"
+    actual_commit="$(git -C "${source_dir}" rev-parse HEAD)"
+    if [[ "${tag}" == "${SUPPORTED_TAG}" ]]; then
+        [[ "${actual_commit}" == "${SUPPORTED_COMMIT}" ]] ||
+            die "${SUPPORTED_TAG} resolved to untrusted commit ${actual_commit}"
+    fi
 
     if [[ "${tag}" == "${SUPPORTED_TAG}" ]]; then
         git -C "${source_dir}" apply --check "${patch_file}"

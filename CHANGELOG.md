@@ -5,6 +5,8 @@ versioning while its public API is experimental.
 
 ## [Unreleased]
 
+## [0.1.0-rc.1] - 2026-07-29
+
 - Make release publication depend on hosted CI and a physical Hawk Point
   correctness, 1,000-completion soak, Ollama install/inference/rollback gate.
 - Pin every third-party GitHub Action to a full commit SHA.
@@ -13,6 +15,12 @@ versioning while its public API is experimental.
 - Add measured soak evidence and 32-token Qwen CPU BF16/NPU agreement reports.
 - Verify the pinned MLIR-AIE/XRT runner environment before hardware work and
   produce a controlled four-placement Ollama benchmark matrix.
+- Pin the Ollama source commit and Qwen manifest digest, enforce output
+  equality across all four placements, and recycle the XRT worker after every
+  inference error.
+- Fail the release gate unless XRT, firmware, kernel, amdxdna, GPU driver, and
+  CUDA UMD versions match `release-pins.json`; publish the observed stack as
+  hardware evidence.
 
 ## [0.1.0-alpha.1] - 2026-07-29
 
@@ -29,3 +37,4 @@ versioning while its public API is experimental.
   SBOM generation, and build provenance workflow.
 
 [0.1.0-alpha.1]: https://github.com/c8dhjp4tyv-bit/hawkpoint-npu-llm/releases/tag/v0.1.0-alpha.1
+[0.1.0-rc.1]: https://github.com/c8dhjp4tyv-bit/hawkpoint-npu-llm/compare/v0.1.0-alpha.1...v0.1.0-rc.1

@@ -30,8 +30,10 @@ The same gated hardware job runs 1,000 requests in each of CPU-only, GPU-only,
 CPU+GPU, and CPU+GPU+NPU placement modes with one pinned Qwen model and
 the same prompt, seed, generation length, and five-minute warm-up. It measures
 streaming time to the first emitted token, verifies deterministic response
-hashes, and publishes `ollama-placement-matrix.json` plus a rendered Markdown
-table.
+hashes both within and across all four placements, and publishes
+`ollama-placement-matrix.json` plus a rendered Markdown table. The benchmark
+refuses to start generation unless the pulled Ollama manifest matches the
+digest in `release-pins.json`.
 Release assets therefore contain the measured table for that exact release;
 this source document keeps empty cells so results are never copied between
 machines or releases. The evidence is also packed into a versioned tarball

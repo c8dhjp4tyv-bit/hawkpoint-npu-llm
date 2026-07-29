@@ -295,7 +295,7 @@ class ProcessCompletionEngine:
                         self._ready = True
                         return
                     else:
-                        self._ready = False
+                        self._terminate()
                         raise RuntimeError("inference worker request failed")
             except GeneratorExit:
                 self._terminate()
