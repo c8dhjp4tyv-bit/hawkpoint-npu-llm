@@ -5,9 +5,10 @@ first-generation AMD XDNA NPU in Phoenix and Hawk Point Ryzen AI processors.
 The implementation uses MLIR-AIE/IRON and targets the `npu1` AIE2 array
 directly.
 
-The GPU is not used. The CPU handles tokenization, orchestration, final argmax,
-printing, and reference validation. Decoder projections, RMSNorm, RoPE,
-attention, KV caches, residuals, and SwiGLU execute as AIE2 kernels.
+The GPU is not used. The CPU handles tokenization, orchestration, argmax,
+printing, reference validation, and Qwen's final LM head. Decoder projections,
+RMSNorm, RoPE, attention, KV caches, residuals, and SwiGLU execute as AIE2
+kernels.
 
 > Experimental research project. It is not affiliated with or supported by
 > AMD, Xilinx, Hugging Face, or the Open WebUI project.
@@ -35,10 +36,23 @@ the sunlight in all directions, including blue light. When sunlight enters
 the Earth's atmosphere,
 ```
 
-The experimental Qwen2.5 0.5B path was also validated against the upstream
-BF16 Transformers checkpoint with a 15-token ChatML prompt. Both runtimes
-selected token `40` (`I`) as the first response token. After the initial
-compile, Qwen prefill ran at about 9.5 seconds per token on the same NPU.
+The fused Qwen2.5 0.5B path was validated against both the NumPy BF16 runtime
+and the upstream BF16 Transformers checkpoint. On a 12-token prefix of the
+standard `Hello` ChatML prompt, the NPU and CPU selected the same token at all
+12 positions.
+
+| Qwen2.5 0.5B measurement | CPU | Fused NPU |
+|---|---:|---:|
+| Warm median latency | 0.669 s/token | **0.618 s/token** |
+| Warm mean latency | 0.676 s/token | **0.617 s/token** |
+| Median speedup | — | **1.084x** |
+| Token agreement | reference | **12/12** |
+
+The API prewarms the default model, moving the roughly 4.2-second compile/load
+cost to server startup. A real four-token `Hello` response produced
+`Hello! How can` at 1.47 decode tokens/s after prompt ingestion, using about
+2.4 GiB peak host RAM. Results are from the same Hawk Point system and vary
+with memory pressure and CPU BLAS configuration.
 
 ## What is included
 
@@ -124,8 +138,8 @@ python scripts/prepare_model.py \
 ```
 
 Qwen2.5 0.5B creates roughly 1.7 GiB of converted runtime files. Its decoder
-uses the numerically stable BF16 projection path and is substantially slower
-than the fused SmolLM path.
+uses two-layer persistent BF16 XDNA1 programs with explicit round-to-nearest-
+even conversion for numerically sensitive residual paths.
 
 Use `--models-dir /path/to/storage` to keep the source and converted weights on
 another disk. Pass that same directory to the launcher with `--models-dir`.
@@ -216,9 +230,11 @@ Select another installed model by changing the request's `model` field:
 ```
 
 An unknown or unprepared model returns `404 model_not_found`; it is never
-silently routed to a different checkpoint. Models are loaded lazily, and only
-one checkpoint is retained by the server at a time to limit host RAM usage.
-The first request after switching models includes its load/compile cost.
+silently routed to a different checkpoint. Only one checkpoint is retained by
+the server at a time to limit host RAM usage. The default model is loaded and
+prewarmed during server startup. A model selected later is prewarmed while it
+is switched in. Pass `--no-prewarm` directly to `api_server.py` only when
+deferred compilation is preferred.
 
 ## Hybrid NPU/CPU offload
 
@@ -228,19 +244,17 @@ Ollama's GPU layer offload; percentages describe decoder-layer placement, not
 an exact utilization or RAM split.
 
 For Qwen2.5 0.5B, `--npu-percent 60` maps 14 of 24 layers to the NPU and 10 to
-the CPU. On the validated Hawk Point system, a 4-NPU/20-CPU split was both
-faster and numerically closer to the BF16 reference:
+the CPU. The optimized default is now all 24 decoder layers on the NPU:
 
 ```bash
 python launcher.py openwebui \
-  --models-dir /path/to/models \
-  --npu-layers 4
+  --models-dir /path/to/models
 ```
 
 Use `--npu-layers 0` for the CPU reference path and omit both options for the
-original all-NPU path. CPU-offloaded layers retain their own CPU KV caches;
-NPU layers retain NPU-resident KV caches. Only the boundary hidden state moves
-between devices once per generated token.
+optimized all-NPU decoder path. CPU-offloaded layers retain their own CPU KV
+caches; NPU layers retain NPU-resident KV caches. Only the boundary hidden
+state moves between devices once per generated token.
 
 The server serializes requests because one physical NPU execution context is
 shared. It binds to `127.0.0.1` in API-only mode and `0.0.0.0` when it must be
@@ -281,6 +295,7 @@ Component examples:
 ```bash
 python npu_llm/tests/test_elementwise_npu.py
 python npu_llm/tests/test_qwen_components_npu.py
+python npu_llm/tests/benchmark_qwen_fused.py /path/to/converted-qwen
 python npu_llm/designs/rmsnorm.py --dev npu --size 576 -w 2 -i 5
 python npu_llm/designs/rope.py --dev npu --heads 12 --position 7 -w 2 -i 5
 ```
@@ -290,30 +305,26 @@ python npu_llm/designs/rope.py --dev npu --heads 12 --position 7 -w 2 -i 5
 Each generated token follows this path:
 
 1. Fetch the token embedding into an XRT buffer.
-2. Run the decoder layers using the fused SmolLM graph or the generalized
-   Qwen BF16 graph.
+2. Run the decoder layers using the fused SmolLM graph or persistent two-layer
+   Qwen BF16 programs.
 3. Keep the 64-token K/V cache in NPU-addressable XRT buffers.
-4. Apply final RMSNorm and the model-specific LM head on the NPU.
-5. Copy logits to the host for argmax and token decoding.
+4. Apply final RMSNorm and the model-specific LM head. Qwen uses a cached CPU
+   LM-head matrix while its 24 decoder layers remain on XDNA1.
+5. Select the next token and decode it on the host.
 
-The decoder-layer xclbin is compiled once and reused for all layers and token
-positions. Layer weights, hidden states, and K/V caches remain in XRT buffer
-objects; there is no CPU tensor-operation fallback.
+The decoder xclbin is compiled once and reused for every two-layer Qwen chunk
+and token position. Layer weights and K/V caches remain in XRT buffer objects.
 
 ## Limitations
 
 - The attention kernel currently has a fixed 64-token context.
 - Only the exact checkpoints and architectures listed above are supported.
-- Qwen2.5 0.5B support is experimental and much slower than SmolLM because it
-  uses generalized, unfused BF16 decoder graphs.
-- Large Qwen NPU offload counts can amplify BF16 rounding around sensitive
-  residual cancellations; four NPU layers matched the tested reference token,
-  while a 14-layer split did not.
+- Qwen2.5 0.5B support remains experimental despite matching the tested BF16
+  reference tokens and beating the current NumPy CPU baseline.
 - Generation is greedy; sampling parameters are accepted neither by the
   runtime nor the API.
-- The Python host currently invokes the resident decoder once per layer and
-  token. A multi-layer sequence exists experimentally, but current XRT firmware
-  is reliable with only two chained task groups.
+- Current XRT firmware is reliable with two decoder layers per persistent
+  invocation; the host invokes 12 such chunks for Qwen's 24-layer stack.
 - The project targets `npu1`; it is not an XDNA2 implementation.
 
 ## License

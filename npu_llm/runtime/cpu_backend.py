@@ -26,6 +26,7 @@ class CPUDecoderStage:
         self.epsilon = float(self.metadata.get("rms_norm_eps", 1e-5))
         self._weights = {}
         self._raw = {}
+        self._lm_head_f32 = None
         self.key_cache = {
             layer: np.zeros(
                 (self.kv_heads, context_length, self.head_dim),
@@ -170,6 +171,10 @@ class CPUDecoderStage:
 
     def logits(self, hidden):
         normalized = self.norm(hidden, "final_norm")
-        return np.asarray(
-            self.project("lm_head", normalized), dtype=np.float32
+        if self._lm_head_f32 is None:
+            self._lm_head_f32 = np.asarray(
+                self.weight("lm_head"), dtype=np.float32
+            )
+        return self._lm_head_f32 @ np.asarray(
+            _bf16(normalized), dtype=np.float32
         )

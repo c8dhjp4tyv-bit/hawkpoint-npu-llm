@@ -19,6 +19,7 @@ from designs.elementwise import (
 from designs.project import norm_project, project, project_residual
 from designs.project_bf16 import project_bf16, project_bf16_residual
 from designs.qkv_rope import qkv_rope
+from designs.qwen_decoder import qwen_decoder
 from designs.rmsnorm import rmsnorm
 from designs.tensor_copy import slice_bf16
 from runtime.model import XDNA1Model
@@ -65,14 +66,27 @@ class NPUDecoder:
         self._packed_layer_gammas = {}
         self._decoder_weights = None
         self._decoder_gammas = None
+        self._qwen_chunks = {}
+        self._qwen_host_buffers = {}
         self._embedding = (
             self._raw_bf16("token_embedding")
-            if self.npu_layers
+            if self.npu_layers and self.model_family != "qwen2"
+            else None
+        )
+        self._host_embedding = (
+            self.model.raw("token_embedding")
+            if self.npu_layers and self.model_family == "qwen2"
             else None
         )
         self.cpu_stage = (
             CPUDecoderStage(self.model, self.npu_layers, context_length)
-            if self.npu_layers < self.layers
+            if (
+                self.npu_layers < self.layers
+                or (
+                    self.model_family == "qwen2"
+                    and self.npu_layers == self.layers
+                )
+            )
             else None
         )
         self._cpu_embedding = (
@@ -81,17 +95,34 @@ class NPUDecoder:
             ).reshape(
                 self.model.metadata["vocab_size"], self.hidden_size
             )
-            if self.cpu_stage is not None
+            if self.npu_layers == 0
             else None
         )
-        self.kv_cache = [
-            iron.zeros(
-                (1, self.kv_heads, 2 * self.context_length * self.head_dim),
-                dtype=bfloat16,
-                device="npu",
-            )
-            for _ in range(self.npu_layers)
-        ]
+        self.kv_cache = (
+            []
+            if self.model_family == "qwen2"
+            else [
+                iron.zeros(
+                    (1, self.kv_heads, 2 * self.context_length * self.head_dim),
+                    dtype=bfloat16,
+                    device="npu",
+                )
+                for _ in range(self.npu_layers)
+            ]
+        )
+        self._qwen_cache = {}
+        if self.model_family == "qwen2":
+            for first in range(0, self.npu_layers, 2):
+                count = min(2, self.npu_layers - first)
+                self._qwen_cache[first] = iron.zeros(
+                    (
+                        count,
+                        self.kv_heads,
+                        2 * self.context_length * self.head_dim,
+                    ),
+                    dtype=bfloat16,
+                    device="npu",
+                )
 
     def _raw_bf16(self, name):
         if name not in self._raw_weights:
@@ -216,6 +247,14 @@ class NPUDecoder:
         return output
 
     def _embedding_for(self, token_id):
+        if self.model_family == "qwen2":
+            return iron.tensor(
+                np.asarray(
+                    self._host_embedding[token_id], dtype=np.float32
+                ).astype(bfloat16),
+                dtype=bfloat16,
+                device="npu",
+            )
         return self._slice(
             self._embedding,
             self.model.metadata["vocab_size"] * self.hidden_size,
@@ -230,9 +269,11 @@ class NPUDecoder:
             ** (np.arange(0, self.head_dim, 2) / self.head_dim)
         )
         angle = position * inv_freq
-        parts = [np.cos(angle), np.sin(angle)]
-        if self.model_family != "qwen2":
-            parts.append(np.array([position, 0.0], np.float32))
+        parts = [
+            np.cos(angle),
+            np.sin(angle),
+            np.array([position, 0.0], np.float32),
+        ]
         lut = np.concatenate(parts).astype(np.float32)
         return iron.tensor(lut.astype(bfloat16), dtype=bfloat16, device="npu")
 
@@ -314,6 +355,71 @@ class NPUDecoder:
                 device="npu",
             )
         return self._decoder_weights, self._decoder_gammas
+
+    def _packed_qwen_chunk(self, first, count):
+        key = (first, count)
+        if key not in self._qwen_chunks:
+            specs = {
+                "qkv": (72, 16, 896),
+                "o_proj": (56, 16, 896),
+                "gate_up": (608, 16, 896),
+                "down_proj": (224, 4, 4864),
+            }
+            projections = {name: [] for name in specs}
+            params = []
+            for layer in range(first, first + count):
+                prefix = f"layer{layer:02d}"
+                for name in projections:
+                    projections[name].append(
+                        np.asarray(
+                            self.model.bf16_projection(f"{prefix}.{name}")
+                        ).reshape(-1)
+                    )
+                bias = np.asarray(
+                    self.model.raw(f"{prefix}.qkv_bias"),
+                    dtype=np.float32,
+                )
+                bias_high = bias.astype(bfloat16)
+                bias_low = (
+                    bias - bias_high.astype(np.float32)
+                ).astype(bfloat16)
+                params.extend(
+                    [
+                        np.asarray(
+                            self.model.raw(f"{prefix}.input_norm")
+                        ).astype(bfloat16),
+                        np.asarray(
+                            self.model.raw(f"{prefix}.post_attn_norm")
+                        ).astype(bfloat16),
+                        bias_high,
+                        bias_low,
+                    ]
+                )
+
+            packed = []
+            for name, (blocks, rows, columns) in specs.items():
+                values = np.stack(projections[name])
+                if name == "down_proj":
+                    values = values.reshape(
+                        count, blocks * rows, 19, 256
+                    ).transpose(1, 0, 2, 3)
+                else:
+                    values = values.reshape(
+                        count, blocks, rows, columns
+                    ).transpose(1, 0, 2, 3)
+                packed.append(values.reshape(-1))
+            host_weights = np.concatenate(packed).astype(bfloat16)
+            host_params = np.concatenate(params).astype(bfloat16)
+            self._qwen_host_buffers[key] = (host_weights, host_params)
+            self._qwen_chunks[key] = (
+                iron.tensor(
+                    host_weights, dtype=bfloat16, device="npu"
+                ),
+                iron.tensor(
+                    host_params, dtype=bfloat16, device="npu"
+                ),
+            )
+        return self._qwen_chunks[key]
 
     def _layer(self, hidden, layer, position, rope_lut):
         if self.model_family == "qwen2":
@@ -417,8 +523,25 @@ class NPUDecoder:
         if self.npu_layers:
             hidden = self._embedding_for(token_id)
             rope_lut = self._rope_lut(position)
-            for layer in range(self.npu_layers):
-                hidden = self._layer(hidden, layer, position, rope_lut)
+            if self.model_family == "qwen2":
+                for first in range(0, self.npu_layers, 2):
+                    count = min(2, self.npu_layers - first)
+                    weights, params = self._packed_qwen_chunk(
+                        first, count
+                    )
+                    qwen_decoder(
+                        weights,
+                        params,
+                        rope_lut,
+                        hidden,
+                        self._qwen_cache[first],
+                        layers=count,
+                    )
+            else:
+                for layer in range(self.npu_layers):
+                    hidden = self._layer(
+                        hidden, layer, position, rope_lut
+                    )
         else:
             hidden = _bf16_cpu(self._cpu_embedding[token_id])
         if self.cpu_stage is not None:
@@ -444,6 +567,42 @@ class NPUDecoder:
         )
         next_token = int(np.argmax(logits.numpy().astype(np.float32)))
         return next_token, time.perf_counter() - start
+
+    def warmup(self):
+        """Compile and populate the hot path before the first request."""
+        if not self.npu_layers:
+            return
+        self.decode_token(self.tokenizer.eos_id, 0)
+        if self.model_family == "qwen2":
+            for first in range(0, self.npu_layers, 2):
+                count = min(2, self.npu_layers - first)
+                self._qwen_cache[first] = iron.zeros(
+                    (
+                        count,
+                        self.kv_heads,
+                        2 * self.context_length * self.head_dim,
+                    ),
+                    dtype=bfloat16,
+                    device="npu",
+                )
+        else:
+            self.kv_cache = [
+                iron.zeros(
+                    (
+                        1,
+                        self.kv_heads,
+                        2 * self.context_length * self.head_dim,
+                    ),
+                    dtype=bfloat16,
+                    device="npu",
+                )
+                for _ in range(self.npu_layers)
+            ]
+        if self.cpu_stage is not None:
+            for cache in self.cpu_stage.key_cache.values():
+                cache.fill(0)
+            for cache in self.cpu_stage.value_cache.values():
+                cache.fill(0)
 
     def generate_messages(self, messages, max_new_tokens=16):
         """Generate a response for an OpenAI-style list of chat messages.
