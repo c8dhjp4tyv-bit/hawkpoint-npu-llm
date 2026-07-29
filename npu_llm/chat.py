@@ -19,13 +19,26 @@ def main():
     )
     p.add_argument("--prompt")
     p.add_argument("--max-new-tokens", type=int, default=16)
+    offload = p.add_mutually_exclusive_group()
+    offload.add_argument("--npu-layers", type=int)
+    offload.add_argument("--npu-percent", type=float)
     p.add_argument(
         "--system-prompt",
         default="You are a helpful AI assistant named SmolLM.",
     )
     args = p.parse_args()
 
-    decoder = NPUDecoder(args.model)
+    npu_layers = args.npu_layers
+    if args.npu_percent is not None:
+        if not 0 <= args.npu_percent <= 100:
+            p.error("--npu-percent must be between 0 and 100")
+        import json
+
+        layers = int(
+            json.loads((args.model / "metadata.json").read_text())["layers"]
+        )
+        npu_layers = round(layers * args.npu_percent / 100.0)
+    decoder = NPUDecoder(args.model, npu_layers=npu_layers)
     messages = [{"role": "system", "content": args.system_prompt}]
 
     def complete(prompt):

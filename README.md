@@ -44,6 +44,7 @@ compile, Qwen prefill ran at about 9.5 seconds per token on the same NPU.
 
 - Interactive, multi-turn terminal chat with `/reset`, `/stats`, and `/exit`
 - Four selectable checkpoints across the SmolLM and Qwen families
+- Configurable NPU/CPU layer offload for hybrid execution
 - OpenAI-compatible `GET /v1/models`
 - OpenAI-compatible `POST /v1/chat/completions`
 - Streaming chat completions over server-sent events
@@ -154,6 +155,12 @@ python launcher.py openwebui
 
 # Models stored on another disk
 python launcher.py openwebui --models-dir /path/to/storage
+
+# Ollama-style hybrid offload: 60% of decoder layers on the NPU
+python launcher.py openwebui --npu-percent 60
+
+# Or select an exact number of leading NPU layers
+python launcher.py openwebui --npu-layers 4
 ```
 
 The Open WebUI container is preconfigured to reach the host API at
@@ -212,6 +219,28 @@ An unknown or unprepared model returns `404 model_not_found`; it is never
 silently routed to a different checkpoint. Models are loaded lazily, and only
 one checkpoint is retained by the server at a time to limit host RAM usage.
 The first request after switching models includes its load/compile cost.
+
+## Hybrid NPU/CPU offload
+
+Hybrid execution assigns a contiguous prefix of decoder layers to XDNA1 and
+the remaining layers plus the LM head to NumPy on the CPU. It is analogous to
+Ollama's GPU layer offload; percentages describe decoder-layer placement, not
+an exact utilization or RAM split.
+
+For Qwen2.5 0.5B, `--npu-percent 60` maps 14 of 24 layers to the NPU and 10 to
+the CPU. On the validated Hawk Point system, a 4-NPU/20-CPU split was both
+faster and numerically closer to the BF16 reference:
+
+```bash
+python launcher.py openwebui \
+  --models-dir /path/to/models \
+  --npu-layers 4
+```
+
+Use `--npu-layers 0` for the CPU reference path and omit both options for the
+original all-NPU path. CPU-offloaded layers retain their own CPU KV caches;
+NPU layers retain NPU-resident KV caches. Only the boundary hidden state moves
+between devices once per generated token.
 
 The server serializes requests because one physical NPU execution context is
 shared. It binds to `127.0.0.1` in API-only mode and `0.0.0.0` when it must be
@@ -277,6 +306,9 @@ objects; there is no CPU tensor-operation fallback.
 - Only the exact checkpoints and architectures listed above are supported.
 - Qwen2.5 0.5B support is experimental and much slower than SmolLM because it
   uses generalized, unfused BF16 decoder graphs.
+- Large Qwen NPU offload counts can amplify BF16 rounding around sensitive
+  residual cancellations; four NPU layers matched the tested reference token,
+  while a 14-layer split did not.
 - Generation is greedy; sampling parameters are accepted neither by the
   runtime nor the API.
 - The Python host currently invokes the resident decoder once per layer and

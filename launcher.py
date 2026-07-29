@@ -15,10 +15,14 @@ ROOT = Path(__file__).resolve().parent
 API = ROOT / "npu_llm/api_server.py"
 
 
-def api_command(host, models_dir=None):
+def api_command(host, models_dir=None, npu_layers=None, npu_percent=None):
     command = [sys.executable, str(API), "--host", host, "--port", "8000"]
     if models_dir:
         command.extend(["--models-dir", str(models_dir)])
+    if npu_layers is not None:
+        command.extend(["--npu-layers", str(npu_layers)])
+    if npu_percent is not None:
+        command.extend(["--npu-percent", str(npu_percent)])
     return command
 
 
@@ -35,10 +39,13 @@ def wait_for_api(process, timeout=120):
     raise TimeoutError("API server did not become ready within 120 seconds")
 
 
-def run_openwebui(models_dir=None):
+def run_openwebui(models_dir=None, npu_layers=None, npu_percent=None):
     if shutil.which("docker") is None:
         raise RuntimeError("Docker is required for the Open WebUI option")
-    api = subprocess.Popen(api_command("0.0.0.0", models_dir), cwd=ROOT)
+    api = subprocess.Popen(
+        api_command("0.0.0.0", models_dir, npu_layers, npu_percent),
+        cwd=ROOT,
+    )
     try:
         wait_for_api(api)
         print("Open WebUI will be available at http://localhost:3000")
@@ -63,6 +70,9 @@ def main():
         type=Path,
         help="directory containing converted model subdirectories",
     )
+    offload = parser.add_mutually_exclusive_group()
+    offload.add_argument("--npu-layers", type=int)
+    offload.add_argument("--npu-percent", type=float)
     args = parser.parse_args()
     mode = args.mode
     if mode is None:
@@ -73,12 +83,21 @@ def main():
 
     if mode == "api":
         subprocess.run(
-            api_command("127.0.0.1", args.models_dir),
+            api_command(
+                "127.0.0.1",
+                args.models_dir,
+                args.npu_layers,
+                args.npu_percent,
+            ),
             cwd=ROOT,
             check=True,
         )
     else:
-        run_openwebui(args.models_dir)
+        run_openwebui(
+            args.models_dir,
+            args.npu_layers,
+            args.npu_percent,
+        )
 
 
 if __name__ == "__main__":

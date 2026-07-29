@@ -327,7 +327,22 @@ def main():
         help="serve one converted model directory instead of scanning --models-dir",
     )
     parser.add_argument("--models-dir", type=Path, default=ROOT / "models")
+    offload = parser.add_mutually_exclusive_group()
+    offload.add_argument(
+        "--npu-layers",
+        type=int,
+        help="exact number of leading decoder layers to run on the NPU",
+    )
+    offload.add_argument(
+        "--npu-percent",
+        type=float,
+        help="percentage of leading decoder layers to run on the NPU",
+    )
     args = parser.parse_args()
+    if args.npu_percent is not None and not 0 <= args.npu_percent <= 100:
+        parser.error("--npu-percent must be between 0 and 100")
+    if args.npu_layers is not None and args.npu_layers < 0:
+        parser.error("--npu-layers cannot be negative")
 
     from runtime.generate import NPUDecoder
 
@@ -351,7 +366,15 @@ def main():
         parser.error(
             "no converted models found; run scripts/prepare_model.py first"
         )
-    engine = CompletionEngine(models, decoder_factory=NPUDecoder)
+    def decoder_factory(path):
+        metadata = json.loads((Path(path) / "metadata.json").read_text())
+        layers = int(metadata["layers"])
+        npu_layers = args.npu_layers
+        if args.npu_percent is not None:
+            npu_layers = round(layers * args.npu_percent / 100.0)
+        return NPUDecoder(path, npu_layers=npu_layers)
+
+    engine = CompletionEngine(models, decoder_factory=decoder_factory)
     server = ThreadingHTTPServer((args.host, args.port), make_handler(engine))
     print("Installed models: " + ", ".join(models), flush=True)
     print(f"OpenAI-compatible API: http://{args.host}:{args.port}/v1", flush=True)
