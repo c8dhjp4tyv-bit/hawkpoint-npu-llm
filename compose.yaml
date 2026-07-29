@@ -1,0 +1,17 @@
+services:
+  open-webui:
+    image: ghcr.io/open-webui/open-webui:main
+    container_name: hawkpoint-npu-open-webui
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:3000:8080"
+    environment:
+      OPENAI_API_BASE_URLS: "http://host.docker.internal:8000/v1"
+      OPENAI_API_KEYS: "local-npu"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - open-webui-data:/app/backend/data
+
+volumes:
+  open-webui-data:

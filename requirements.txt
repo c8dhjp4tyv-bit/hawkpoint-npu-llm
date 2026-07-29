@@ -1,0 +1,5 @@
+huggingface-hub>=0.28
+ml-dtypes>=0.5
+numpy>=2.1
+safetensors>=0.5
+tokenizers>=0.21

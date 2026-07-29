@@ -1,0 +1,16 @@
+ironenv/
+models/
+npu_llm/models/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.cache/
+*.xclbin
+*.insts.txt
+*.elf
+*.o
+build/
+dist/
+.venv/
+.idea/
+.vscode/
