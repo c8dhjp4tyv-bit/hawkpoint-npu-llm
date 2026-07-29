@@ -5,6 +5,13 @@ versioning while its public API is experimental.
 
 ## [Unreleased]
 
+## [0.1.0-rc.2] - 2026-07-29
+
+- Replace the Qwen agreement prompt that reached EOS before 32 tokens with a
+  long-form prompt and a checked-in 32-token CPU BF16 reference sequence.
+- Persist CPU, NPU, EOS, and mismatch evidence before failing the release gate.
+- Cap BLAS, OpenMP, NumExpr, and Go hardware-job parallelism at eight workers.
+
 ## [0.1.0-rc.1] - 2026-07-29
 
 - Make release publication depend on hosted CI and a physical Hawk Point
@@ -38,3 +45,4 @@ versioning while its public API is experimental.
 
 [0.1.0-alpha.1]: https://github.com/c8dhjp4tyv-bit/hawkpoint-npu-llm/releases/tag/v0.1.0-alpha.1
 [0.1.0-rc.1]: https://github.com/c8dhjp4tyv-bit/hawkpoint-npu-llm/compare/v0.1.0-alpha.1...v0.1.0-rc.1
+[0.1.0-rc.2]: https://github.com/c8dhjp4tyv-bit/hawkpoint-npu-llm/compare/v0.1.0-rc.1...v0.1.0-rc.2

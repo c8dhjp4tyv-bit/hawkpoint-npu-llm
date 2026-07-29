@@ -16,7 +16,49 @@ sys.path.insert(0, str(ROOT))
 from runtime.generate import NPUDecoder  # noqa: E402
 
 
-PROMPT = [{"role": "user", "content": "Reply with exactly OK."}]
+PROMPT = [
+    {
+        "role": "user",
+        "content": (
+            "Explain why the sky appears blue during the day in one detailed "
+            "paragraph with at least five sentences."
+        ),
+    }
+]
+EXPECTED_CPU_BF16_TOKENS = [
+    785,
+    12884,
+    7952,
+    6303,
+    2337,
+    279,
+    1899,
+    4152,
+    311,
+    279,
+    71816,
+    315,
+    39020,
+    553,
+    13673,
+    3015,
+    6973,
+    89492,
+    304,
+    279,
+    9237,
+    594,
+    16566,
+    13,
+    4220,
+    6973,
+    89492,
+    11,
+    892,
+    525,
+    13673,
+    9853,
+]
 
 
 def sequence(model_dir, npu_layers, count):
@@ -39,7 +81,7 @@ def sequence(model_dir, npu_layers, count):
             next_token, elapsed = decoder.decode_token(next_token, position)
             timings.append(elapsed)
             position += 1
-    return generated, timings
+    return generated, timings, decoder.tokenizer.eos_id
 
 
 def main():
@@ -48,26 +90,60 @@ def main():
     parser.add_argument("--tokens", type=int, default=32)
     parser.add_argument("--report", type=Path, required=True)
     args = parser.parse_args()
-    if not 32 <= args.tokens <= 63:
-        parser.error("--tokens must be between 32 and 63")
+    if args.tokens != len(EXPECTED_CPU_BF16_TOKENS):
+        parser.error(
+            f"--tokens must be {len(EXPECTED_CPU_BF16_TOKENS)} "
+            "for the pinned reference"
+        )
 
-    cpu_tokens, cpu_times = sequence(args.model_dir, 0, args.tokens)
+    cpu_tokens, cpu_times, eos_id = sequence(args.model_dir, 0, args.tokens)
     gc.collect()
-    npu_tokens, npu_times = sequence(args.model_dir, 24, args.tokens)
-    if cpu_tokens != npu_tokens:
-        differences = [
-            index
-            for index, pair in enumerate(zip(cpu_tokens, npu_tokens))
-            if pair[0] != pair[1]
-        ]
-        raise AssertionError(f"Qwen token mismatch at positions {differences}")
+    npu_tokens, npu_times, npu_eos_id = sequence(
+        args.model_dir,
+        24,
+        args.tokens,
+    )
+    if npu_eos_id != eos_id:
+        raise AssertionError("CPU and NPU tokenizers disagree on EOS")
+    cpu_reference_differences = [
+        index
+        for index, pair in enumerate(
+            zip(EXPECTED_CPU_BF16_TOKENS, cpu_tokens)
+        )
+        if pair[0] != pair[1]
+    ]
+    npu_reference_differences = [
+        index
+        for index, pair in enumerate(
+            zip(EXPECTED_CPU_BF16_TOKENS, npu_tokens)
+        )
+        if pair[0] != pair[1]
+    ]
+    cpu_npu_differences = [
+        index
+        for index, pair in enumerate(zip(cpu_tokens, npu_tokens))
+        if pair[0] != pair[1]
+    ]
+    cpu_eos_positions = [
+        index for index, token_id in enumerate(cpu_tokens) if token_id == eos_id
+    ]
+    npu_eos_positions = [
+        index for index, token_id in enumerate(npu_tokens) if token_id == eos_id
+    ]
     report = {
         "schema_version": 1,
         "prompt": PROMPT,
         "token_count": args.tokens,
-        "expected_cpu_bf16_token_ids": cpu_tokens,
+        "expected_cpu_bf16_token_ids": EXPECTED_CPU_BF16_TOKENS,
+        "actual_cpu_bf16_token_ids": cpu_tokens,
         "actual_npu_token_ids": npu_tokens,
-        "agreement": args.tokens,
+        "agreement": args.tokens - len(npu_reference_differences),
+        "cpu_reference_difference_positions": cpu_reference_differences,
+        "npu_reference_difference_positions": npu_reference_differences,
+        "cpu_npu_difference_positions": cpu_npu_differences,
+        "eos_token_id": eos_id,
+        "cpu_eos_positions": cpu_eos_positions,
+        "npu_eos_positions": npu_eos_positions,
         "cpu_median_seconds": statistics.median(cpu_times),
         "npu_median_seconds": statistics.median(npu_times),
     }
@@ -76,6 +152,20 @@ def main():
     temporary.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n")
     os.replace(temporary, args.report)
     print(json.dumps(report, indent=2, sort_keys=True))
+    if cpu_eos_positions and cpu_eos_positions[0] < args.tokens - 1:
+        raise AssertionError(
+            "CPU reference ended before the required token sequence length"
+        )
+    if cpu_reference_differences:
+        raise AssertionError(
+            "Qwen CPU BF16 reference changed at positions "
+            f"{cpu_reference_differences}"
+        )
+    if npu_reference_differences:
+        raise AssertionError(
+            "Qwen NPU reference mismatch at positions "
+            f"{npu_reference_differences}"
+        )
 
 
 if __name__ == "__main__":

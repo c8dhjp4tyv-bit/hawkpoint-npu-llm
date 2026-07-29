@@ -26,6 +26,9 @@ request counts, per-model results, median/p95 TTFT and token rate, start/end/
 peak RAM, peak observable GPU VRAM, available RAPL energy, model-switch
 failures, fixed CPU-BF16 token references, and matching XRT/NPU error lines.
 The Qwen release gate uploads its full 32-token CPU/NPU sequence separately.
+That gate checks both paths against a checked-in CPU BF16 reference generated
+from the pinned checkpoint and a fixed long-form prompt; EOS must not occur
+before the end of the sequence.
 The same gated hardware job runs 1,000 requests in each of CPU-only, GPU-only,
 CPU+GPU, and CPU+GPU+NPU placement modes with one pinned Qwen model and
 the same prompt, seed, generation length, and five-minute warm-up. It measures

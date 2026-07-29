@@ -19,6 +19,12 @@ jobs:
   hawk-point:
     runs-on: [self-hosted, linux, x64, xdna1, hawk-point]
     timeout-minutes: 360
+    env:
+      GOMAXPROCS: "8"
+      MKL_NUM_THREADS: "8"
+      NUMEXPR_NUM_THREADS: "8"
+      OMP_NUM_THREADS: "8"
+      OPENBLAS_NUM_THREADS: "8"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       - name: Configure pinned hardware toolchain
