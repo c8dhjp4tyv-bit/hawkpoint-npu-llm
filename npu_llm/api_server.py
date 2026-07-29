@@ -96,8 +96,16 @@ class CompletionEngine:
         gc.collect()
         print(f"Loading {model_id} from {record['path']} on XDNA1...", flush=True)
         self._active_decoder = self.decoder_factory(record["path"])
+        warmup = getattr(self._active_decoder, "warmup", None)
+        if warmup is not None:
+            print(f"Warming {model_id}...", flush=True)
+            warmup()
         self._active_model_id = model_id
         return self._active_decoder
+
+    def prewarm_default(self):
+        with self.lock:
+            self._load(self.default_model_id)
 
     def generate(self, model_id, messages, max_tokens):
         with self.lock:
@@ -327,6 +335,11 @@ def main():
         help="serve one converted model directory instead of scanning --models-dir",
     )
     parser.add_argument("--models-dir", type=Path, default=ROOT / "models")
+    parser.add_argument(
+        "--no-prewarm",
+        action="store_true",
+        help="defer model compilation until the first completion request",
+    )
     offload = parser.add_mutually_exclusive_group()
     offload.add_argument(
         "--npu-layers",
@@ -375,6 +388,8 @@ def main():
         return NPUDecoder(path, npu_layers=npu_layers)
 
     engine = CompletionEngine(models, decoder_factory=decoder_factory)
+    if not args.no_prewarm:
+        engine.prewarm_default()
     server = ThreadingHTTPServer((args.host, args.port), make_handler(engine))
     print("Installed models: " + ", ".join(models), flush=True)
     print(f"OpenAI-compatible API: http://{args.host}:{args.port}/v1", flush=True)
