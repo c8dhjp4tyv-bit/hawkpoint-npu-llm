@@ -21,10 +21,16 @@ The smaller component measurements already obtained during development remain
 in the README, but they are not substitutes for this controlled comparison.
 Empty cells are intentional: this repository does not invent benchmark data.
 
-The release soak uploads JSON evidence containing successful and failed
-request counts, per-model results, median/p95 TTFT and token rate, start/end/
-peak RAM, peak observable GPU VRAM, available RAPL energy, model-switch
-failures, fixed CPU-BF16 token references, and matching XRT/NPU error lines.
+The release runs two hardware endurance tests that upload JSON evidence. The
+endurance soak keeps each model resident under sustained load, running the
+1,000 completions as 250 consecutive requests per model; the model-switch
+stress test does the opposite, forcing at least 100 back-to-back model switches
+to exercise deterministic XRT/NPU context release. Each report contains
+successful and failed request counts, per-model results, median/p95 TTFT and
+token rate, start/end/peak RAM, the observed number of model switches,
+available RAPL energy, fixed CPU-BF16 token references, and matching XRT/NPU
+error lines. Either test fails the gate on any HTTP failure, token mismatch, or
+amdxdna/XRT/NPU kernel error.
 The Qwen release gate uploads its full 32-token CPU/NPU sequence separately.
 That gate checks both paths against a checked-in CPU BF16 reference generated
 from the pinned checkpoint and a fixed long-form prompt; EOS must not occur

@@ -1,14 +1,15 @@
 #!/usr/bin/env python3
-"""Sustained per-model endurance test for a separately started API.
+"""Bounded model-switch stress test for a separately started API.
 
-Runs a fixed number of completions (1000 by default) as consecutive per-model
-blocks of ``HAWKPOINT_SOAK_RUN_LENGTH`` requests (250 by default). This keeps
-each model resident under sustained load for a long stretch, which is what a
-real serving session looks like, while the dedicated ``switch_stress_api.py``
-covers rapid model switching.
+Where ``soak_api.py`` measures sustained per-model endurance, this test does the
+opposite: it switches the active model on *every* request, exercising the
+deterministic close/release of the previous model's XRT/NPU hardware context
+before the next one loads. This is the exact path that leaked driver contexts in
+the RC3 release soak (``DRM_IOCTL_AMDXDNA_CREATE_HWCTX`` -110 /
+``aie2_alloc_resource failed``).
 
-Zero tolerance: any HTTP failure, any token mismatch, or any amdxdna/XRT/NPU
-kernel error fails the gate.
+Zero tolerance: any HTTP failure, any token mismatch, any amdxdna/XRT/NPU kernel
+error, or fewer than the required number of switches fails the gate.
 """
 
 import os
@@ -30,23 +31,28 @@ from hardware_soak_common import (
 )
 
 
-COMPLETIONS = int(os.environ.get("HAWKPOINT_SOAK_COMPLETIONS", "1000"))
-RUN_LENGTH = int(os.environ.get("HAWKPOINT_SOAK_RUN_LENGTH", "250"))
-REPORT = Path(os.environ.get("HAWKPOINT_SOAK_REPORT", "soak-report.json"))
+REQUIRED_SWITCHES = int(os.environ.get("HAWKPOINT_SWITCH_COUNT", "100"))
+# One extra request so that REQUIRED_SWITCHES transitions actually occur
+# (the first request is never a switch). Callers may raise the iteration
+# count, but never below what is needed to reach the required switches.
+ITERATIONS = max(
+    REQUIRED_SWITCHES + 1,
+    int(os.environ.get("HAWKPOINT_SWITCH_ITERATIONS", "0")),
+)
+REPORT = Path(
+    os.environ.get("HAWKPOINT_SWITCH_REPORT", "switch-stress-report.json")
+)
 API_LOG = Path(os.environ.get("HAWKPOINT_API_LOG", "hawkpoint-api.log"))
-
-if RUN_LENGTH < 1:
-    raise SystemExit("HAWKPOINT_SOAK_RUN_LENGTH must be at least 1")
-
-
-def model_for(index, models):
-    """Consecutive blocks of RUN_LENGTH requests per model, round-robin."""
-    return models[(index // RUN_LENGTH) % len(models)]
 
 
 def main():
     expected = load_expected()
     models = installed_models(expected)
+    if len(models) < 2:
+        raise SystemExit(
+            "model-switch stress needs at least 2 installed models; "
+            f"found {len(models)}"
+        )
 
     started_epoch = int(time.time())
     start_energy = energy_uj()
@@ -57,12 +63,13 @@ def main():
     per_model = defaultdict(lambda: {"success": 0, "failure": 0})
     failures = []
     switches = 0
-    switch_errors = 0
+    switch_failures = 0
     previous_model = None
 
     with ResourceMonitor(API_PID) as monitor:
-        for index in range(COMPLETIONS):
-            model = model_for(index, models)
+        for index in range(ITERATIONS):
+            # Alternate on every request to force a model switch each time.
+            model = models[index % len(models)]
             switched = previous_model is not None and previous_model != model
             if switched:
                 switches += 1
@@ -75,27 +82,28 @@ def main():
             except REQUEST_ERRORS as exc:
                 per_model[model]["failure"] += 1
                 if switched:
-                    switch_errors += 1
+                    switch_failures += 1
                 failures.append(
                     {"index": index, "model": model, "error": str(exc)[:500]}
                 )
             previous_model = model
-            if index and index % 100 == 0:
-                print(f"completed {index}/{COMPLETIONS}", flush=True)
+            if index and index % 25 == 0:
+                print(f"switched {switches} (request {index}/{ITERATIONS})", flush=True)
 
     end_energy = energy_uj()
     xrt_errors = kernel_errors(started_epoch, API_LOG)
+    insufficient = switches < REQUIRED_SWITCHES
     report = {
         "schema_version": 2,
-        "test": "endurance",
+        "test": "model_switch_stress",
         "started_epoch": started_epoch,
         "completed_epoch": int(time.time()),
-        "requested_completions": COMPLETIONS,
-        "run_length_per_model": RUN_LENGTH,
+        "iterations": ITERATIONS,
+        "required_switches": REQUIRED_SWITCHES,
         "model_switches": switches,
         "successful_requests": len(latencies),
         "failed_requests": len(failures),
-        "model_switch_errors": switch_errors,
+        "switch_failures": switch_failures,
         "models": dict(per_model),
         "latency_seconds": summarize(latencies),
         "ttft_seconds": summarize(ttfts),
@@ -120,13 +128,14 @@ def main():
     }
     write_report(REPORT, report)
 
-    if failures or xrt_errors:
+    if failures or xrt_errors or insufficient:
         raise SystemExit(
-            f"FAIL failures={len(failures)} xrt_npu_errors={len(xrt_errors)}"
+            f"FAIL failures={len(failures)} xrt_npu_errors={len(xrt_errors)} "
+            f"switches={switches}/{REQUIRED_SWITCHES}"
         )
     print(
-        f"PASS {COMPLETIONS} measured completions "
-        f"({RUN_LENGTH} consecutive per model) across {len(models)} model(s)"
+        f"PASS {switches} model switches across {len(models)} models "
+        f"with no HTTP or XRT/NPU errors"
     )
 
 
