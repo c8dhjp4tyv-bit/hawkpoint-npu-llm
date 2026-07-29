@@ -150,6 +150,7 @@ if [[ "${rebuild_runtime}" -eq 1 ]]; then
         -B "${native_build}"
         -G Ninja
         -DCMAKE_BUILD_TYPE=Release
+        "-DOLLAMA_BUILD_PARALLEL=${jobs}"
     )
     if [[ "${backend}" != "cpu" ]]; then
         cmake_args+=("-DOLLAMA_LLAMA_BACKENDS=${backend}")
