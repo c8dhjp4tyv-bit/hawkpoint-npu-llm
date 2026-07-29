@@ -18,6 +18,8 @@ sys.path.insert(0, str(ROOT))
 from npu_llm.api_server import (  # noqa: E402
     BoundedHTTPServer,
     CompletionEngine,
+    InferenceTimeout,
+    ProcessCompletionEngine,
     ServerConfig,
     make_handler,
 )
@@ -56,6 +58,14 @@ class SlowDecoder:
     def generate_messages(self, messages, max_new_tokens):
         time.sleep(0.35)
         yield "done", {"generated_tokens": 1}
+
+
+class HangingDecoder:
+    context_length = 64
+
+    def generate_messages(self, messages, max_new_tokens):
+        time.sleep(30)
+        yield "unreachable", None
 
 
 def fetch(url, data=None, *, api_key=API_KEY, origin=None, raw=None):
@@ -117,6 +127,9 @@ def test_protocol_and_security():
     try:
         status, _, _ = fetch(f"{base}/v1/models", api_key=None)
         assert status == 401
+        status, body, _ = fetch(f"{base}/ready", api_key=None)
+        assert status == 200
+        assert json.loads(body)["status"] == "ready"
 
         status, body, headers = fetch(
             f"{base}/v1/models",
@@ -195,9 +208,37 @@ def test_backpressure_and_safe_errors():
         stop_server(server, thread)
 
 
+def test_hard_process_timeout():
+    engine = ProcessCompletionEngine(
+        {"smollm2-135m-xdna1": HangingDecoder()},
+        decoder_factory=None,
+        timeout=0.2,
+    )
+    started = time.monotonic()
+    try:
+        try:
+            list(
+                engine.generate(
+                    "smollm2-135m-xdna1",
+                    [{"role": "user", "content": "Hello"}],
+                    5,
+                    timeout=0.2,
+                )
+            )
+            raise AssertionError("hanging worker unexpectedly completed")
+        except InferenceTimeout:
+            pass
+        assert time.monotonic() - started < 3
+        assert engine.worker_restarts == 1
+        assert not engine.ready
+    finally:
+        engine.close()
+
+
 def main():
     test_protocol_and_security()
     test_backpressure_and_safe_errors()
+    test_hard_process_timeout()
     print("PASS API security and protocol")
 
 

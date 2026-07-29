@@ -304,6 +304,13 @@ threads. Defaults also include a 1 MiB request limit, 120-second socket
 timeout, 30 requests/minute/client rate limit, bearer authentication, safe
 internal errors, and an explicit browser-origin allowlist.
 
+The HTTP process never owns the XRT context. Inference runs in a persistent
+spawned worker process. If a request deadline expires, the worker is
+terminated, its NPU context is discarded, and the next request creates a fresh
+worker. `GET /health` reports HTTP-process liveness; `GET /ready` returns `200`
+only while a warmed inference worker is available, and `503` after a timeout
+until recovery succeeds.
+
 Both launcher modes bind the API to `127.0.0.1`; Open WebUI also binds only to
 localhost. To run the server directly with TLS, pass `--tls-cert CERT.pem
 --tls-key KEY.pem`. For non-local deployment, use a trusted TLS reverse proxy
@@ -339,9 +346,10 @@ Run the complete hardware acceptance test:
 python npu_llm/tests/validate_chat_npu.py
 ```
 
-The manual self-hosted workflow additionally performs fresh pinned downloads
-and conversion, model switching, 1,000 completions, and an Ollama build with
-`--jobs 8`. See [SUPPORT.md](SUPPORT.md) for the release gate and
+The tag-triggered release pipeline performs fresh pinned downloads and
+conversion, Qwen token agreement, measured model switching, 1,000
+completions, and an Ollama install/inference/rollback test with `--jobs 8`
+before its publish job can start. See [SUPPORT.md](SUPPORT.md) for the gate and
 [BENCHMARKS.md](BENCHMARKS.md) for the controlled comparison protocol.
 
 Component examples:

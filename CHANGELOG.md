@@ -3,6 +3,17 @@
 All notable changes are documented here. This project follows semantic
 versioning while its public API is experimental.
 
+## [Unreleased]
+
+- Make release publication depend on hosted CI and a physical Hawk Point
+  correctness, 1,000-completion soak, Ollama install/inference/rollback gate.
+- Pin every third-party GitHub Action to a full commit SHA.
+- Isolate XRT inference in a restartable worker process with hard termination
+  at the request deadline and separate liveness/readiness endpoints.
+- Add measured soak evidence and 32-token Qwen CPU BF16/NPU agreement reports.
+- Verify the pinned MLIR-AIE/XRT runner environment before hardware work and
+  produce a controlled four-placement Ollama benchmark matrix.
+
 ## [0.1.0-alpha.1] - 2026-07-29
 
 ### Added

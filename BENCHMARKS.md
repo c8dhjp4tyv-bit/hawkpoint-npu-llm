@@ -20,3 +20,19 @@ completions.
 The smaller component measurements already obtained during development remain
 in the README, but they are not substitutes for this controlled comparison.
 Empty cells are intentional: this repository does not invent benchmark data.
+
+The release soak uploads JSON evidence containing successful and failed
+request counts, per-model results, median/p95 TTFT and token rate, start/end/
+peak RAM, peak observable GPU VRAM, available RAPL energy, model-switch
+failures, fixed CPU-BF16 token references, and matching XRT/NPU error lines.
+The Qwen release gate uploads its full 32-token CPU/NPU sequence separately.
+The same gated hardware job runs 1,000 requests in each of CPU-only, GPU-only,
+CPU+GPU, and CPU+GPU+NPU placement modes with one pinned Qwen model and
+the same prompt, seed, generation length, and five-minute warm-up. It measures
+streaming time to the first emitted token, verifies deterministic response
+hashes, and publishes `ollama-placement-matrix.json` plus a rendered Markdown
+table.
+Release assets therefore contain the measured table for that exact release;
+this source document keeps empty cells so results are never copied between
+machines or releases. The evidence is also packed into a versioned tarball
+whose digest is covered by the release's keyless-signed `SHA256SUMS`.

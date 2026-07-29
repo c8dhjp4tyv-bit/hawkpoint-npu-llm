@@ -9,6 +9,7 @@ import hmac
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import logging
+import multiprocessing
 import os
 from pathlib import Path
 import socket
@@ -149,10 +150,184 @@ class CompletionEngine:
         with self.lock:
             self._load(self.default_model_id)
 
-    def generate(self, model_id, messages, max_tokens):
+    @property
+    def ready(self):
+        return True
+
+    def generate(self, model_id, messages, max_tokens, timeout=None):
         with self.lock:
             decoder = self._load(model_id)
             yield from decoder.generate_messages(messages, max_tokens)
+
+
+class InferenceTimeout(TimeoutError):
+    pass
+
+
+def _worker_loop(models, decoder_factory, connection):
+    engine = CompletionEngine(models, decoder_factory=decoder_factory)
+    try:
+        while True:
+            command = connection.recv()
+            if command["op"] == "close":
+                return
+            try:
+                if command["op"] == "prewarm":
+                    engine.prewarm_default()
+                    connection.send(("done", None))
+                    continue
+                for text, stats in engine.generate(
+                    command["model"],
+                    command["messages"],
+                    command["max_tokens"],
+                ):
+                    connection.send(("chunk", (text, stats)))
+                connection.send(("done", None))
+            except Exception as exc:
+                logging.exception("inference worker failed")
+                connection.send(("error", type(exc).__name__))
+    except (EOFError, BrokenPipeError, KeyboardInterrupt):
+        pass
+    finally:
+        connection.close()
+
+
+class ProcessCompletionEngine:
+    """Run the NPU/XRT context in a killable, restartable worker process."""
+
+    def __init__(self, models, decoder_factory, timeout=120):
+        catalog = CompletionEngine(models, decoder_factory=decoder_factory)
+        self.models = catalog.models
+        self.default_model_id = catalog.default_model_id
+        self.decoder_factory = decoder_factory
+        self.timeout = timeout
+        self._context = multiprocessing.get_context("spawn")
+        self._process = None
+        self._connection = None
+        self._lock = threading.Lock()
+        self._ready = False
+        self.worker_restarts = 0
+
+    def model_list(self):
+        return CompletionEngine(self.models).model_list()
+
+    def has_model(self, model_id):
+        return model_id in self.models
+
+    def context_length(self, model_id):
+        return int(self.models[model_id].get("context_length", 64))
+
+    @property
+    def ready(self):
+        return self._ready and self._process is not None and self._process.is_alive()
+
+    def _start(self):
+        if self._process is not None and self._process.is_alive():
+            return
+        parent, child = self._context.Pipe()
+        self._process = self._context.Process(
+            target=_worker_loop,
+            args=(self.models, self.decoder_factory, child),
+            daemon=True,
+            name="hawkpoint-npu-worker",
+        )
+        self._process.start()
+        child.close()
+        self._connection = parent
+        self._ready = False
+
+    def _terminate(self, count_restart=True):
+        self._ready = False
+        if self._connection is not None:
+            self._connection.close()
+            self._connection = None
+        if self._process is not None:
+            if self._process.is_alive():
+                self._process.terminate()
+                self._process.join(timeout=5)
+            if self._process.is_alive():
+                self._process.kill()
+                self._process.join(timeout=5)
+            self._process.close()
+            self._process = None
+        if count_restart:
+            self.worker_restarts += 1
+
+    def _receive(self, deadline):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0 or not self._connection.poll(remaining):
+            self._terminate()
+            raise InferenceTimeout("inference worker exceeded its deadline")
+        try:
+            return self._connection.recv()
+        except (EOFError, BrokenPipeError) as exc:
+            self._terminate()
+            raise RuntimeError("inference worker exited unexpectedly") from exc
+
+    def prewarm_default(self):
+        with self._lock:
+            self._start()
+            self._connection.send({"op": "prewarm"})
+            kind, _ = self._receive(time.monotonic() + self.timeout)
+            if kind != "done":
+                self._terminate()
+                raise RuntimeError("inference worker prewarm failed")
+            self._ready = True
+
+    def generate(self, model_id, messages, max_tokens, timeout=None):
+        deadline = time.monotonic() + (timeout or self.timeout)
+        with self._lock:
+            self._start()
+            self._connection.send(
+                {
+                    "op": "generate",
+                    "model": model_id,
+                    "messages": messages,
+                    "max_tokens": max_tokens,
+                }
+            )
+            try:
+                while True:
+                    kind, payload = self._receive(deadline)
+                    if kind == "chunk":
+                        yield payload
+                    elif kind == "done":
+                        self._ready = True
+                        return
+                    else:
+                        self._ready = False
+                        raise RuntimeError("inference worker request failed")
+            except GeneratorExit:
+                self._terminate()
+                raise
+
+    def close(self):
+        with self._lock:
+            if self._process is None:
+                return
+            try:
+                self._connection.send({"op": "close"})
+                self._process.join(timeout=5)
+            except (BrokenPipeError, OSError):
+                pass
+            finally:
+                self._terminate(count_restart=False)
+
+
+@dataclass(frozen=True)
+class NPUDecoderFactory:
+    npu_layers: int | None = None
+    npu_percent: float | None = None
+
+    def __call__(self, path):
+        from runtime.generate import NPUDecoder
+
+        metadata = json.loads((Path(path) / "metadata.json").read_text())
+        layers = int(metadata["layers"])
+        selected = self.npu_layers
+        if self.npu_percent is not None:
+            selected = round(layers * self.npu_percent / 100.0)
+        return NPUDecoder(path, npu_layers=selected)
 
 
 def make_handler(engine, config=None):
@@ -222,9 +397,20 @@ def make_handler(engine, config=None):
                 self._json(
                     {
                         "status": "ok",
+                        "service": "hawkpoint-npu-api",
+                    }
+                )
+                return
+            if self.path.rstrip("/") == "/ready":
+                ready = engine.ready
+                self._json(
+                    {
+                        "status": "ready" if ready else "not_ready",
                         "models": list(engine.models),
                         "device": "npu1",
-                    }
+                        "worker_restarts": getattr(engine, "worker_restarts", 0),
+                    },
+                    200 if ready else 503,
                 )
                 return
             if self.path.rstrip("/") == "/v1/models":
@@ -299,7 +485,10 @@ def make_handler(engine, config=None):
             stats = None
             try:
                 for text, final_stats in engine.generate(
-                    model_id, messages, max_tokens
+                    model_id,
+                    messages,
+                    max_tokens,
+                    timeout=config.request_timeout,
                 ):
                     if time.monotonic() > self._deadline:
                         raise TimeoutError
@@ -370,7 +559,10 @@ def make_handler(engine, config=None):
                 )
                 stats = None
                 for text, final_stats in engine.generate(
-                    model_id, messages, max_tokens
+                    model_id,
+                    messages,
+                    max_tokens,
+                    timeout=config.request_timeout,
                 ):
                     if time.monotonic() > self._deadline:
                         raise TimeoutError
@@ -486,8 +678,6 @@ def main():
     if args.npu_layers is not None and args.npu_layers < 0:
         parser.error("--npu-layers cannot be negative")
 
-    from runtime.generate import NPUDecoder
-
     if args.model:
         discovered = discover_models(args.model.parent)
         matching = {
@@ -508,15 +698,15 @@ def main():
         parser.error(
             "no converted models found; run scripts/prepare_model.py first"
         )
-    def decoder_factory(path):
-        metadata = json.loads((Path(path) / "metadata.json").read_text())
-        layers = int(metadata["layers"])
-        npu_layers = args.npu_layers
-        if args.npu_percent is not None:
-            npu_layers = round(layers * args.npu_percent / 100.0)
-        return NPUDecoder(path, npu_layers=npu_layers)
-
-    engine = CompletionEngine(models, decoder_factory=decoder_factory)
+    decoder_factory = NPUDecoderFactory(
+        npu_layers=args.npu_layers,
+        npu_percent=args.npu_percent,
+    )
+    engine = ProcessCompletionEngine(
+        models,
+        decoder_factory=decoder_factory,
+        timeout=args.request_timeout,
+    )
     if not args.no_prewarm:
         engine.prewarm_default()
     config = ServerConfig(
@@ -545,6 +735,7 @@ def main():
         pass
     finally:
         server.server_close()
+        engine.close()
 
 
 if __name__ == "__main__":

@@ -1,9 +1,6 @@
 name: XDNA1 hardware acceptance
 
 on:
-  push:
-    tags:
-      - "v*"
   workflow_dispatch:
     inputs:
       completions:
@@ -23,10 +20,9 @@ jobs:
     runs-on: [self-hosted, linux, x64, xdna1, hawk-point]
     timeout-minutes: 360
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-python@v7
-        with:
-          python-version: "3.12"
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - name: Configure pinned hardware toolchain
+        run: ./scripts/configure-hardware-runner.sh
       - name: Install locked Python dependencies
         run: python -m pip install --require-hashes -r requirements.lock
       - name: Verify fresh host prerequisites
@@ -46,11 +42,29 @@ jobs:
         run: |
           python npu_llm/tests/test_model_runtime.py
           python npu_llm/tests/validate_chat_npu.py
+      - name: Qwen component and 32-token agreement gate
+        env:
+          HAWKPOINT_QWEN_MODEL_DIR: ${{ runner.temp }}/hawkpoint-models/Qwen2.5-0.5B-Instruct-xdna1-w8a16
+        run: |
+          python npu_llm/tests/test_qwen_components_npu.py
+          python npu_llm/tests/validate_qwen_tokens.py \
+            "$HAWKPOINT_QWEN_MODEL_DIR" \
+            --tokens 32 \
+            --report "$RUNNER_TEMP/qwen-token-agreement.json"
+          python npu_llm/tests/benchmark_qwen_fused.py \
+            "$HAWKPOINT_QWEN_MODEL_DIR" \
+            --positions 32
       - name: Model switching and long-run API soak
         env:
           HAWKPOINT_SOAK_COMPLETIONS: ${{ inputs.completions || '1000' }}
           HAWKPOINT_API_KEY: hardware-ci-ephemeral-key
+          HAWKPOINT_SOAK_REPORT: ${{ runner.temp }}/hawkpoint-soak-report.json
+          HAWKPOINT_API_LOG: ${{ runner.temp }}/hawkpoint-api.log
+          HAWKPOINT_EXPECTED_TOKENS: ${{ runner.temp }}/expected-token-ids.json
         run: |
+          python tests/build_token_references.py \
+            "$RUNNER_TEMP/hawkpoint-models" \
+            --output "$HAWKPOINT_EXPECTED_TOKENS"
           python npu_llm/api_server.py \
             --models-dir "$RUNNER_TEMP/hawkpoint-models" \
             --api-key "$HAWKPOINT_API_KEY" \
@@ -59,10 +73,11 @@ jobs:
           api_pid=$!
           trap 'kill "$api_pid" 2>/dev/null || true' EXIT
           for _ in $(seq 1 180); do
-            curl -fsS http://127.0.0.1:8000/health >/dev/null && break
+            curl -fsS http://127.0.0.1:8000/ready >/dev/null && break
             sleep 1
           done
-          python tests/soak_api.py
+          curl -fsS http://127.0.0.1:8000/ready >/dev/null
+          HAWKPOINT_API_PID="$api_pid" python tests/soak_api.py
       - name: Build patched Ollama without installing
         run: |
           ./ollama-xdna/scripts/build-and-install.sh \
@@ -71,3 +86,14 @@ jobs:
             --no-install
       - name: Verify rollback script syntax
         run: bash -n ollama-xdna/scripts/rollback.sh
+      - name: Upload hardware evidence
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f
+        with:
+          name: xdna1-hardware-evidence-${{ github.run_id }}
+          if-no-files-found: warn
+          path: |
+            ${{ runner.temp }}/hawkpoint-soak-report.json
+            ${{ runner.temp }}/qwen-token-agreement.json
+            ${{ runner.temp }}/expected-token-ids.json
+            ${{ runner.temp }}/hawkpoint-api.log

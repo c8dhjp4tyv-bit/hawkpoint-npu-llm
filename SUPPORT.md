@@ -21,10 +21,22 @@ constraints.
 
 ## Release gate
 
-A release candidate is accepted only after hosted CI passes. A maintainer with
-a labeled Hawk Point runner must also run the manual `XDNA1 hardware
-acceptance` workflow for fresh dependency installation, pinned model download,
-conversion, token agreement, model switching, a 1,000-completion soak, Ollama
-build validation, and rollback-script validation. Until that external hardware
-run is attached to a release, the release remains alpha rather than
-production-ready.
+The tag-triggered `Gated release` workflow is one dependency chain. Hosted
+protocol/converter and upstream Ollama tests run first. The release then waits
+for a labeled physical Hawk Point runner to complete fresh pinned model
+conversion, SmolLM acceptance, Qwen component and 32-token CPU BF16/NPU
+agreement, a measured 1,000-completion model-switching soak, and an Ollama
+build/install/inference/rollback test. The SBOM, signing, provenance, and
+GitHub release job has `needs: hawk-point`; it cannot run when hardware is
+absent or any hardware gate fails.
+
+All third-party Actions are pinned to full commit SHAs. Repository Actions
+policy also requires full-length SHA pinning. The separately dispatchable
+`XDNA1 hardware acceptance` workflow is for pre-tag validation and does not
+publish releases.
+
+The self-hosted runner must keep the pinned MLIR-AIE checkout at
+`$HOME/mlir-aie`, or set `HAWKPOINT_MLIR_AIE_DIR`. Before any hardware work,
+`scripts/configure-hardware-runner.sh` verifies the full source commit, the
+dedicated Python environment, XRT libraries, Python bindings, and access to
+device 0. A mismatched or incomplete runner fails closed.

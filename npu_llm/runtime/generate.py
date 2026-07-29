@@ -634,6 +634,7 @@ class NPUDecoder:
         stats = {
             "prompt_tokens": len(prompt_ids),
             "generated_tokens": len(generated),
+            "generated_token_ids": generated,
             "npu_layers": self.npu_layers,
             "cpu_layers": self.layers - self.npu_layers,
             "finish_reason": (
