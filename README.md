@@ -1,8 +1,8 @@
 # Hawk Point NPU LLM
 
-Run the complete SmolLM2-135M-Instruct transformer data path on the first
-generation AMD XDNA NPU in Phoenix and Hawk Point Ryzen AI processors. The
-implementation uses MLIR-AIE/IRON and targets the `npu1` AIE2 array directly.
+Run compatible SmolLM 135M transformer checkpoints on the first-generation AMD
+XDNA NPU in Phoenix and Hawk Point Ryzen AI processors. The implementation uses
+MLIR-AIE/IRON and targets the `npu1` AIE2 array directly.
 
 The GPU is not used. The CPU handles tokenization, orchestration, final argmax,
 printing, and reference validation. Decoder projections, RMSNorm, RoPE,
@@ -37,6 +37,7 @@ the Earth's atmosphere,
 ## What is included
 
 - Interactive, multi-turn terminal chat with `/reset`, `/stats`, and `/exit`
+- Three selectable SmolLM 135M checkpoints
 - OpenAI-compatible `GET /v1/models`
 - OpenAI-compatible `POST /v1/chat/completions`
 - Streaming chat completions over server-sent events
@@ -46,6 +47,18 @@ the Earth's atmosphere,
 
 Conversation history is retained by the client and automatically trimmed to
 the newest tokens that fit the current 64-token hardware context.
+
+## Supported models
+
+| API model ID | Hugging Face checkpoint | Intended use |
+|---|---|---|
+| `smollm2-135m-xdna1` | `HuggingFaceTB/SmolLM2-135M-Instruct` | Default assistant |
+| `smollm-135m-xdna1` | `HuggingFaceTB/SmolLM-135M-Instruct` | Previous-generation assistant |
+| `smollm2-135m-sft-xdna1` | `HuggingFaceTB/smollm2-135M-SFT-Only` | SFT comparison/research |
+
+The converter rejects checkpoints whose hidden size, intermediate size, layer
+count, attention layout, or vocabulary do not match the fixed hardware graph.
+SmolLM2-360M and SmolLM2-1.7B are therefore not silently accepted.
 
 ## Requirements
 
@@ -86,6 +99,23 @@ python scripts/prepare_model.py
 XDNA1 runtime representation under `npu_llm/models/`. Model weights are not
 stored in this Git repository.
 
+Prepare every supported model:
+
+```bash
+python scripts/prepare_model.py --all
+```
+
+Or choose one or more explicitly:
+
+```bash
+python scripts/prepare_model.py \
+  --model smollm2-135m-xdna1 \
+  --model smollm-135m-xdna1
+```
+
+Use `--models-dir /path/to/storage` to keep the source and converted weights on
+another disk. Pass that same directory to the launcher with `--models-dir`.
+
 Verify the NPU:
 
 ```bash
@@ -108,10 +138,15 @@ python launcher.py api
 
 # API + Open WebUI: http://localhost:3000
 python launcher.py openwebui
+
+# Models stored on another disk
+python launcher.py openwebui --models-dir /path/to/storage
 ```
 
 The Open WebUI container is preconfigured to reach the host API at
-`http://host.docker.internal:8000/v1`. Its data is kept in a Docker volume.
+`http://host.docker.internal:8000/v1`. Its model picker displays every
+installed checkpoint returned by `/v1/models`. Its data is kept in a Docker
+volume.
 
 Run the terminal chatbot:
 
@@ -151,13 +186,27 @@ curl http://localhost:8000/v1/chat/completions \
 
 For streaming output, set `"stream": true`.
 
+Select another installed model by changing the request's `model` field:
+
+```json
+{
+  "model": "smollm-135m-xdna1",
+  "messages": [{"role": "user", "content": "Say hello."}]
+}
+```
+
+An unknown or unprepared model returns `404 model_not_found`; it is never
+silently routed to a different checkpoint. Models are loaded lazily, and only
+one checkpoint is retained by the server at a time to limit host RAM usage.
+The first request after switching models includes its load/compile cost.
+
 The server serializes requests because one physical NPU execution context is
 shared. It binds to `127.0.0.1` in API-only mode and `0.0.0.0` when it must be
 reachable from the local Open WebUI container. Open WebUI itself is published
 only on `127.0.0.1:3000`. The API has no authentication, so use the Open WebUI
 mode only on a trusted network or protect port 8000 with a firewall.
 
-## Convert the model manually
+## Convert a model manually
 
 ```bash
 python npu_llm/tools/convert_smollm2.py \
@@ -210,7 +259,7 @@ objects; there is no CPU tensor-operation fallback.
 ## Limitations
 
 - The attention kernel currently has a fixed 64-token context.
-- Only SmolLM2-135M-Instruct is supported.
+- Only the compatible SmolLM 135M checkpoints listed above are supported.
 - Generation is greedy; sampling parameters are accepted neither by the
   runtime nor the API.
 - The Python host currently invokes the resident decoder once per layer and

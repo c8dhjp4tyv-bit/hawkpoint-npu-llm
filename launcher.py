@@ -15,8 +15,11 @@ ROOT = Path(__file__).resolve().parent
 API = ROOT / "npu_llm/api_server.py"
 
 
-def api_command(host):
-    return [sys.executable, str(API), "--host", host, "--port", "8000"]
+def api_command(host, models_dir=None):
+    command = [sys.executable, str(API), "--host", host, "--port", "8000"]
+    if models_dir:
+        command.extend(["--models-dir", str(models_dir)])
+    return command
 
 
 def wait_for_api(process, timeout=120):
@@ -32,10 +35,10 @@ def wait_for_api(process, timeout=120):
     raise TimeoutError("API server did not become ready within 120 seconds")
 
 
-def run_openwebui():
+def run_openwebui(models_dir=None):
     if shutil.which("docker") is None:
         raise RuntimeError("Docker is required for the Open WebUI option")
-    api = subprocess.Popen(api_command("0.0.0.0"), cwd=ROOT)
+    api = subprocess.Popen(api_command("0.0.0.0", models_dir), cwd=ROOT)
     try:
         wait_for_api(api)
         print("Open WebUI will be available at http://localhost:3000")
@@ -55,6 +58,11 @@ def run_openwebui():
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("mode", nargs="?", choices=["api", "openwebui"])
+    parser.add_argument(
+        "--models-dir",
+        type=Path,
+        help="directory containing converted model subdirectories",
+    )
     args = parser.parse_args()
     mode = args.mode
     if mode is None:
@@ -64,9 +72,13 @@ def main():
         mode = "openwebui" if choice == "2" else "api"
 
     if mode == "api":
-        subprocess.run(api_command("127.0.0.1"), cwd=ROOT, check=True)
+        subprocess.run(
+            api_command("127.0.0.1", args.models_dir),
+            cwd=ROOT,
+            check=True,
+        )
     else:
-        run_openwebui()
+        run_openwebui(args.models_dir)
 
 
 if __name__ == "__main__":

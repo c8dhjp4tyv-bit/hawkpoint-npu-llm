@@ -21,6 +21,18 @@ def test_per_channel_quantization():
     assert np.all(error.max(axis=1) <= scale / 2 + 1e-6)
 
 
+def test_architecture_validation():
+    valid = dict(CONVERTER.EXPECTED_ARCHITECTURE)
+    CONVERTER._validate_architecture(valid)
+    invalid = {**valid, "hidden_size": 960}
+    try:
+        CONVERTER._validate_architecture(invalid)
+        raise AssertionError("incompatible architecture unexpectedly accepted")
+    except ValueError as exc:
+        assert "hidden_size=960" in str(exc)
+
+
 if __name__ == "__main__":
     test_per_channel_quantization()
+    test_architecture_validation()
     print("PASS!")

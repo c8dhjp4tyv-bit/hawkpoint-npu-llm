@@ -44,7 +44,14 @@ def fetch(url, data=None):
 def main():
     server = ThreadingHTTPServer(
         ("127.0.0.1", 0),
-        make_handler(CompletionEngine(FakeDecoder())),
+        make_handler(
+            CompletionEngine(
+                {
+                    "smollm2-135m-xdna1": FakeDecoder(),
+                    "smollm-135m-xdna1": FakeDecoder(),
+                }
+            )
+        ),
     )
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
@@ -53,6 +60,7 @@ def main():
         status, body = fetch(f"{base}/v1/models")
         assert status == 200
         assert json.loads(body)["data"][0]["id"] == "smollm2-135m-xdna1"
+        assert len(json.loads(body)["data"]) == 2
 
         payload = {
             "model": "smollm2-135m-xdna1",
@@ -72,6 +80,13 @@ def main():
         assert '"content":"Hello"' in body
         assert '"finish_reason":"length"' in body
         assert "data: [DONE]" in body
+
+        payload["model"] = "not-installed"
+        try:
+            fetch(f"{base}/v1/chat/completions", payload)
+            raise AssertionError("unknown model request unexpectedly succeeded")
+        except Exception as exc:
+            assert getattr(exc, "code", None) == 404
     finally:
         server.shutdown()
         server.server_close()

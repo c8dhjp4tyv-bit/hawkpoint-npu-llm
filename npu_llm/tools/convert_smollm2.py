@@ -9,6 +9,16 @@ from ml_dtypes import bfloat16  # noqa: F401 - registers BF16 with NumPy
 from safetensors import safe_open
 
 
+EXPECTED_ARCHITECTURE = {
+    "hidden_size": 576,
+    "intermediate_size": 1536,
+    "num_attention_heads": 9,
+    "num_key_value_heads": 3,
+    "num_hidden_layers": 30,
+    "vocab_size": 49152,
+}
+
+
 def _tensor_files(model_dir: Path):
     index = model_dir / "model.safetensors.index.json"
     if index.exists():
@@ -75,8 +85,33 @@ def write_raw(out_dir, name, array, dtype, manifest):
     }
 
 
-def convert(model_dir: Path, out_dir: Path):
+def _validate_architecture(config):
+    mismatches = {
+        name: (config.get(name), expected)
+        for name, expected in EXPECTED_ARCHITECTURE.items()
+        if config.get(name) != expected
+    }
+    if mismatches:
+        details = ", ".join(
+            f"{name}={actual!r} (expected {expected})"
+            for name, (actual, expected) in mismatches.items()
+        )
+        raise ValueError(
+            "model is incompatible with the fixed SmolLM 135M XDNA1 graph: "
+            + details
+        )
+
+
+def convert(
+    model_dir: Path,
+    out_dir: Path,
+    *,
+    model_id=None,
+    source_model=None,
+    display_name=None,
+):
     config = json.loads((model_dir / "config.json").read_text())
+    _validate_architecture(config)
     out_dir.mkdir(parents=True, exist_ok=True)
     reader = TensorReader(model_dir)
     layers = int(config["num_hidden_layers"])
@@ -91,11 +126,18 @@ def convert(model_dir: Path, out_dir: Path):
         ),
         "layers": layers,
         "vocab_size": int(config["vocab_size"]),
+        "rope_theta": float(config.get("rope_theta", 10000.0)),
         "context_length": 64,
         "activation_dtype": "int16",
         "accumulator_dtype": "int32",
         "tensors": {},
     }
+    if model_id:
+        manifest["model_id"] = model_id
+    if source_model:
+        manifest["source_model"] = source_model
+    if display_name:
+        manifest["display_name"] = display_name
 
     embed = reader.get("model.embed_tokens.weight")
     write_raw(out_dir, "token_embedding", embed, np.float16, manifest)

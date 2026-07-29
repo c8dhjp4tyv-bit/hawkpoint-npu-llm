@@ -131,9 +131,9 @@ class NPUDecoder:
             self.hidden_size,
         )
 
-    @staticmethod
-    def _rope_lut(position):
-        inv_freq = 1.0 / (100000.0 ** (np.arange(0, 64, 2) / 64.0))
+    def _rope_lut(self, position):
+        rope_theta = float(self.model.metadata.get("rope_theta", 100000.0))
+        inv_freq = 1.0 / (rope_theta ** (np.arange(0, 64, 2) / 64.0))
         angle = position * inv_freq
         lut = np.concatenate(
             [

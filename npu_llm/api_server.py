@@ -2,6 +2,7 @@
 """Small OpenAI-compatible HTTP server for the XDNA1 SmolLM2 runtime."""
 
 import argparse
+import gc
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 from pathlib import Path
@@ -12,7 +13,10 @@ import uuid
 
 
 ROOT = Path(__file__).resolve().parent
-MODEL_ID = "smollm2-135m-xdna1"
+try:
+    from .model_catalog import DEFAULT_MODEL_ID, discover_models
+except ImportError:
+    from model_catalog import DEFAULT_MODEL_ID, discover_models
 
 
 def _completion_id():
@@ -37,15 +41,68 @@ def _validate_messages(value):
 
 
 class CompletionEngine:
-    """Serialize access to one physical NPU and expose completion helpers."""
+    """Lazily load selected models and serialize access to one physical NPU."""
 
-    def __init__(self, decoder):
-        self.decoder = decoder
+    def __init__(self, models, decoder_factory=None):
+        if not models:
+            raise ValueError("no converted models were found")
+        self.models = {}
+        for model_id, record in models.items():
+            if hasattr(record, "generate_messages"):
+                record = {
+                    "decoder": record,
+                    "display_name": model_id,
+                    "context_length": record.context_length,
+                }
+            self.models[model_id] = dict(record)
+        self.default_model_id = (
+            DEFAULT_MODEL_ID
+            if DEFAULT_MODEL_ID in self.models
+            else next(iter(self.models))
+        )
+        self.decoder_factory = decoder_factory
+        self._active_model_id = None
+        self._active_decoder = None
         self.lock = threading.Lock()
 
-    def generate(self, messages, max_tokens):
+    def model_list(self):
+        return [
+            {
+                "id": model_id,
+                "object": "model",
+                "created": 0,
+                "owned_by": "local",
+                "name": record.get("display_name", model_id),
+            }
+            for model_id, record in self.models.items()
+        ]
+
+    def has_model(self, model_id):
+        return model_id in self.models
+
+    def context_length(self, model_id):
+        return int(self.models[model_id].get("context_length", 64))
+
+    def _load(self, model_id):
+        record = self.models[model_id]
+        if "decoder" in record:
+            return record["decoder"]
+        if self._active_model_id == model_id:
+            return self._active_decoder
+        if self.decoder_factory is None:
+            raise RuntimeError("no decoder factory configured")
+        self._active_decoder = None
+        self._active_model_id = None
+        gc.collect()
+        print(f"Loading {model_id} from {record['path']} on XDNA1...", flush=True)
+        self._active_decoder = self.decoder_factory(record["path"])
+        self._active_model_id = model_id
+        return self._active_decoder
+
+    def generate(self, model_id, messages, max_tokens):
         with self.lock:
-            yield from self.decoder.generate_messages(messages, max_tokens)
+            decoder = self._load(model_id)
+            yield from decoder.generate_messages(messages, max_tokens)
 
 
 def make_handler(engine):
@@ -78,12 +135,12 @@ def make_handler(engine):
             self.end_headers()
             self.wfile.write(body)
 
-        def _error(self, message, status=400):
+        def _error(self, message, status=400, error_type="invalid_request_error"):
             self._json(
                 {
                     "error": {
                         "message": str(message),
-                        "type": "invalid_request_error",
+                        "type": error_type,
                     }
                 },
                 status,
@@ -94,20 +151,19 @@ def make_handler(engine):
 
         def do_GET(self):
             if self.path.rstrip("/") == "/health":
-                self._json({"status": "ok", "model": MODEL_ID, "device": "npu1"})
+                self._json(
+                    {
+                        "status": "ok",
+                        "models": list(engine.models),
+                        "device": "npu1",
+                    }
+                )
                 return
             if self.path.rstrip("/") == "/v1/models":
                 self._json(
                     {
                         "object": "list",
-                        "data": [
-                            {
-                                "id": MODEL_ID,
-                                "object": "model",
-                                "created": 0,
-                                "owned_by": "local",
-                            }
-                        ],
+                        "data": engine.model_list(),
                     }
                 )
                 return
@@ -121,25 +177,35 @@ def make_handler(engine):
                 length = int(self.headers.get("Content-Length", "0"))
                 request = json.loads(self.rfile.read(length))
                 messages = _validate_messages(request.get("messages"))
+                model_id = request.get("model") or engine.default_model_id
+                if not engine.has_model(model_id):
+                    self._error(
+                        f"model {model_id!r} is not installed",
+                        404,
+                        "model_not_found",
+                    )
+                    return
                 requested = int(request.get("max_tokens", 16))
                 max_tokens = min(
                     max(1, requested),
-                    engine.decoder.context_length - 1,
+                    engine.context_length(model_id) - 1,
                 )
             except (ValueError, TypeError, json.JSONDecodeError) as exc:
                 self._error(exc)
                 return
 
             if request.get("stream", False):
-                self._stream(messages, max_tokens)
+                self._stream(model_id, messages, max_tokens)
             else:
-                self._complete(messages, max_tokens)
+                self._complete(model_id, messages, max_tokens)
 
-        def _complete(self, messages, max_tokens):
+        def _complete(self, model_id, messages, max_tokens):
             pieces = []
             stats = None
             try:
-                for text, final_stats in engine.generate(messages, max_tokens):
+                for text, final_stats in engine.generate(
+                    model_id, messages, max_tokens
+                ):
                     pieces.append(text)
                     if final_stats is not None:
                         stats = final_stats
@@ -155,7 +221,7 @@ def make_handler(engine):
                     "id": _completion_id(),
                     "object": "chat.completion",
                     "created": int(time.time()),
-                    "model": MODEL_ID,
+                    "model": model_id,
                     "choices": [
                         {
                             "index": 0,
@@ -175,7 +241,7 @@ def make_handler(engine):
                 }
             )
 
-        def _stream(self, messages, max_tokens):
+        def _stream(self, model_id, messages, max_tokens):
             completion_id = _completion_id()
             created = int(time.time())
             self._headers(200, "text/event-stream")
@@ -191,7 +257,7 @@ def make_handler(engine):
                         "id": completion_id,
                         "object": "chat.completion.chunk",
                         "created": created,
-                        "model": MODEL_ID,
+                        "model": model_id,
                         "choices": [
                             {
                                 "index": 0,
@@ -202,14 +268,16 @@ def make_handler(engine):
                     }
                 )
                 stats = None
-                for text, final_stats in engine.generate(messages, max_tokens):
+                for text, final_stats in engine.generate(
+                    model_id, messages, max_tokens
+                ):
                     if text:
                         send(
                             {
                                 "id": completion_id,
                                 "object": "chat.completion.chunk",
                                 "created": created,
-                                "model": MODEL_ID,
+                                "model": model_id,
                                 "choices": [
                                     {
                                         "index": 0,
@@ -226,7 +294,7 @@ def make_handler(engine):
                         "id": completion_id,
                         "object": "chat.completion.chunk",
                         "created": created,
-                        "model": MODEL_ID,
+                        "model": model_id,
                         "choices": [
                             {
                                 "index": 0,
@@ -256,15 +324,36 @@ def main():
     parser.add_argument(
         "--model",
         type=Path,
-        default=ROOT / "models/SmolLM2-135M-Instruct-xdna1-w8a16",
+        help="serve one converted model directory instead of scanning --models-dir",
     )
+    parser.add_argument("--models-dir", type=Path, default=ROOT / "models")
     args = parser.parse_args()
 
     from runtime.generate import NPUDecoder
 
-    print(f"Loading {MODEL_ID} from {args.model} on XDNA1...", flush=True)
-    engine = CompletionEngine(NPUDecoder(args.model))
+    if args.model:
+        discovered = discover_models(args.model.parent)
+        matching = {
+            model_id: record
+            for model_id, record in discovered.items()
+            if record["path"].resolve() == args.model.resolve()
+        }
+        models = matching or {
+            DEFAULT_MODEL_ID: {
+                "path": args.model,
+                "display_name": DEFAULT_MODEL_ID,
+                "context_length": 64,
+            }
+        }
+    else:
+        models = discover_models(args.models_dir)
+    if not models:
+        parser.error(
+            "no converted models found; run scripts/prepare_model.py first"
+        )
+    engine = CompletionEngine(models, decoder_factory=NPUDecoder)
     server = ThreadingHTTPServer((args.host, args.port), make_handler(engine))
+    print("Installed models: " + ", ".join(models), flush=True)
     print(f"OpenAI-compatible API: http://{args.host}:{args.port}/v1", flush=True)
     try:
         server.serve_forever()
