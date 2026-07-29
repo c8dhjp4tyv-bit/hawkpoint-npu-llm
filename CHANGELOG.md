@@ -5,6 +5,20 @@ versioning while its public API is experimental.
 
 ## [Unreleased]
 
+- Fix the RC3 release blocker: deterministically close the active decoder and
+  release its XRT/NPU hardware context before another model loads, in worker
+  finally blocks and on worker termination, instead of relying on garbage
+  collection. This exhausted the driver's system-wide context pool during long
+  model-switching runs (`DRM_IOCTL_AMDXDNA_CREATE_HWCTX` -110,
+  `aie2_alloc_resource failed`) and produced one HTTP 500 in the 1,000-completion
+  soak.
+- Split the hardware endurance coverage: keep the 1,000-completion soak but run
+  it as 250 consecutive requests per model, and add a dedicated bounded
+  model-switch stress test of at least 100 switches. Both preserve zero-tolerance
+  reporting for HTTP failures and amdxdna/XRT/NPU kernel errors.
+- Add tests proving an inference error tears down and recreates the worker
+  process, and that a model switch deterministically closes the previous decoder.
+
 ## [0.1.0-rc.3] - 2026-07-29
 
 - Publish full fused-Qwen top-five logit and latency evidence for 32 prefill

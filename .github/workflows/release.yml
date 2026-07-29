@@ -88,11 +88,14 @@ jobs:
             "$HAWKPOINT_QWEN_MODEL_DIR" \
             --positions 32 \
             --report "$RUNNER_TEMP/qwen-fused-benchmark.json"
-      - name: Start API and run 1,000-completion soak
+      - name: Start API, model-switch stress, and endurance soak
         env:
           HAWKPOINT_API_KEY: release-hardware-ephemeral-key
           HAWKPOINT_SOAK_COMPLETIONS: "1000"
+          HAWKPOINT_SOAK_RUN_LENGTH: "250"
+          HAWKPOINT_SWITCH_COUNT: "100"
           HAWKPOINT_SOAK_REPORT: ${{ runner.temp }}/hawkpoint-soak-report.json
+          HAWKPOINT_SWITCH_REPORT: ${{ runner.temp }}/hawkpoint-switch-stress-report.json
           HAWKPOINT_API_LOG: ${{ runner.temp }}/hawkpoint-api.log
           HAWKPOINT_EXPECTED_TOKENS: ${{ runner.temp }}/expected-token-ids.json
         run: |
@@ -111,6 +114,7 @@ jobs:
             sleep 1
           done
           curl -fsS http://127.0.0.1:8000/ready >/dev/null
+          HAWKPOINT_API_PID="$api_pid" python tests/switch_stress_api.py
           HAWKPOINT_API_PID="$api_pid" python tests/soak_api.py
       - name: Ollama build, install, inference, and rollback gate
         run: |
@@ -169,6 +173,7 @@ jobs:
           if-no-files-found: error
           path: |
             ${{ runner.temp }}/hawkpoint-soak-report.json
+            ${{ runner.temp }}/hawkpoint-switch-stress-report.json
             ${{ runner.temp }}/qwen-token-agreement.json
             ${{ runner.temp }}/qwen-fused-benchmark.json
             ${{ runner.temp }}/expected-token-ids.json

@@ -1,5 +1,7 @@
 """Host orchestration for the supported NPU-only decode graphs."""
 
+import gc
+import logging
 import resource
 import time
 
@@ -31,6 +33,7 @@ class NPUDecoder:
     def __init__(self, model_dir, context_length=64, npu_layers=None):
         if context_length != 64:
             raise ValueError("the current NPU attention kernel has a fixed 64-token cache")
+        self._closed = False
         self.model = XDNA1Model(model_dir)
         self.model_family = self.model.metadata.get("model_family", "llama")
         default_system = (
@@ -674,3 +677,49 @@ class NPUDecoder:
             [{"role": "user", "content": prompt}],
             max_new_tokens=max_new_tokens,
         )
+
+    def close(self):
+        """Deterministically release every NPU/XRT resource this decoder holds.
+
+        Model switching reuses one physical NPU. Its XRT hardware contexts are a
+        driver-level, system-wide constrained resource (six on npu1). Relying on
+        garbage collection to release them races the next model's context
+        creation and, over a long model-switching run, exhausts the driver pool:
+        ``DRM_IOCTL_AMDXDNA_CREATE_HWCTX`` then fails with ``-110`` and the
+        kernel logs ``aie2_alloc_resource failed``. This drops every
+        device-resident buffer object and releases the cached hardware contexts
+        so the next model starts from a clean allocation. It is idempotent.
+        """
+        if getattr(self, "_closed", False):
+            return
+        self._closed = True
+        for attr in (
+            "_device_weights",
+            "_bf16_weights",
+            "_raw_weights",
+            "_packed_layer_weights",
+            "_packed_layer_gammas",
+            "_qwen_chunks",
+            "_qwen_host_buffers",
+            "_qwen_cache",
+        ):
+            container = getattr(self, attr, None)
+            if isinstance(container, dict):
+                container.clear()
+        self.kv_cache = []
+        self._decoder_weights = None
+        self._decoder_gammas = None
+        self._embedding = None
+        # Release the cached, driver-level hardware contexts before another
+        # model loads. Only meaningful when this decoder actually touched the
+        # NPU; the CPU-only path (npu_layers == 0) never created a context.
+        if getattr(self, "npu_layers", 0):
+            try:
+                from aie.utils import cleanup_npu_runtime
+
+                cleanup_npu_runtime()
+            except Exception:
+                logging.exception(
+                    "cleanup_npu_runtime failed while closing NPUDecoder"
+                )
+        gc.collect()

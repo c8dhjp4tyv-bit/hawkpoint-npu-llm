@@ -343,9 +343,10 @@ python npu_llm/tests/validate_chat_npu.py
 ```
 
 The tag-triggered release pipeline performs fresh pinned downloads and
-conversion, Qwen token agreement, measured model switching, 1,000
-completions, and an Ollama install/inference/rollback test with `--jobs 8`
-before its publish job can start. See [SUPPORT.md](SUPPORT.md) for the gate and
+conversion, Qwen token agreement, a bounded model-switch stress test of at
+least 100 switches, a 1,000-completion endurance soak of 250 consecutive
+requests per model, and an Ollama install/inference/rollback test with
+`--jobs 8` before its publish job can start. See [SUPPORT.md](SUPPORT.md) for the gate and
 [BENCHMARKS.md](BENCHMARKS.md) for the controlled comparison protocol.
 `release-pins.json` is the machine-readable authority for the Ollama source
 commit, Ollama model manifest, and accepted hardware/software stack.

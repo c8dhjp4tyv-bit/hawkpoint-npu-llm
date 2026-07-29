@@ -4,8 +4,10 @@
 from concurrent.futures import ThreadPoolExecutor
 from http.client import HTTPConnection
 import json
+import os
 from pathlib import Path
 import sys
+import tempfile
 import threading
 import time
 from urllib.error import HTTPError
@@ -66,6 +68,66 @@ class HangingDecoder:
     def generate_messages(self, messages, max_new_tokens):
         time.sleep(30)
         yield "unreachable", None
+
+
+class ToggleDecoder:
+    """Fails while a marker file exists, otherwise completes normally.
+
+    Used to prove a worker killed by an inference error is recreated on the
+    next request. The marker is checked at generate time so the same pickled
+    instance behaves differently across worker restarts.
+    """
+
+    context_length = 64
+
+    def __init__(self, marker):
+        self.marker = marker
+
+    def generate_messages(self, messages, max_new_tokens):
+        if Path(self.marker).exists():
+            raise RuntimeError("secret internal detail")
+        yield "ok", None
+        yield "", {
+            "prompt_tokens": 1,
+            "generated_tokens": 1,
+            "finish_reason": "stop",
+            "decode_tokens_per_second": 1.0,
+        }
+
+
+class CloseTrackingDecoder:
+    """Records close() calls so model-switch cleanup can be asserted offline."""
+
+    context_length = 64
+
+    def __init__(self, name, events):
+        self.name = name
+        self.events = events
+        self.closed = False
+
+    def generate_messages(self, messages, max_new_tokens):
+        yield self.name, None
+        yield "", {
+            "prompt_tokens": 1,
+            "generated_tokens": 1,
+            "finish_reason": "stop",
+        }
+
+    def close(self):
+        self.closed = True
+        self.events.append(("close", self.name))
+
+
+class TrackingFactory:
+    def __init__(self, events):
+        self.events = events
+        self.created = []
+
+    def __call__(self, path):
+        decoder = CloseTrackingDecoder(str(path), self.events)
+        self.created.append(decoder)
+        self.events.append(("create", str(path)))
+        return decoder
 
 
 def fetch(url, data=None, *, api_key=API_KEY, origin=None, raw=None):
@@ -260,11 +322,82 @@ def test_worker_error_forces_restart():
         engine.close()
 
 
+def test_inference_error_recreates_worker():
+    """An inference error must kill the worker; the next request recreates it."""
+    messages = [{"role": "user", "content": "Hello"}]
+    with tempfile.TemporaryDirectory() as directory:
+        marker = Path(directory) / "fail"
+        engine = ProcessCompletionEngine(
+            {"smollm2-135m-xdna1": ToggleDecoder(str(marker))},
+            decoder_factory=None,
+            timeout=5,
+        )
+        try:
+            # Healthy worker first, so we can prove the PID actually changes.
+            first = list(engine.generate("smollm2-135m-xdna1", messages, 1))
+            assert [text for text, _ in first if text] == ["ok"]
+            healthy_pid = engine._process.pid
+            assert engine.worker_restarts == 0
+
+            # Force the next inference to fail; the worker must be torn down.
+            marker.touch()
+            try:
+                list(engine.generate("smollm2-135m-xdna1", messages, 1))
+                raise AssertionError("failing worker unexpectedly completed")
+            except RuntimeError as exc:
+                assert str(exc) == "inference worker request failed"
+            assert engine.worker_restarts == 1
+            assert engine._process is None
+            assert not engine.ready
+
+            # Recovery: the next request must spawn a brand-new worker process.
+            marker.unlink()
+            recovered = list(engine.generate("smollm2-135m-xdna1", messages, 1))
+            assert [text for text, _ in recovered if text] == ["ok"]
+            assert engine._process is not None and engine._process.is_alive()
+            assert engine._process.pid != healthy_pid
+            # A successful request must not itself count as a restart.
+            assert engine.worker_restarts == 1
+        finally:
+            engine.close()
+
+
+def test_model_switch_releases_previous_decoder():
+    """Switching models must deterministically close the previous decoder."""
+    messages = [{"role": "user", "content": "Hello"}]
+    events = []
+    factory = TrackingFactory(events)
+    engine = CompletionEngine(
+        {
+            "model-a": {"path": "model-a", "context_length": 64},
+            "model-b": {"path": "model-b", "context_length": 64},
+        },
+        decoder_factory=factory,
+    )
+    try:
+        list(engine.generate("model-a", messages, 1))
+        list(engine.generate("model-b", messages, 1))
+        # model-a must be closed before model-b is created.
+        assert events == [
+            ("create", "model-a"),
+            ("close", "model-a"),
+            ("create", "model-b"),
+        ]
+        assert factory.created[0].closed is True
+        assert factory.created[1].closed is False
+    finally:
+        engine.close()
+    # Closing the engine releases the still-active decoder.
+    assert factory.created[1].closed is True
+
+
 def main():
     test_protocol_and_security()
     test_backpressure_and_safe_errors()
     test_hard_process_timeout()
     test_worker_error_forces_restart()
+    test_inference_error_recreates_worker()
+    test_model_switch_releases_previous_decoder()
     print("PASS API security and protocol")
 
 

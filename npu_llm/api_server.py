@@ -126,6 +126,23 @@ class CompletionEngine:
     def context_length(self, model_id):
         return int(self.models[model_id].get("context_length", 64))
 
+    def _close_active(self):
+        """Deterministically release the currently loaded decoder, if any.
+
+        The active decoder owns the physical NPU's XRT hardware contexts. They
+        must be released before another model loads (or when the worker exits),
+        otherwise the driver's system-wide context pool leaks and eventually
+        fails ``CREATE_HWCTX``. Never rely on garbage collection alone here.
+        """
+        decoder = self._active_decoder
+        self._active_decoder = None
+        self._active_model_id = None
+        if decoder is not None:
+            close = getattr(decoder, "close", None)
+            if close is not None:
+                close()
+        gc.collect()
+
     def _load(self, model_id):
         record = self.models[model_id]
         if "decoder" in record:
@@ -134,9 +151,8 @@ class CompletionEngine:
             return self._active_decoder
         if self.decoder_factory is None:
             raise RuntimeError("no decoder factory configured")
-        self._active_decoder = None
-        self._active_model_id = None
-        gc.collect()
+        # Release the previous model's NPU/XRT context before loading the next.
+        self._close_active()
         print(f"Loading {model_id} from {record['path']} on XDNA1...", flush=True)
         self._active_decoder = self.decoder_factory(record["path"])
         warmup = getattr(self._active_decoder, "warmup", None)
@@ -145,6 +161,10 @@ class CompletionEngine:
             warmup()
         self._active_model_id = model_id
         return self._active_decoder
+
+    def close(self):
+        """Release any loaded decoder and its NPU/XRT resources."""
+        self._close_active()
 
     def prewarm_default(self):
         with self.lock:
@@ -189,6 +209,10 @@ def _worker_loop(models, decoder_factory, connection):
     except (EOFError, BrokenPipeError, KeyboardInterrupt):
         pass
     finally:
+        try:
+            engine.close()
+        except Exception:
+            logging.exception("failed to release NPU resources on worker exit")
         connection.close()
 
 
