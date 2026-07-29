@@ -1,0 +1,443 @@
+diff --git a/api/types.go b/api/types.go
+index ce11b66..f98e4ea 100644
+--- a/api/types.go
++++ b/api/types.go
+@@ -854,6 +854,8 @@ type ProcessModelResponse struct {
+ 	Details       ModelDetails `json:"details,omitempty"`
+ 	ExpiresAt     time.Time    `json:"expires_at"`
+ 	SizeVRAM      int64        `json:"size_vram"`
++	NPU           bool         `json:"npu,omitempty"`
++	NPUPercent    int          `json:"npu_percent,omitempty"`
+ 	ContextLength int          `json:"context_length"`
+ }
+ 
+diff --git a/cmd/cmd.go b/cmd/cmd.go
+index e65d125..d96342e 100644
+--- a/cmd/cmd.go
++++ b/cmd/cmd.go
+@@ -1110,6 +1110,47 @@ func ListHandler(cmd *cobra.Command, args []string) error {
+ 	return nil
+ }
+ 
++func formatProcessor(m api.ProcessModelResponse) string {
++	if m.Size <= 0 || m.SizeVRAM < 0 || m.SizeVRAM > m.Size {
++		return "Unknown"
++	}
++
++	gpuPercent := int(math.Round(float64(m.SizeVRAM) / float64(m.Size) * 100))
++	gpuPercent = max(0, min(100, gpuPercent))
++	npuPercent := 0
++	if m.NPU {
++		npuPercent = max(0, min(100-gpuPercent, m.NPUPercent))
++	}
++	cpuPercent := 100 - gpuPercent - npuPercent
++
++	if npuPercent > 0 {
++		return fmt.Sprintf(
++			"%d%%/%d%%/%d%% CPU/GPU/NPU",
++			cpuPercent,
++			gpuPercent,
++			npuPercent,
++		)
++	}
++
++	var processor string
++	switch {
++	case gpuPercent == 0:
++		processor = "100% CPU"
++	case gpuPercent == 100:
++		processor = "100% GPU"
++	default:
++		processor = fmt.Sprintf(
++			"%d%%/%d%% CPU/GPU",
++			cpuPercent,
++			gpuPercent,
++		)
++	}
++	if m.NPU {
++		processor += " + NPU"
++	}
++	return processor
++}
++
+ func ListRunningHandler(cmd *cobra.Command, args []string) error {
+ 	client, err := api.ClientFromEnvironment()
+ 	if err != nil {
+@@ -1125,19 +1166,7 @@ func ListRunningHandler(cmd *cobra.Command, args []string) error {
+ 
+ 	for _, m := range models.Models {
+ 		if len(args) == 0 || strings.HasPrefix(m.Name, args[0]) {
+-			var procStr string
+-			switch {
+-			case m.SizeVRAM == 0:
+-				procStr = "100% CPU"
+-			case m.SizeVRAM == m.Size:
+-				procStr = "100% GPU"
+-			case m.SizeVRAM > m.Size || m.Size == 0:
+-				procStr = "Unknown"
+-			default:
+-				sizeCPU := m.Size - m.SizeVRAM
+-				cpuPercent := math.Round(float64(sizeCPU) / float64(m.Size) * 100)
+-				procStr = fmt.Sprintf("%d%%/%d%% CPU/GPU", int(cpuPercent), int(100-cpuPercent))
+-			}
++			procStr := formatProcessor(m)
+ 
+ 			var until string
+ 			delta := time.Since(m.ExpiresAt)
+diff --git a/cmd/cmd_test.go b/cmd/cmd_test.go
+index 821c0ee..41d8f9f 100644
+--- a/cmd/cmd_test.go
++++ b/cmd/cmd_test.go
+@@ -22,6 +22,57 @@ import (
+ 	"github.com/ollama/ollama/types/model"
+ )
+ 
++func TestFormatProcessor(t *testing.T) {
++	tests := []struct {
++		name  string
++		model api.ProcessModelResponse
++		want  string
++	}{
++		{
++			name: "three way compute distribution sums to 100",
++			model: api.ProcessModelResponse{
++				Size:       100,
++				SizeVRAM:   33,
++				NPU:        true,
++				NPUPercent: 44,
++			},
++			want: "23%/33%/44% CPU/GPU/NPU",
++		},
++		{
++			name:  "cpu only",
++			model: api.ProcessModelResponse{Size: 100},
++			want:  "100% CPU",
++		},
++		{
++			name: "cpu and npu",
++			model: api.ProcessModelResponse{
++				Size:       100,
++				NPU:        true,
++				NPUPercent: 66,
++			},
++			want: "34%/0%/66% CPU/GPU/NPU",
++		},
++		{
++			name:  "gpu only",
++			model: api.ProcessModelResponse{Size: 100, SizeVRAM: 100},
++			want:  "100% GPU",
++		},
++		{
++			name:  "invalid accounting",
++			model: api.ProcessModelResponse{Size: 100, SizeVRAM: 101},
++			want:  "Unknown",
++		},
++	}
++
++	for _, test := range tests {
++		t.Run(test.name, func(t *testing.T) {
++			if got := formatProcessor(test.model); got != test.want {
++				t.Fatalf("formatProcessor = %q, want %q", got, test.want)
++			}
++		})
++	}
++}
++
+ func TestShowInfo(t *testing.T) {
+ 	t.Run("bare details", func(t *testing.T) {
+ 		var b bytes.Buffer
+diff --git a/discover/llama_server.go b/discover/llama_server.go
+index a66c34e..f73c894 100644
+--- a/discover/llama_server.go
++++ b/discover/llama_server.go
+@@ -179,6 +179,8 @@ var deviceLineRegex = regexp.MustCompile(
+ 	`^\s+(.+?):\s+(.+?)\s+\((\d+)\s+MiB,\s+(\d+)\s+MiB\s+free\)`,
+ )
+ 
++var deviceNameIndexRegex = regexp.MustCompile(`(\d+)$`)
++
+ // cudaCCRegex matches CUDA stderr lines like:
+ //
+ //	Device 0: NVIDIA GeForce GTX 1060 6GB, compute capability 6.1, VMM: yes, VRAM: 6063 MiB
+@@ -281,6 +283,10 @@ func parseLlamaServerDevicesWithNative(output, nativeOutput string, libDirs []st
+ 		totalMiB, _ := strconv.ParseUint(matches[3], 10, 64)
+ 		freeMiB, _ := strconv.ParseUint(matches[4], 10, 64)
+ 		library := inferLibrary(name, description)
++		backendIndex := deviceIndex
++		if indexMatch := deviceNameIndexRegex.FindStringSubmatch(name); indexMatch != nil {
++			backendIndex, _ = strconv.Atoi(indexMatch[1])
++		}
+ 
+ 		// Skip pseudo-devices like BLAS/Accelerate that report zero memory.
+ 		// These are CPU math libraries, not real GPUs — they shouldn't appear
+@@ -293,7 +299,7 @@ func parseLlamaServerDevicesWithNative(output, nativeOutput string, libDirs []st
+ 
+ 		// For CUDA devices, check if this variant supports the device's CC
+ 		if library == "CUDA" {
+-			cc, ok := ccByIndex[deviceIndex]
++			cc, ok := ccByIndex[backendIndex]
+ 			if ok && len(cudaArchSet) > 0 {
+ 				if !cudaArchSet[cc.arch] {
+ 					slog.Info("skipping CUDA device — compute capability not in compiled architectures",
+@@ -315,15 +321,15 @@ func parseLlamaServerDevicesWithNative(output, nativeOutput string, libDirs []st
+ 			}
+ 		}
+ 
+-		nativeDevice, hasNativeDevice := nativeByIndex[library][deviceIndex]
++		nativeDevice, hasNativeDevice := nativeByIndex[library][backendIndex]
+ 		totalBytes := totalMiB * 1024 * 1024
+ 		if hasNativeDevice && !nativeProbeMatchesLlamaServerDevice(library, description, totalBytes, nativeDevice) {
+ 			hasNativeDevice = false
+ 		}
+-		computeMajor, computeMinor := computeVersion(library, deviceIndex, gfxByIndex, ccByIndex)
++		computeMajor, computeMinor := computeVersion(library, backendIndex, gfxByIndex, ccByIndex)
+ 		dev := ml.DeviceInfo{
+ 			DeviceID: ml.DeviceID{
+-				ID:      strconv.Itoa(deviceIndex),
++				ID:      strconv.Itoa(backendIndex),
+ 				Library: library,
+ 			},
+ 			Name:         name,
+@@ -333,8 +339,8 @@ func parseLlamaServerDevicesWithNative(output, nativeOutput string, libDirs []st
+ 			ComputeMajor: computeMajor,
+ 			ComputeMinor: computeMinor,
+ 			LibraryPath:  libDirs,
+-			GFXTarget:    gfxByIndex[deviceIndex],
+-			Integrated:   isIntegratedLlamaServerDevice(library, deviceIndex, integratedByIndex),
++			GFXTarget:    gfxByIndex[backendIndex],
++			Integrated:   isIntegratedLlamaServerDevice(library, backendIndex, integratedByIndex),
+ 		}
+ 		if hasNativeDevice {
+ 			if nativeDevice.DeviceID != "" {
+diff --git a/discover/llama_server_test.go b/discover/llama_server_test.go
+index 563da94..e50f696 100644
+--- a/discover/llama_server_test.go
++++ b/discover/llama_server_test.go
+@@ -11,6 +11,26 @@ import (
+ 	"github.com/ollama/ollama/ml"
+ )
+ 
++func TestParseLlamaServerDevicesIgnoresAcceleratorIndexForCUDA(t *testing.T) {
++	output := `ggml_cuda_init: found 1 CUDA devices:
++  Device 0: NVIDIA GeForce RTX 5060 Laptop GPU, compute capability 12.0, VMM: yes, VRAM: 7746 MiB
++system_info: n_threads = 8 | CUDA : ARCHS = 1200 |
++Available devices:
++  XDNA0: AMD Ryzen AI XDNA1 NPU (0 MiB, 0 MiB free)
++  CUDA0: NVIDIA GeForce RTX 5060 Laptop GPU (7746 MiB, 7532 MiB free)
++`
++	devices := parseLlamaServerDevices(output, []string{"/lib/ollama", "/lib/ollama/cuda_v13"})
++	if len(devices) != 1 {
++		t.Fatalf("got %d devices, want 1", len(devices))
++	}
++	if devices[0].ID != "0" {
++		t.Fatalf("device ID = %q, want 0", devices[0].ID)
++	}
++	if devices[0].Compute() != "12.0" {
++		t.Fatalf("compute = %q, want 12.0", devices[0].Compute())
++	}
++}
++
+ func TestLlamaServerDiscovery(t *testing.T) {
+ 	originalProbe := probeLlamaServerVulkanDevices
+ 	probeLlamaServerVulkanDevices = func(_ []string) ([]vulkanPhysicalDevice, error) {
+diff --git a/llm/llama_server.go b/llm/llama_server.go
+index e529cfc..9639be5 100644
+--- a/llm/llama_server.go
++++ b/llm/llama_server.go
+@@ -228,6 +228,34 @@ func (s *llamaServerRunner) llamaServerMediaMarker() string {
+ 	return "<__media__>"
+ }
+ 
++func appendGPULayerArgs(params []string, opts api.Options) []string {
++	xdna := os.Getenv("GGML_XDNA_XCLBIN") != ""
++	if opts.NumGPU > 0 {
++		params = append(params, "-ngl", strconv.Itoa(opts.NumGPU))
++		if xdna {
++			params = append(params, "--fit", "off")
++		}
++		return params
++	}
++	if opts.NumGPU == 0 {
++		params = append(params, "-ngl", "0")
++		if xdna {
++			params = append(params, "--fit", "off")
++		}
++		return params
++	}
++
++	// llama-server's automatic fit probe initializes every registered backend.
++	// XDNA1 only permits one active hardware context for this AIE program, so the
++	// subsequent real model load would fail with EAGAIN. An explicit, measured
++	// layer count bypasses that probe while retaining CUDA + CPU placement.
++	if xdna {
++		return append(params, "-ngl", "16", "--fit", "off")
++	}
++
++	return params
++}
++
+ func newLlamaServerMediaMarker() string {
+ 	var b [16]byte
+ 	if _, err := crand.Read(b[:]); err == nil {
+@@ -408,15 +436,7 @@ func startLlamaServer(launch llamaServerLaunchConfig, out io.Writer) (cmd *exec.
+ 
+ 	params = appendBatchArgs(params, launch.opts, launch.embedding, launch.numParallel)
+ 
+-	// GPU layer offloading — only pass if user explicitly set it (non-default).
+-	// Default behavior: let llama-server auto-detect via -ngl auto.
+-	if launch.opts.NumGPU > 0 {
+-		params = append(params, "-ngl", strconv.Itoa(launch.opts.NumGPU))
+-	} else if launch.opts.NumGPU == 0 {
+-		// Explicit 0 means CPU only
+-		params = append(params, "-ngl", "0")
+-	}
+-	// NumGPU == -1 (default): don't pass -ngl, let llama-server auto-detect
++	params = appendGPULayerArgs(params, launch.opts)
+ 
+ 	// Thread count — only pass if user explicitly set it.
+ 	// Default behavior: let llama-server auto-detect.
+@@ -889,6 +909,9 @@ func NewLlamaServerRunner(
+ 		serverEnvs[k] = v
+ 	}
+ 	serverEnvs["LLAMA_MEDIA_MARKER"] = mediaMarker
++	if os.Getenv("GGML_XDNA_XCLBIN") != "" {
++		serverEnvs["GGML_XDNA_MODEL_ARCH"] = arch
++	}
+ 
+ 	launch := llamaServerLaunchConfig{
+ 		modelPath:    modelPath,
+diff --git a/llm/llama_server_test.go b/llm/llama_server_test.go
+index d39b5b0..2c58985 100644
+--- a/llm/llama_server_test.go
++++ b/llm/llama_server_test.go
+@@ -2036,6 +2036,35 @@ func TestAppendFlashAttentionArgs(t *testing.T) {
+ 	}
+ }
+ 
++func TestAppendGPULayerArgs(t *testing.T) {
++	defaultOpts := api.DefaultOptions()
++
++	t.Run("default leaves automatic fit enabled", func(t *testing.T) {
++		t.Setenv("GGML_XDNA_XCLBIN", "")
++		got := appendGPULayerArgs([]string{"base"}, defaultOpts)
++		if !slices.Equal(got, []string{"base"}) {
++			t.Fatalf("appendGPULayerArgs = %v", got)
++		}
++	})
++
++	t.Run("xdna bypasses automatic fit", func(t *testing.T) {
++		t.Setenv("GGML_XDNA_XCLBIN", "/tmp/router.xclbin")
++		got := appendGPULayerArgs([]string{"base"}, defaultOpts)
++		if !slices.Equal(got, []string{"base", "-ngl", "16", "--fit", "off"}) {
++			t.Fatalf("appendGPULayerArgs = %v", got)
++		}
++	})
++
++	t.Run("explicit setting wins over xdna default", func(t *testing.T) {
++		t.Setenv("GGML_XDNA_XCLBIN", "/tmp/router.xclbin")
++		defaultOpts.NumGPU = 7
++		got := appendGPULayerArgs([]string{"base"}, defaultOpts)
++		if !slices.Equal(got, []string{"base", "-ngl", "7", "--fit", "off"}) {
++			t.Fatalf("appendGPULayerArgs = %v", got)
++		}
++	})
++}
++
+ func TestAppendMainGPUArgs(t *testing.T) {
+ 	tests := []struct {
+ 		name string
+diff --git a/server/routes.go b/server/routes.go
+index ed75d15..849b4c0 100644
+--- a/server/routes.go
++++ b/server/routes.go
+@@ -2273,11 +2273,15 @@ func (s *Server) PsHandler(c *gin.Context) {
+ 			QuantizationLevel: m.Config.FileType,
+ 		}
+ 
++		hasXDNA := strings.Contains(strings.ToLower(os.Getenv("GGML_BACKEND_PATH")), "xdna") &&
++			strings.HasPrefix(m.Config.ModelFamily, "qwen")
+ 		models = append(models, api.ProcessModelResponse{
+ 			Model:         displayName,
+ 			Name:          displayName,
+ 			Size:          v.size,
+ 			SizeVRAM:      v.sizeVRAM,
++			NPU:           hasXDNA,
++			NPUPercent:    xdnaNPUComputePercent(v.size, v.sizeVRAM, m.Config.ModelFamily, hasXDNA),
+ 			Digest:        m.Digest,
+ 			Details:       modelDetails,
+ 			ExpiresAt:     v.expiresAt,
+@@ -2293,6 +2297,31 @@ func (s *Server) PsHandler(c *gin.Context) {
+ 	c.JSON(http.StatusOK, api.ProcessResponse{Models: models})
+ }
+ 
++func xdnaNPUComputePercent(size, sizeVRAM int64, family string, enabled bool) int {
++	if !enabled || size <= 0 || sizeVRAM < 0 || sizeVRAM > size {
++		return 0
++	}
++
++	// Qwen3-Coder 30B-A3B active linear MACs per transformer layer:
++	//   experts: gate + up + down = 3 * 8 * 2048 * 768
++	//   non-expert: Q/K/V/O projections + router
++	// The XDNA backend handles expert projections only for layers whose weights
++	// remain in host memory. GPU-resident layers continue to execute on CUDA.
++	if family == "qwen3moe" {
++		const expertMACs = 3.0 * 8.0 * 2048.0 * 768.0
++		const nonExpertMACs = 2048.0*4096.0 +
++			2.0*2048.0*512.0 +
++			4096.0*2048.0 +
++			2048.0*128.0
++		hostFraction := float64(size-sizeVRAM) / float64(size)
++		return int(math.Round(
++			100.0 * hostFraction * expertMACs / (expertMACs + nonExpertMACs),
++		))
++	}
++
++	return 0
++}
++
+ func toolCallId() string {
+ 	const letterBytes = "abcdefghijklmnopqrstuvwxyz0123456789"
+ 	b := make([]byte, 8)
+diff --git a/server/routes_test.go b/server/routes_test.go
+index 894035e..f6f40d6 100644
+--- a/server/routes_test.go
++++ b/server/routes_test.go
+@@ -32,6 +32,38 @@ import (
+ 	"github.com/ollama/ollama/version"
+ )
+ 
++func TestXDNANPUComputePercent(t *testing.T) {
++	tests := []struct {
++		name     string
++		size     int64
++		sizeVRAM int64
++		family   string
++		enabled  bool
++		want     int
++	}{
++		{"qwen3 coder partial GPU", 100, 33, "qwen3moe", true, 44},
++		{"qwen3 coder CPU resident", 100, 0, "qwen3moe", true, 66},
++		{"qwen3 coder GPU resident", 100, 100, "qwen3moe", true, 0},
++		{"xdna disabled", 100, 33, "qwen3moe", false, 0},
++		{"dense family has no expert estimate", 100, 33, "qwen2", true, 0},
++		{"invalid size", 0, 0, "qwen3moe", true, 0},
++	}
++
++	for _, test := range tests {
++		t.Run(test.name, func(t *testing.T) {
++			got := xdnaNPUComputePercent(
++				test.size,
++				test.sizeVRAM,
++				test.family,
++				test.enabled,
++			)
++			if got != test.want {
++				t.Fatalf("xdnaNPUComputePercent = %d, want %d", got, test.want)
++			}
++		})
++	}
++}
++
+ func createTestFile(t *testing.T, name string) (string, string) {
+ 	t.Helper()
+ 
