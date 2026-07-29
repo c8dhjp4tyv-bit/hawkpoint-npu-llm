@@ -22,14 +22,14 @@ from designs.qkv_rope import qkv_rope
 from designs.rmsnorm import rmsnorm
 from designs.tensor_copy import slice_bf16
 from runtime.model import XDNA1Model
+from runtime.cpu_backend import CPUDecoderStage, _bf16 as _bf16_cpu
 from runtime.tokenizer import SmolLMTokenizer
 
 
 class NPUDecoder:
-    def __init__(self, model_dir, context_length=64):
+    def __init__(self, model_dir, context_length=64, npu_layers=None):
         if context_length != 64:
             raise ValueError("the current NPU attention kernel has a fixed 64-token cache")
-        set_current_device(from_name("npu", n_cols=4))
         self.model = XDNA1Model(model_dir)
         self.model_family = self.model.metadata.get("model_family", "llama")
         default_system = (
@@ -49,6 +49,15 @@ class NPUDecoder:
             self.model.metadata.get("rms_norm_eps", 1e-5)
         )
         self.layers = self.model.metadata["layers"]
+        self.npu_layers = (
+            self.layers if npu_layers is None else int(npu_layers)
+        )
+        if not 0 <= self.npu_layers <= self.layers:
+            raise ValueError(
+                f"npu_layers must be between 0 and {self.layers}"
+            )
+        if self.npu_layers:
+            set_current_device(from_name("npu", n_cols=4))
         self._device_weights = {}
         self._bf16_weights = {}
         self._raw_weights = {}
@@ -56,14 +65,32 @@ class NPUDecoder:
         self._packed_layer_gammas = {}
         self._decoder_weights = None
         self._decoder_gammas = None
-        self._embedding = self._raw_bf16("token_embedding")
+        self._embedding = (
+            self._raw_bf16("token_embedding")
+            if self.npu_layers
+            else None
+        )
+        self.cpu_stage = (
+            CPUDecoderStage(self.model, self.npu_layers, context_length)
+            if self.npu_layers < self.layers
+            else None
+        )
+        self._cpu_embedding = (
+            np.asarray(
+                self.model.raw("token_embedding"), dtype=np.float32
+            ).reshape(
+                self.model.metadata["vocab_size"], self.hidden_size
+            )
+            if self.cpu_stage is not None
+            else None
+        )
         self.kv_cache = [
             iron.zeros(
                 (1, self.kv_heads, 2 * self.context_length * self.head_dim),
                 dtype=bfloat16,
                 device="npu",
             )
-            for _ in range(self.layers)
+            for _ in range(self.npu_layers)
         ]
 
     def _raw_bf16(self, name):
@@ -387,10 +414,21 @@ class NPUDecoder:
         if not 0 <= position < self.context_length:
             raise ValueError("position outside the 64-token context")
         start = time.perf_counter()
-        hidden = self._embedding_for(token_id)
-        rope_lut = self._rope_lut(position)
-        for layer in range(self.layers):
-            hidden = self._layer(hidden, layer, position, rope_lut)
+        if self.npu_layers:
+            hidden = self._embedding_for(token_id)
+            rope_lut = self._rope_lut(position)
+            for layer in range(self.npu_layers):
+                hidden = self._layer(hidden, layer, position, rope_lut)
+        else:
+            hidden = _bf16_cpu(self._cpu_embedding[token_id])
+        if self.cpu_stage is not None:
+            if self.npu_layers:
+                hidden = hidden.numpy().astype(bfloat16)
+            for layer in range(self.npu_layers, self.layers):
+                hidden = self.cpu_stage.layer(hidden, layer, position)
+            logits = self.cpu_stage.logits(hidden)
+            next_token = int(np.argmax(logits))
+            return next_token, time.perf_counter() - start
         normalized = iron.zeros(self.hidden_size, dtype=bfloat16, device="npu")
         rmsnorm(
             hidden,
@@ -437,6 +475,8 @@ class NPUDecoder:
         stats = {
             "prompt_tokens": len(prompt_ids),
             "generated_tokens": len(generated),
+            "npu_layers": self.npu_layers,
+            "cpu_layers": self.layers - self.npu_layers,
             "finish_reason": (
                 "stop" if next_token == self.tokenizer.eos_id else "length"
             ),
