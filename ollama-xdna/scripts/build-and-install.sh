@@ -242,11 +242,20 @@ else
         llama_source="${build_root}/llama.cpp"
         llama_commit="$(tr -d '[:space:]' < "${source_dir}/LLAMA_CPP_VERSION")"
         if [[ ! -d "${llama_source}/.git" ]]; then
+            # Shallow-clone the pinned llama.cpp ref directly. A plain
+            # "--depth 1" clone fetches only the default branch and no tags, so
+            # a later "checkout ${llama_commit}" (a tag such as b10091) fails
+            # with "pathspec did not match"; cloning "--branch ${llama_commit}"
+            # lands on the ref with every blob present and nothing to promisor.
             robust_clone https://github.com/ggml-org/llama.cpp.git \
-                "${llama_source}" --depth 1
+                "${llama_source}" --depth 1 --branch "${llama_commit}"
+        else
+            # Existing checkout: fetch just the pinned ref and check out what was
+            # fetched. FETCH_HEAD avoids relying on a local tag ref that a
+            # shallow clone never created.
+            git -C "${llama_source}" fetch --quiet --depth 1 origin "${llama_commit}"
+            git -C "${llama_source}" checkout --quiet FETCH_HEAD
         fi
-        git -C "${llama_source}" fetch --quiet --depth 1 origin "${llama_commit}"
-        git -C "${llama_source}" checkout --quiet "${llama_commit}"
     fi
 fi
 
