@@ -19,6 +19,29 @@ die() {
     exit 1
 }
 
+# Clone with retries, cleaning a partial checkout between attempts. This host
+# intermittently drops HTTP git transfers to GitHub mid-checkout; a fresh retry
+# recovers without failing the build.
+robust_clone() {
+    local url="$1" dest="$2"
+    shift 2
+    local attempts=3 delay=5 n=1
+    while true; do
+        if git clone --quiet "$@" "${url}" "${dest}"; then
+            return 0
+        fi
+        rm -rf "${dest}"
+        if [[ "${n}" -ge "${attempts}" ]]; then
+            die "failed to clone ${url} after ${attempts} attempts"
+        fi
+        echo "warning: clone of ${url} failed (attempt ${n}/${attempts});" \
+            "retrying in ${delay}s" >&2
+        sleep "${delay}"
+        n=$((n + 1))
+        delay=$((delay * 2))
+    done
+}
+
 usage() {
     cat <<EOF
 Usage: $0 [options]
@@ -100,6 +123,17 @@ if [[ "${tag}" != "${SUPPORTED_TAG}" && "${allow_unsupported}" -ne 1 ]]; then
     die "${tag} is unvalidated; use --allow-unsupported to attempt a 3-way apply"
 fi
 
+# Force HTTP/1.1 (and a larger transfer buffer) for every git process this
+# script spawns, including cmake FetchContent's clone of llama.cpp. This
+# dedicated runner intermittently fails HTTP/2 transfers to GitHub with
+# "curl 92 HTTP/2 stream reset by server" during on-demand promisor blob
+# fetches; HTTP/1.1 avoids the multiplexed-stream reset.
+export GIT_CONFIG_COUNT=2
+export GIT_CONFIG_KEY_0=http.version
+export GIT_CONFIG_VALUE_0=HTTP/1.1
+export GIT_CONFIG_KEY_1=http.postBuffer
+export GIT_CONFIG_VALUE_1=524288000
+
 "${PROJECT_ROOT}/scripts/verify-system.sh"
 
 if [[ -z "${build_root}" ]]; then
@@ -130,8 +164,8 @@ if [[ "${resume}" -eq 1 ]]; then
     git -C "${source_dir}" diff --check
 else
     [[ ! -e "${source_dir}" ]] || die "${source_dir} already exists"
-    git clone --quiet --filter=blob:none --branch "${tag}" \
-        https://github.com/ollama/ollama.git "${source_dir}"
+    robust_clone https://github.com/ollama/ollama.git "${source_dir}" \
+        --depth 1 --branch "${tag}"
     actual_commit="$(git -C "${source_dir}" rev-parse HEAD)"
     if [[ "${tag}" == "${SUPPORTED_TAG}" ]]; then
         [[ "${actual_commit}" == "${SUPPORTED_COMMIT}" ]] ||
@@ -208,10 +242,10 @@ else
         llama_source="${build_root}/llama.cpp"
         llama_commit="$(tr -d '[:space:]' < "${source_dir}/LLAMA_CPP_VERSION")"
         if [[ ! -d "${llama_source}/.git" ]]; then
-            git clone --quiet --filter=blob:none \
-                https://github.com/ggml-org/llama.cpp.git "${llama_source}"
+            robust_clone https://github.com/ggml-org/llama.cpp.git \
+                "${llama_source}" --depth 1
         fi
-        git -C "${llama_source}" fetch --quiet origin "${llama_commit}"
+        git -C "${llama_source}" fetch --quiet --depth 1 origin "${llama_commit}"
         git -C "${llama_source}" checkout --quiet "${llama_commit}"
     fi
 fi
