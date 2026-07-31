@@ -13,7 +13,56 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tests"))
 
 from benchmark_ollama_matrix import compare_placement_responses  # noqa: E402
+from placement_agreement import evaluate_agreement  # noqa: E402
 from verify_ollama_manifest import verify_manifest  # noqa: E402
+
+
+def _rows(*token_ids_with_logprobs):
+    """Build one placement's per-position top-k rows.
+
+    Each argument is a list of ``(token_id, logprob)`` for one position.
+    """
+    return [
+        [{"id": tid, "logprob": lp} for tid, lp in position]
+        for position in token_ids_with_logprobs
+    ]
+
+
+def test_logit_agreement_tolerance():
+    # Reference: position 0 is confident (margin 2.0); position 1 is an ambiguous
+    # near-tie (margin 0.1).
+    reference = _rows(
+        [(10, -0.1), (11, -2.1), (12, -3.0)],
+        [(20, -0.5), (21, -0.6), (22, -3.0)],
+    )
+    # Agrees on the confident token; differs only on the ambiguous one.
+    tolerant = _rows(
+        [(10, -0.1), (11, -2.0), (12, -3.1)],
+        [(21, -0.5), (20, -0.6), (22, -3.0)],
+    )
+    # Diverges on the CONFIDENT token -> must fail.
+    divergent = _rows(
+        [(11, -0.2), (10, -1.9), (12, -3.0)],
+        [(20, -0.5), (21, -0.6), (22, -3.0)],
+    )
+
+    report, failures = evaluate_agreement(
+        {"cpu_only": reference, "gpu_only": tolerant},
+        "cpu_only",
+        margin_threshold=1.0,
+    )
+    assert failures == []
+    tol = report["placements"]["gpu_only"]
+    assert tol["top1_matches"] == 1
+    assert len(tol["tolerated_mismatches"]) == 1
+    assert tol["high_margin_violations"] == []
+
+    _, failures = evaluate_agreement(
+        {"cpu_only": reference, "gpu_only": divergent},
+        "cpu_only",
+        margin_threshold=1.0,
+    )
+    assert failures == ["gpu_only_top1_divergence"]
 
 
 def test_release_pins():
@@ -71,6 +120,7 @@ def main():
     test_release_pins()
     test_manifest_digest()
     test_cross_placement_agreement()
+    test_logit_agreement_tolerance()
     print("PASS immutable release gates")
 
 
