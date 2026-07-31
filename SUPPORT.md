@@ -9,7 +9,7 @@ unsupported until a reproducible hardware report is added.
 | Phoenix XDNA1 | Same `npu1` architecture | Expected compatible; needs an independent report |
 | XDNA2 / Strix Point | No | Unsupported |
 | OS | Fedora Linux, x86-64, systemd | Validated |
-| Kernel / amdxdna | `7.2.0-0.rc5.260729.fc02acf6.441.vanilla.fc45.x86_64` | Exact RC gate |
+| Kernel / amdxdna | `7.2.0-0.rc5.260730.11028ab6.442.vanilla.fc45.x86_64` | Exact RC gate |
 | XRT | `2.26.0`, build `8bf2fc4c090540dcf7872243ab67779ae74ef5e3` | Exact RC gate |
 | NPU firmware | `1.5.5.391` | Validated |
 | Ollama | `v0.32.5`, commit `eec8e0b9458b8a01be0c216a9cc53eefde24ef50` | Patch target |
