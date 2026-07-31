@@ -1,11 +1,11 @@
 {
   "hardware": {
-    "amdxdna_version": "7.2.0-0.rc5.260730.11028ab6.442.vanilla.fc45.x86_64",
+    "amdxdna_version": "7.2.0-0.rc5.260729.fc02acf6.441.vanilla.fc45.x86_64",
     "cuda_umd_version": "13.3",
     "firmware_version": "1.5.5.391",
     "gpu_driver_version": "610.43.03",
     "gpu_name": "NVIDIA GeForce RTX 5060 Laptop GPU",
-    "kernel_release": "7.2.0-0.rc5.260730.11028ab6.442.vanilla.fc45.x86_64",
+    "kernel_release": "7.2.0-0.rc5.260729.fc02acf6.441.vanilla.fc45.x86_64",
     "npu_name": "RyzenAI-npu1",
     "xrt_hash": "8bf2fc4c090540dcf7872243ab67779ae74ef5e3",
     "xrt_version": "2.26.0"
