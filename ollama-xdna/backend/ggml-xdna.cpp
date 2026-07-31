@@ -638,6 +638,15 @@ const char * registry_name(ggml_backend_reg_t registry) {
 
 size_t registry_device_count(ggml_backend_reg_t registry) {
     GGML_UNUSED(registry);
+    // Only advertise the XDNA device when it is actually configured. Without
+    // the xclbin/instruction blobs device_init() cannot succeed, and
+    // advertising a device whose init fails aborts context creation for every
+    // model -- even pure CPU/GPU inference that never asked for XDNA. Report
+    // zero devices so ggml transparently falls back when XDNA is unconfigured.
+    if (std::getenv("GGML_XDNA_XCLBIN") == nullptr ||
+        std::getenv("GGML_XDNA_INSTS") == nullptr) {
+        return 0;
+    }
     return 1;
 }
 
