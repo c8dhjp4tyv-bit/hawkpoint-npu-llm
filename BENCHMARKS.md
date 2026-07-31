@@ -44,11 +44,22 @@ correctness condition.
 The same gated hardware job runs 1,000 requests in each of CPU-only, GPU-only,
 CPU+GPU, and CPU+GPU+NPU placement modes with one pinned Qwen model and
 the same prompt, seed, generation length, and five-minute warm-up. It measures
-streaming time to the first emitted token, verifies deterministic response
-hashes both within and across all four placements, and publishes
-`ollama-placement-matrix.json` plus a rendered Markdown table. The benchmark
-refuses to start generation unless the pulled Ollama manifest matches the
-digest in `release-pins.json`.
+streaming time to the first emitted token and requires every placement to
+complete all requests with zero errors and a stable response hash within its
+own placement.
+Cross-placement agreement is judged at the logit level, not by byte-for-byte
+text equality: CPU, CUDA, and XDNA kernels diverge numerically, so identical
+generated text is not a realistic requirement. A separate `llama-server` pass
+teacher-forces every placement onto one fixed token prefix and compares, per
+position, top-1 token agreement, top-k overlap, and the reference logit margin.
+A top-1 mismatch fails the release only when the reference margin is at or above
+the tolerance threshold; genuinely ambiguous low-margin near-ties are tolerated.
+The pass also proves each placement really ran on its intended backend -- CUDA
+placements must hold GPU memory, the NPU placement must show XDNA dispatch, and
+no placement may silently fall back to CPU. Exact response hashes are still
+recorded in `ollama-placement-matrix.json` for information but never fail the
+release on their own. The benchmark refuses to start generation unless the
+pulled Ollama manifest matches the digest in `release-pins.json`.
 Release assets therefore contain the measured table for that exact release;
 this source document keeps empty cells so results are never copied between
 machines or releases. The evidence is also packed into a versioned tarball

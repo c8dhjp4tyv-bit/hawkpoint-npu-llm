@@ -18,6 +18,18 @@ versioning while its public API is experimental.
   reporting for HTTP failures and amdxdna/XRT/NPU kernel errors.
 - Add tests proving an inference error tears down and recreates the worker
   process, and that a model switch deterministically closes the previous decoder.
+- Make the XDNA ggml backend opt-in: it advertised one device unconditionally,
+  so every model load tried to initialize XDNA and hard-failed with HTTP 500
+  when `GGML_XDNA_XCLBIN`/`GGML_XDNA_INSTS` were unset -- breaking all non-XDNA
+  (CPU/CUDA) Ollama inference. It now reports zero devices when unconfigured.
+- Replace the placement benchmark's byte-for-byte cross-placement text equality
+  with a teacher-forced top-1/top-k logit-agreement gate driven through
+  `llama-server`. Different backends (CPU/CUDA/XDNA) diverge numerically, so a
+  top-1 mismatch fails only when the reference logit margin is at or above a
+  tolerance threshold; low-margin near-ties are tolerated. Each placement must
+  still complete every request with zero errors, stay deterministic, prove real
+  CPU/CUDA/XDNA execution (no silent fallback), and the NPU placement must show
+  XDNA dispatch. Exact response hashes remain in the report for information only.
 
 ## [0.1.0-rc.3] - 2026-07-29
 

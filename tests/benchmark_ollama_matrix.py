@@ -13,7 +13,20 @@ import threading
 import time
 from urllib.request import Request, urlopen
 
+from placement_agreement import PlacementError, run_placement_agreement
 from verify_ollama_manifest import verify_manifest
+
+
+def find_model_gguf(models_dir):
+    """Return the pinned model's GGUF blob (the largest blob ollama pulled)."""
+    blobs = sorted(
+        (Path(models_dir) / "blobs").glob("sha256-*"),
+        key=lambda path: path.stat().st_size,
+        reverse=True,
+    )
+    if not blobs:
+        raise RuntimeError(f"no model blob found under {models_dir}/blobs")
+    return str(blobs[0])
 
 
 def percentile(values, fraction):
@@ -312,6 +325,17 @@ def main():
     parser.add_argument("--warmup-seconds", type=int, default=300)
     parser.add_argument("--base-port", type=int, default=11500)
     parser.add_argument("--prompt", default="Explain why the sky is blue.")
+    parser.add_argument(
+        "--llama-server-bin",
+        type=Path,
+        default=None,
+        help="llama-server for the logit-agreement pass "
+        "(default: alongside --ollama-bin)",
+    )
+    parser.add_argument("--logit-positions", type=int, default=16)
+    parser.add_argument("--logit-top-k", type=int, default=5)
+    parser.add_argument("--logit-margin-threshold", type=float, default=1.0)
+    parser.add_argument("--logit-reference", default="cpu_only")
     args = parser.parse_args()
     if args.requests < 1:
         parser.error("--requests must be positive")
@@ -371,15 +395,49 @@ def main():
         results,
         len(modes),
     )
+    # Throughput/liveness gate: every placement must complete all requests with
+    # zero errors. benchmark_mode also fails a placement whose response text
+    # changes between requests, enforcing within-placement determinism.
     gate_failures = [
         item["placement"]
         for item in results
         if item["failures"] or item["successful_requests"] != args.requests
     ]
-    if not cross_placement_agreement:
-        gate_failures.append("cross_placement_response_mismatch")
+
+    # Cross-placement agreement is judged at the logit level, not by byte-for-
+    # byte text equality. Different backends (CPU/CUDA/XDNA) diverge numerically,
+    # so teacher-forcing every placement onto one fixed prefix and comparing
+    # top-1/top-k with a reference-margin tolerance is the correct check. The
+    # exact-text hashes above are retained for information only and never fail
+    # the release on their own.
+    logit_report = None
+    logit_error = None
+    if not gate_failures:
+        server_bin = args.llama_server_bin or (
+            args.ollama_bin.resolve().parent.parent
+            / "lib" / "ollama" / "llama-server"
+        )
+        try:
+            logit_report = run_placement_agreement(
+                find_model_gguf(args.models_dir),
+                prompt=args.prompt,
+                positions=args.logit_positions,
+                top_k=args.logit_top_k,
+                margin_threshold=args.logit_margin_threshold,
+                reference=args.logit_reference,
+                server_bin=str(server_bin),
+                xdna_dir=str(args.xdna_dir),
+                ollama_lib=str(args.xdna_dir.resolve().parent),
+                log_dir=str(args.output_dir / "logit-logs"),
+                base_port=args.base_port + 200,
+            )
+            gate_failures.extend(logit_report["gate_failures"])
+        except (PlacementError, RuntimeError) as exc:
+            logit_error = str(exc)[:1000]
+            gate_failures.append("logit_agreement_error")
+
     report = {
-        "schema_version": 1,
+        "schema_version": 2,
         "model": args.model,
         "model_manifest_sha256": args.model_manifest_sha256,
         "prompt": args.prompt,
@@ -387,6 +445,8 @@ def main():
         "warmup_seconds_per_placement": args.warmup_seconds,
         "placement_response_sha256": placement_hashes,
         "cross_placement_response_agreement": cross_placement_agreement,
+        "logit_agreement": logit_report,
+        "logit_agreement_error": logit_error,
         "gate_failures": gate_failures,
         "placements": results,
     }
@@ -425,13 +485,22 @@ def main():
                 failures=len(item["failures"]),
             )
         )
+    if logit_report is not None:
+        logit_line = "Cross-placement top-1 logit agreement: " + (
+            "PASS" if not logit_report["gate_failures"] else "FAIL"
+        )
+    elif logit_error is not None:
+        logit_line = f"Cross-placement logit agreement: ERROR ({logit_error})"
+    else:
+        logit_line = "Cross-placement logit agreement: not run (throughput gate failed)"
     (args.output_dir / "ollama-placement-matrix.md").write_text(
         "\n".join(
             markdown
             + [
                 "",
-                "Cross-placement response SHA-256 agreement: "
-                + ("PASS" if cross_placement_agreement else "FAIL"),
+                logit_line,
+                "Cross-placement response SHA-256 agreement (informational): "
+                + ("match" if cross_placement_agreement else "differ"),
             ]
         )
         + "\n"
