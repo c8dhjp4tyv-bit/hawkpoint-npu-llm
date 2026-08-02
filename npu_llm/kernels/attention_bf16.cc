@@ -1,9 +1,15 @@
-// ---------------------------------------------------------------------------
-// attention_bf16.cc — SmolLM attention kernel (3-head, 64-dim).
+// attention_bf16.cc — SmolLM attention kernel (3 query heads, 64-dim).
 // Separates score computation and value aggregation into two passes to fit
 // within the AIE2 tile's 64 KB data memory budget.
-// The 3-head × 64 tokens × 64 dim = 12,288 BF16 elements per head.
-// By splitting across scores then values, each pass stays below tile capacity.
+//
+// The kernel operates on one pair of KV heads at a time (SmolLM uses 3 KV
+// heads). Per KV-head slice: 64 positions × 64 dim = 4,096 BF16 elements for
+// the K cache, plus an equally sized V cache. Across the three KV heads the
+// total cache is 3 × 2 × 4096 = 24,576 BF16 elements, but only one pair is
+// active per kernel invocation.
+//
+// By splitting attention into separate score and value-aggregation passes,
+// each pass stays within a reasonable fraction of the tile's 64 KB window.
 // ---------------------------------------------------------------------------
 #include <aie_api/aie.hpp>
 #include <stdint.h>
