@@ -1,3 +1,10 @@
+// ---------------------------------------------------------------------------
+// rmsnorm_bf16.cc — Parametric RMS normalization (configurable column count).
+// Used by the SmolLM decoder path as a generic BF16 normalizer.
+// Compile-time epsilon via RMS_EPSILON (default 1e-5), Quake-III style
+// fast reciprocal sqrt with 2 Newton iterations for BF16-grade precision.
+// Hardware event profiling markers (event0/event1) bracket execution.
+// ---------------------------------------------------------------------------
 #include <aie_api/aie.hpp>
 #include <stdint.h>
 
