@@ -23,28 +23,26 @@ software multiply-accumulate rather than dedicated tensor units.
 
 ## Where the NPU Time Goes
 
-For Qwen2.5-0.5B (896 hidden, 4864 intermediate, 24 layers). **All per-phase
-numbers below are order-of-magnitude estimates derived from the XDNA1 AIE2
-clock rate (1 GHz), known op counts, and the measured end-to-end token rate
-(3.65 tok/s).** The repository's benchmark tooling records only whole-token
-timings — it does not instrument individual dispatch, compute, or tokenizer
-phases. Use these estimates for bottleneck identification, not as measured
-results.
+For Qwen2.5-0.5B (896 hidden, 4864 intermediate, 24 layers), the table below
+is an **idealized analytical compute model**. It is derived from the XDNA1
+AIE2 clock rate (1 GHz) and known operation counts; it is *not* a phase-level
+profile and is not derived from the observed end-to-end token time.
 
-| Phase | Estimated time | Derivation |
+| Idealized phase | Estimated lower-bound time | Basis |
 |---|---|---|
-| Tile dispatch + weight fill | ~120 µs | XRT command submission overhead |
-| Kernel compute (12 × 2-layer chunks) | ~960 µs | 75M MACs / ~78 GMACs estimated AIE2 throughput |
-| Host-side LM head | ~650 µs | NumPy BF16 matmul on Zen 4, derived from residual |
-| Tokenizer + bookkeeping | ~80 µs | Python + HuggingFace tokenizers overhead |
-| **Total estimated** | **~1.8 ms** | **~550 tok/s upper bound vs 3.65 tok/s measured** |
+| Tile dispatch + weight fill | ~120 µs | Analytical XRT submission-cost estimate |
+| AIE kernel compute (12 × 2-layer chunks) | ~960 µs | 75M MACs / ~78 GMAC/s assumed AIE2 throughput |
+| Host-side LM head | ~650 µs | Analytical host-matmul estimate; not profiled |
+| Tokenizer + bookkeeping | ~80 µs | Analytical host-overhead estimate; not profiled |
+| **Idealized total** | **~1.8 ms** | **Compute-model lower bound only** |
 
-Measured streaming throughput is **3.65 tok/s** for Qwen 0.5B in 32-token chat.
-The 150× gap between theory and reality comes from:
-1. **Synchronous dispatch**: the host waits for each tile completion before
-   submitting the next.
-2. **No batching**: single-token inference only.
-3. **Python overhead** in the orchestration loop.
+Measured streaming throughput is **3.65 tok/s** for Qwen 0.5B in 32-token chat,
+or approximately **274 ms/token**. The model above therefore leaves roughly
+272 ms/token unaccounted for. The current benchmark tooling records whole-token
+timings only, so that residual cannot be attributed to dispatch, AIE compute,
+LM-head work, tokenization, or any other phase without new instrumentation.
+Use the model only to identify candidate optimization areas; do not interpret
+it as a timing breakdown or an upper-bound throughput claim.
 
 ## Why CPU Beats NPU
 
