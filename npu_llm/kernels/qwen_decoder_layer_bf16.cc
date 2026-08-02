@@ -17,9 +17,12 @@
 // KV CACHE LAYOUT (per layer, per KV head, in XRT buffer objects):
 //   [0..4095]  = K cache: 64 positions × 64 dims of BF16
 //   [4096..8191] = V cache: 64 positions × 64 dims of BF16
-// The 64-position limit is a tile-memory hardcap on XDNA1 AIE2 (4 columns,
-// 64 KB local memory per tile).  Extending it requires rebalancing weight
-// streams against cache footprint in the IRON tile layout.
+// The 64-position limit is currently hard-coded in the IRON graph and kernel
+// buffer dimensions; the actual storage lives in NPU/XRT buffer objects
+// allocated at runtime. Extending the window requires resizing the XRT
+// allocation, rebalancing the weight stream layout across tiles, and
+// recompiling the xclbin — it is a graph/kernel parameter, not a
+// physical tile-memory ceiling.
 //
 // PRECISION NOTES:
 // - All operations accumulate in FP32 via aie::accum<accfloat,32>
@@ -33,9 +36,10 @@
 
 // ---------------------------------------------------------------------------
 // Fast inverse square root — three Newton iterations.
-// Used by RMSNorm; the three iterations are calibrated for Qwen2.5 BF16
-// precision so that the CPU reference path produces the same argmax at
-// position 256 in the token-acceptance test.
+// Used by RMSNorm; the three iterations are calibrated so the CPU reference
+// path and the NPU path produce identical BF16 argmax results across every
+// position in the 64-token acceptance window, as verified by the checked-in
+// CPU BF16 reference sequence in the release gate.
 static inline float qwen_rsqrt(float value) {
   const float half = 0.5f * value;
   union {

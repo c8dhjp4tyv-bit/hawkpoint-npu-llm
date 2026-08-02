@@ -23,15 +23,21 @@ software multiply-accumulate rather than dedicated tensor units.
 
 ## Where the NPU Time Goes
 
-For Qwen2.5-0.5B (896 hidden, 4864 intermediate, 24 layers), per-token decode:
+For Qwen2.5-0.5B (896 hidden, 4864 intermediate, 24 layers). **All per-phase
+numbers below are order-of-magnitude estimates derived from the XDNA1 AIE2
+clock rate (1 GHz), known op counts, and the measured end-to-end token rate
+(3.65 tok/s).** The repository's benchmark tooling records only whole-token
+timings — it does not instrument individual dispatch, compute, or tokenizer
+phases. Use these estimates for bottleneck identification, not as measured
+results.
 
-| Phase | Time | Notes |
+| Phase | Estimated time | Derivation |
 |---|---|---|
-| Tile dispatch + weight fill | ~120 µs | XRT command submission |
-| Kernel compute (12 × 2-layer chunks) | ~960 µs | Full matmul + attention |
-| Host-side LM head | ~650 µs | NumPy BF16, not on NPU |
-| Tokenizer + bookkeeping | ~80 µs | Python overhead |
-| **Total** | **~1.8 ms** | ~550 tok/s theoretical |
+| Tile dispatch + weight fill | ~120 µs | XRT command submission overhead |
+| Kernel compute (12 × 2-layer chunks) | ~960 µs | 75M MACs / ~78 GMACs estimated AIE2 throughput |
+| Host-side LM head | ~650 µs | NumPy BF16 matmul on Zen 4, derived from residual |
+| Tokenizer + bookkeeping | ~80 µs | Python + HuggingFace tokenizers overhead |
+| **Total estimated** | **~1.8 ms** | **~550 tok/s upper bound vs 3.65 tok/s measured** |
 
 Measured streaming throughput is **3.65 tok/s** for Qwen 0.5B in 32-token chat.
 The 150× gap between theory and reality comes from:
@@ -66,15 +72,16 @@ The 150× gap between theory and reality comes from:
 
 ## XDNA1 vs XDNA2 Projection
 
-| | XDNA1 (AIE2) | XDNA2 (AIE4) |
+| | XDNA1 (AIE2, npu1) | XDNA2 (AIE4, npu4) |
 |---|---|---|
-| Tile count (mm²) | 4 columns * 5! | 8 columns * 8! |
-| Tile memory | 64 KB | 128 KB + L2 shared |
+| Columns | 4 | 8 |
+| Tile local memory | 64 KB data | 128 KB data + shared L2 |
 | Native FP8 | No | Yes |
-| Native TF32 | No | Yes |
-| Vector width | 256b | 512b + super-arith |
+| Vector width | 256-bit | 512-bit |
 
-Moving to XDNA2 would require a full kernel port (AIE2→AIE4), a re-parameterized
-IRON file, and new XRT/PCIe controller setup. This not needed on the current
-project plan, especially as owned by AMD. For numpy reference for FB samples, see
-attached pipeline jobs under `.github/workflows/`.
+Note: per-tile AIE2 throughput is ~117 GFLOPS BF16 (single tile, single
+worker); per-tile AIE4 throughput is architecture-dependent and not yet
+measured on Hawk Point.
+
+Both generations of silicon are AMD-proprietary; XDNA1 is validated here
+and XDNA2 is not. See [README Limitations](README.md#limitations).
