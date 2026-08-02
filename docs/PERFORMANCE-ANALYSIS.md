@@ -1,85 +1,74 @@
 # Performance Analysis
 
-## Bottom Line
+## Scope and Evidence
 
-The Qwen2.5-0.5B native NPU path is **not faster than an eight-thread CPU
-baseline** on measured Hawk Point hardware. This document explains the
-hardware budget and identifies where the NPU time goes, so future work can
-target the highest-impact bottlenecks.
+This document distinguishes **measured repository evidence** from static model
+arithmetic. It does not present uninstrumented phase timings, processor peak
+rates, cache behavior, or projected speedups as measurements.
 
-## Hardware Budget
+The controlled-comparison protocol is defined in [BENCHMARKS.md](../BENCHMARKS.md).
+Its cross-placement result table is intentionally empty until evidence is
+collected on the release hardware.
 
-| Resource | XDNA1 AIE2 | Zen 4 CPU (8T) |
-|---|---|---|
-| BF16 peak TFLOPS | ~1.7 | ~2.7 |
-| On-chip memory per tile/core | 64 KB data | 32 KB L1d + 1 MB L2 |
-| Weight movement per token | Zero (XRT buffers) | DDR5 stream |
-| NVMe / NEON / GPU acceleration | None | AVX-512 FMA |
+## Measured Native Runtime Results
 
-The NPU's theoretical advantage is weight persistence. All decoder weights
-remain in XRT buffer objects across tokens — no DDR re-read. But XDNA1's
-BF16 throughput is FP32-bound by the AIE2 tile architecture which uses
-software multiply-accumulate rather than dedicated tensor units.
+The following values are reported in the repository README for the validated
+Hawk Point XDNA1 system and acceptance workload:
 
-## Where the NPU Time Goes
+| Measurement | Reported result |
+|---|---:|
+| Cold compile/load | 7.03 s |
+| Warm `decode_token` smoke test | 10.72 token/s |
+| 32-token streaming chat | 3.65 token/s |
+| End-to-end TTFT for acceptance prompt | 8.80 s |
+| Fixed hardware context | 64 tokens |
 
-For Qwen2.5-0.5B (896 hidden, 4864 intermediate, 24 layers), the table below
-is an **idealized analytical compute model**. It is derived from the XDNA1
-AIE2 clock rate (1 GHz) and known operation counts; it is *not* a phase-level
-profile and is not derived from the observed end-to-end token time.
+For the 32-token streaming measurement, 3.65 token/s corresponds to about
+274 ms/token. The benchmark tooling does not separately instrument XRT dispatch,
+AIE execution, CPU LM-head work, tokenization, or Python orchestration.
+Consequently, this document makes no
+per-phase attribution of that 274 ms.
 
-| Idealized phase | Estimated lower-bound time | Basis |
-|---|---|---|
-| Tile dispatch + weight fill | ~120 µs | Analytical XRT submission-cost estimate |
-| AIE kernel compute (12 × 2-layer chunks) | ~960 µs | 75M MACs / ~78 GMAC/s assumed AIE2 throughput |
-| Host-side LM head | ~650 µs | Analytical host-matmul estimate; not profiled |
-| Tokenizer + bookkeeping | ~80 µs | Analytical host-overhead estimate; not profiled |
-| **Idealized total** | **~1.8 ms** | **Compute-model lower bound only** |
+## Static Decoder Projection Arithmetic
 
-Measured streaming throughput is **3.65 tok/s** for Qwen 0.5B in 32-token chat,
-or approximately **274 ms/token**. The model above therefore leaves roughly
-272 ms/token unaccounted for. The current benchmark tooling records whole-token
-timings only, so that residual cannot be attributed to dispatch, AIE compute,
-LM-head work, tokenization, or any other phase without new instrumentation.
-Use the model only to identify candidate optimization areas; do not interpret
-it as a timing breakdown or an upper-bound throughput claim.
+For Qwen2.5-0.5B, the native fused graph uses hidden size `896`, intermediate
+size `4864`, QKV projection size `1152`, and `24` decoder layers. Per layer,
+the four linear projections alone require:
 
-## Why CPU Beats NPU
+| Projection | MAC calculation | MACs/layer |
+|---|---:|---:|
+| QKV | `1152 × 896` | 1,032,192 |
+| Output projection | `896 × 896` | 802,816 |
+| Gate + up projection | `(2 × 4864) × 896` | 8,716,288 |
+| Down projection | `4864 × 896` | 4,358,144 |
+| **Projection subtotal** |  | **14,909,440** |
 
-- The 8-thread CPU baseline uses AVX-512 BF16 FMA at near-peak throughput.
-  The Qwen2.5-0.5B's ~1 GB of BF16 weights stream from DDR5, but at single-token
-  batch size the memory bandwidth is not saturated (~5-10 GB/s vs DDR5-5600's
-  44.8 GB/s peak).
-- The CPU cores cache attention and LM head constants in L2 over repeated
-  tokens, reducing round-trip latency for the most-frequently-accessed tensors.
-  However, the full model does **not** fit in L2 (∼1 GB weights vs 1 MB/core L2).
-  The performance advantage comes from latency-hiding via prefetchers and
-  out-of-order execution, not from caching the entire dataset.
-- The NPU compilation and load cost (7.03 s cold) is **amortized over tokens**,
-  but the serial dispatch gap makes the NPU hardware runway too short to catch up.
+Across 24 layers, the projection subtotal is **357,826,560 MACs/token**.
+This excludes RMSNorm, RoPE, residual operations, SwiGLU, cache work, and
+attention. It is therefore a lower bound on decoder arithmetic, not a timing
+model.
 
-## Possible Improvements (Estimated Impact)
+For example, an assumed sustained rate of 78 GMAC/s would yield a projection
+floor of about **4.59 ms/token** (`357.83M / 78G`) before those omitted
+operations. That is arithmetic under an explicit assumption, not a hardware
+measurement. It must not be compared directly with the 274 ms/token observed
+end-to-end result or used to assign the remaining time to any phase.
 
-| Optimization | Impact | Effort |
-|---|---|---|
-| NVME slice of Qwen 2-layer kernel  | 2× decode | Medium |
-| 2-layer pipelining (tile 0 runs and tile 1 dispatches) | 1.8× decode | Medium |
-| INT4/INT6 path on NPU (quantized than FP16) | 3-5× | High (new kernel) |
-| FP8 with XDNA2 AIE4 (hardware redesign) | 5-10× | Full rewrite |
-| Continuous batching on the server side | 3× throughput | Medium-high |
+## Candidate Areas for Measurement
 
-## XDNA1 vs XDNA2 Projection
+The source and existing benchmark protocol identify these areas as useful
+experiments, without claiming a speedup until they are benchmarked:
 
-| | XDNA1 (AIE2, npu1) | XDNA2 (AIE4, npu4) |
-|---|---|---|
-| Columns | 4 | 8 |
-| Tile local memory | 64 KB data | 128 KB data + shared L2 |
-| Native FP8 | No | Yes |
-| Vector width | 256-bit | 512-bit |
+- Profile XRT submission and completion timing separately from whole-token
+  latency.
+- Measure CPU LM-head and tokenization costs with the exact validated model
+  and prompt.
+- Compare persistent quantized-weight kernels against the current host-to-NPU
+  weight-transfer path in the Ollama integration.
+- Measure continuous batching or pipelining only with fixed prompt, context,
+  generation length, warm-up, and stability criteria from `BENCHMARKS.md`.
+- Run any XDNA2 port as a separate hardware-validation effort; XDNA2 is not
+  supported by the current XDNA1 implementation.
 
-Note: per-tile AIE2 throughput is ~117 GFLOPS BF16 (single tile, single
-worker); per-tile AIE4 throughput is architecture-dependent and not yet
-measured on Hawk Point.
-
-Both generations of silicon are AMD-proprietary; XDNA1 is validated here
-and XDNA2 is not. See [README Limitations](README.md#limitations).
+Until these measurements exist, benchmark data should be added only to release
+evidence artifacts, following the no-invented-data policy in `BENCHMARKS.md`.

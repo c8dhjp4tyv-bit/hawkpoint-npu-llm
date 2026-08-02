@@ -439,9 +439,9 @@ generation.
   are not currently in scope.
 - **Single-event completion model** — the inference worker uses
   `wait=True` on AIE command completion, not an interrupt-driven dispatch
-  or multi-worker pipelining. Between-token gaps include an estimated XRT
-  command-submission cost (~120 µs in the analytical model); this phase is not
-  currently instrumented separately.
+  or multi-worker pipelining. Between-token gaps include XRT command submission
+  overhead, but the current benchmark tooling does not instrument that phase
+  separately.
 
 See [ROADMAP.md](ROADMAP.md) for planned improvements and [BENCHMARKS.md](BENCHMARKS.md) for the
 controlled comparison protocol.
