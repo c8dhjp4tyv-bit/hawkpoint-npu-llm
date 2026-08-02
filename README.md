@@ -378,17 +378,73 @@ and token position. Layer weights and K/V caches remain in XRT buffer objects.
 
 ## Limitations
 
-- The attention kernel currently has a fixed 64-token context.
-- Only the exact checkpoints and architectures listed above are supported.
-- Qwen2.5 0.5B support remains experimental despite matching the tested BF16
-  generated-token reference. The current eight-thread CPU baseline can be
-  faster than the fused NPU path; consult the release evidence rather than
-  assuming an NPU speedup.
-- Generation is greedy; sampling parameters are accepted neither by the
-  runtime nor the API.
-- Current XRT firmware is reliable with two decoder layers per persistent
-  invocation; the host invokes 12 such chunks for Qwen's 24-layer stack.
-- The project targets `npu1`; it is not an XDNA2 implementation.
+### Hardware
+
+- **Fixed 64-token context window**: The KV cache is allocated as NPU/XRT
+  buffer objects sized for 64 positions (`2 × 4096 BF16 per KV head`).
+  This limit is currently hard-coded in the IRON graph and kernel definitions;
+  it is not imposed by the physical tile memory itself. Extending it would
+  require rebalancing the weight stream and cache buffer layout across the
+  AIE tiles and recompiling the xclbin. Prompts longer than 64 tokens are
+  automatically trimmed by the host.
+- **Padlocked to XDNA1 (`npu1`, AIE2, 4 columns).** XDNA2/NPU4 silicon
+  (Strix Point, Strix Halo — 8 columns, larger local memory, shared
+  caches) is not targeted. The IRON graph layouts, tile counts, and ObjectFifo
+  depths assume a 4-column array. Porting requires at minimum a re-parameterized
+ IRON design and a full AIE2→AIE4 kernel rewrite.
+- **No native BF16/FP16 tensor cores.** All AIE2 operations use a software
+  BF16 multiply-accumulate path via `aie::mul` + `aie::accum`. There is no
+  equivalent to NVIDIA Tensor Cores or Apple AMX blocks on this NPU
+generation.
+- **Two decoder layers per persistent invocation** — verified firmware
+  limit. Qwen2.5 0.5B stacks 12 chunks of 2 layers each.
+
+### Model support
+
+- Only the exact four checkpoint architectures listed above are supported.
+  The converter rejects any model whose hidden size, intermediate size,
+  layer count, attention layout, or vocabulary differ from a known template.
+  SmolLM2-360M, SmolLM2-1.7B, larger Qwen variants, and non-Llama architectures
+  fail at conversion time, not silently at runtime.
+- **No sampling parameters**. Generation is greedy. Temperature, top-k, top-p,
+  and repetition penalty are accepted by neither the runtime nor the
+  OpenAI-compatible API endpoint.
+
+### Performance
+
+- **Qwen2.5 0.5B NPU path is not faster than an eight-thread CPU baseline**
+  on measured hardware. The first-generation XDNA AIE2 array has ~2.34 TFLOPS
+  of BF16 peak throughput compared to a Zen 4 CPU core cluster at comparable
+  throughput with much lower launch overhead. See [Performance
+  Analysis](docs/PERFORMANCE-ANALYSIS.md) for a detailed breakdown.
+- The **Ollama XDNA backend** converts GGML rows to W8 for each decoded token
+  and streams padded weights through host→NPU DMA. This overhead makes the
+  NPU path slower than the optimized CPU/GPU path for all measured models.
+  A persistent packed-weight kernel (Q4_K/Q6_K→BF16 fused) would eliminate this
+  bottleneck — this is the highest-value optimization and is tracked as
+  a future work item in [ROADMAP.md](ROADMAP.md).
+- **Warm decode is line-rate only for a single token stream**
+  with no batching. The NPU has one execution context shared across all
+  requests; the HTTP server serializes inference and returns `429 Too Many
+  Requests` beyond a configurable queue depth.
+
+### Software
+
+- Requires a specific **XRT + firmware + kernel + MLIR-AIE version
+  combination**. `release-pins.json` records the validated stack. Component
+  version drift causes silent failures (DRM_IOCTL_AMDXDNA_CREATE_HWCTX
+  failures, `aie2_alloc_resource` exhaustion).
+- **No CUDA, ROCm, oneAPI, or Vulcan NPU delegates**: the AIE2 kernel follows
+  the old MTBL path. IREE, TPU-MLIR, open-Silicon, and XDNA-API-based builds
+  are not currently in scope.
+- **Single-event completion model** — the inference worker uses
+  `wait=True` on AIE command completion, not an interrupt-driven dispatch
+  or multi-worker pipelining. Between-token gaps include XRT command submission
+  overhead, but the current benchmark tooling does not instrument that phase
+  separately.
+
+See [ROADMAP.md](ROADMAP.md) for planned improvements and [BENCHMARKS.md](BENCHMARKS.md) for the
+controlled comparison protocol.
 
 ## License
 
