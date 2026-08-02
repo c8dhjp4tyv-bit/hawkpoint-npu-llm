@@ -42,12 +42,17 @@ The 150× gap between theory and reality comes from:
 
 ## Why CPU Beats NPU
 
-- The 8-thread CPU baseline caches the model in L2 after 2-3 iterations
-  (0.5B < Zen 4 unified cache).
-- Single-token, cold-start inference has negligible DDR bandwidth pressure
-  for the CPU.
+- The 8-thread CPU baseline uses AVX-512 BF16 FMA at near-peak throughput.
+  The Qwen2.5-0.5B's ~1 GB of BF16 weights stream from DDR5, but at single-token
+  batch size the memory bandwidth is not saturated (~5-10 GB/s vs DDR5-5600's
+  44.8 GB/s peak).
+- The CPU cores cache attention and LM head constants in L2 over repeated
+  tokens, reducing round-trip latency for the most-frequently-accessed tensors.
+  However, the full model does **not** fit in L2 (∼1 GB weights vs 1 MB/core L2).
+  The performance advantage comes from latency-hiding via prefetchers and
+  out-of-order execution, not from caching the entire dataset.
 - The NPU compilation and load cost (7.03 s cold) is **amortized over tokens**,
-  but the NPU hardware runway is too short to catch up.
+  but the serial dispatch gap makes the NPU hardware runway too short to catch up.
 
 ## Possible Improvements (Estimated Impact)
 

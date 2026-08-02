@@ -380,10 +380,12 @@ and token position. Layer weights and K/V caches remain in XRT buffer objects.
 
 ### Hardware
 
-- **Fixed 64-token context window**: The attention kernel's K/V cache size is
-  baked into the AIE2 array dimension (`2 × 8192 BF16 entries`). The 64-token
-  limit is a physical tile-memory constraint of the current `npu1` AIE2
-  design, not a soft configuration value. Prompts longer than 64 tokens are
+- **Fixed 64-token context window**: The KV cache is allocated as NPU/XRT
+  buffer objects sized for 64 positions (`2 × 4096 BF16 per KV head`).
+  This limit is currently hard-coded in the IRON graph and kernel definitions;
+  it is not imposed by the physical tile memory itself. Extending it would
+  require rebalancing the weight stream and cache buffer layout across the
+  AIE tiles and recompiling the xclbin. Prompts longer than 64 tokens are
   automatically trimmed by the host.
 - **Padlocked to XDNA1 (`npu1`, AIE2, 4 columns).** XDNA2/NPU4 silicon
   (Strix Point, Strix Halo — 8 columns, larger local memory, shared

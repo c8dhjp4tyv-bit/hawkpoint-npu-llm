@@ -146,6 +146,7 @@ static inline float qwen_exp(float x) {
 // ---------------------------------------------------------------------------
 // EXPORTED KERNEL ENTRY POINTS (extern "C" — discovered by IRON via ExternalFunction)
 // ---------------------------------------------------------------------------
+extern "C" {
 
 void qwen_copy896(const bfloat16 *__restrict input,
                   bfloat16 *__restrict output) {
