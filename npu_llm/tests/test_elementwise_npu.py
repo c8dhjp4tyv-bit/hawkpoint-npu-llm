@@ -10,8 +10,8 @@ from aie.utils.hostruntime import set_current_device
 
 
 ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT))
-from designs.elementwise import dequantize, quantize, residual_add, swiglu
+sys.path.insert(0, str(ROOT.parent))
+from npu_llm.designs.elementwise import dequantize, quantize, residual_add, swiglu
 
 
 def close(actual, expected, atol=0.08):

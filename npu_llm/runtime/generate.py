@@ -12,21 +12,22 @@ import aie.iron as iron
 from aie.iron.device import from_name
 from aie.utils.hostruntime import set_current_device
 
-from designs.attention_block import attention_block
-from designs.decoder_layer import decoder_layer
-from designs.elementwise import (
+from ..designs.attention_block import attention_block
+from ..designs.decoder_layer import decoder_layer
+from ..designs.elementwise import (
     residual_add,
     swiglu,
 )
-from designs.project import norm_project, project, project_residual
-from designs.project_bf16 import project_bf16, project_bf16_residual
-from designs.qkv_rope import qkv_rope
-from designs.qwen_decoder import qwen_decoder
-from designs.rmsnorm import rmsnorm
-from designs.tensor_copy import slice_bf16
-from runtime.model import XDNA1Model
-from runtime.cpu_backend import CPUDecoderStage, _bf16 as _bf16_cpu
-from runtime.tokenizer import SmolLMTokenizer
+from ..designs.project import norm_project, project, project_residual
+from ..designs.project_bf16 import project_bf16, project_bf16_residual
+from ..designs.qkv_rope import qkv_rope
+from ..designs.qwen_decoder import qwen_decoder
+from ..designs.rmsnorm import rmsnorm
+from ..designs.tensor_copy import slice_bf16
+from .model import XDNA1Model
+from .cpu_backend import CPUDecoderStage, _bf16 as _bf16_cpu
+from .prompts import default_system_prompt
+from .tokenizer import SmolLMTokenizer
 
 
 class NPUDecoder:
@@ -36,12 +37,10 @@ class NPUDecoder:
         self._closed = False
         self.model = XDNA1Model(model_dir)
         self.model_family = self.model.metadata.get("model_family", "llama")
-        default_system = (
-            "You are Qwen, created by Alibaba Cloud. You are a helpful assistant."
-            if self.model_family == "qwen2"
-            else "You are a helpful AI assistant named SmolLM."
+        self.tokenizer = SmolLMTokenizer(
+            model_dir,
+            default_system=default_system_prompt(self.model_family),
         )
-        self.tokenizer = SmolLMTokenizer(model_dir, default_system=default_system)
         self.context_length = context_length
         self.hidden_size = self.model.metadata["hidden_size"]
         self.intermediate_size = self.model.metadata["intermediate_size"]
@@ -633,15 +632,16 @@ class NPUDecoder:
         """Generate a response for an OpenAI-style list of chat messages.
 
         The hardware attention cache is fixed at 64 tokens. When a conversation
-        grows beyond that window, the newest prompt tokens are retained.
+        grows beyond that window, whole turns are dropped oldest-first so the
+        retained prompt stays well-formed ChatML.
         """
         if not 0 < max_new_tokens < self.context_length:
             raise ValueError(
                 f"max_new_tokens must be between 1 and {self.context_length - 1}"
             )
-        prompt_ids = self.tokenizer.encode_chat(messages)
-        if len(prompt_ids) + max_new_tokens > self.context_length:
-            prompt_ids = prompt_ids[-(self.context_length - max_new_tokens) :]
+        prompt_ids = self.tokenizer.encode_chat_within(
+            messages, self.context_length - max_new_tokens
+        )
         timings = []
         next_token = None
         position = 0

@@ -5,9 +5,10 @@ import sys
 
 
 ROOT = Path(__file__).resolve().parent
-sys.path.insert(0, str(ROOT))
+sys.path.insert(0, str(ROOT.parent))
 
-from runtime.generate import NPUDecoder
+from npu_llm.runtime.generate import NPUDecoder
+from npu_llm.runtime.prompts import seed_messages
 
 
 def main():
@@ -44,11 +45,7 @@ def main():
     decoder = NPUDecoder(args.model, npu_layers=npu_layers)
     # An explicit system prompt wins; otherwise the tokenizer supplies the one
     # matching the checkpoint family (SmolLM and Qwen expect different text).
-    messages = (
-        [{"role": "system", "content": args.system_prompt}]
-        if args.system_prompt
-        else []
-    )
+    messages = seed_messages(args.system_prompt)
     history_start = len(messages)
     label = "Qwen" if decoder.model_family == "qwen2" else "SmolLM"
 

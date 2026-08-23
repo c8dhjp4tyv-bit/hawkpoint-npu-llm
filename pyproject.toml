@@ -1,0 +1,46 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "hawkpoint-npu-llm"
+version = "0.1.0a0"
+description = "Run SmolLM and Qwen2.5 checkpoints on the AMD XDNA1 NPU"
+readme = "README.md"
+requires-python = ">=3.12"
+license = "Apache-2.0 WITH LLVM-exception"
+license-files = ["LICENSE", "NOTICE"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: GPU",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+# MLIR-AIE/IRON and XRT are not distributed on PyPI: they come from the
+# upstream MLIR-AIE environment described in README.md, so only the
+# host-side dependencies are declared here. Use requirements.lock for the
+# exact hash-pinned versions the hardware gate is validated against.
+dependencies = [
+    "huggingface-hub>=1.19",
+    "ml-dtypes>=0.5.4",
+    "numpy>=2.4",
+    "safetensors>=0.8",
+    "tokenizers>=0.22",
+]
+
+[project.urls]
+Homepage = "https://github.com/c8dhjp4tyv-bit/hawkpoint-npu-llm"
+Changelog = "https://github.com/c8dhjp4tyv-bit/hawkpoint-npu-llm/blob/main/CHANGELOG.md"
+
+[project.scripts]
+hawkpoint-npu-api = "npu_llm.api_server:main"
+hawkpoint-npu-chat = "npu_llm.chat:main"
+
+[tool.setuptools.packages.find]
+include = ["npu_llm*"]
+# Only real packages: npu_llm/tests holds hardware scripts, not library code.
+namespaces = false
+
+[tool.setuptools.package-data]
+# The IRON designs compile these AIE2 sources at run time.
+"npu_llm" = ["kernels/*.cc"]

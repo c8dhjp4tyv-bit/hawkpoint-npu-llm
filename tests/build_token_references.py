@@ -10,10 +10,10 @@ import sys
 
 
 ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT / "npu_llm"))
+sys.path.insert(0, str(ROOT))
 
-from model_catalog import discover_models  # noqa: E402
-from runtime.generate import NPUDecoder  # noqa: E402
+from npu_llm.model_catalog import discover_models  # noqa: E402
+from npu_llm.runtime.generate import NPUDecoder  # noqa: E402
 
 
 def main():

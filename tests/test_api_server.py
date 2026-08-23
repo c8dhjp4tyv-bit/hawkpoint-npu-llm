@@ -24,6 +24,7 @@ from npu_llm.api_server import (  # noqa: E402
     ProcessCompletionEngine,
     RateLimiter,
     ServerConfig,
+    client_address,
     make_handler,
 )
 
@@ -45,6 +46,29 @@ class FakeDecoder:
             "finish_reason": "length",
             "decode_tokens_per_second": 2.5,
         }
+
+
+class EchoDecoder:
+    """Reports the max_new_tokens it was handed, so clamping can be asserted."""
+
+    context_length = 64
+
+    def generate_messages(self, messages, max_new_tokens):
+        yield str(max_new_tokens), None
+        yield "", {"prompt_tokens": 1, "generated_tokens": 1}
+
+
+class _Headers:
+    """Minimal stand-in for the email.message.Message header container."""
+
+    def __init__(self, values):
+        self._values = values
+
+    def get_all(self, name, failobj=None):
+        for key, value in self._values.items():
+            if key.lower() == name.lower():
+                return [value]
+        return failobj
 
 
 class FailingDecoder:
@@ -131,12 +155,21 @@ class TrackingFactory:
         return decoder
 
 
-def fetch(url, data=None, *, api_key=API_KEY, origin=None, raw=None):
+def fetch(
+    url,
+    data=None,
+    *,
+    api_key=API_KEY,
+    origin=None,
+    raw=None,
+    extra_headers=None,
+):
     headers = {"Content-Type": "application/json"}
     if api_key:
         headers["Authorization"] = f"Bearer {api_key}"
     if origin:
         headers["Origin"] = origin
+    headers.update(extra_headers or {})
     request = Request(
         url,
         data=raw if raw is not None else (
@@ -240,6 +273,91 @@ def test_protocol_and_security():
         assert status == 413
     finally:
         stop_server(server, thread)
+
+
+def test_request_validation_rejects_coercible_types():
+    """Malformed JSON types must fail with 400, not be silently coerced."""
+    server, thread, base = start_server({"smollm2-135m-xdna1": FakeDecoder()})
+    try:
+        for field, value in (
+            ("max_tokens", "5"),
+            ("max_tokens", True),
+            ("max_tokens", 2.5),
+            ("max_tokens", 0),
+            ("max_tokens", -3),
+            ("stream", "false"),
+            ("stream", 1),
+            ("model", {"id": "smollm2-135m-xdna1"}),
+        ):
+            request = payload()
+            request[field] = value
+            status, body, _ = fetch(f"{base}/v1/chat/completions", request)
+            assert status == 400, f"{field}={value!r} returned {status}"
+            assert json.loads(body)["error"]["type"] == "invalid_request_error"
+
+    finally:
+        stop_server(server, thread)
+
+    # Above the context window max_tokens is clamped, not rejected.
+    server, thread, base = start_server({"smollm2-135m-xdna1": EchoDecoder()})
+    try:
+        request = payload()
+        request["max_tokens"] = 5000
+        status, body, _ = fetch(f"{base}/v1/chat/completions", request)
+        assert status == 200
+        assert json.loads(body)["choices"][0]["message"]["content"] == "63"
+    finally:
+        stop_server(server, thread)
+
+
+def test_forwarded_headers_only_honored_for_trusted_proxies():
+    """Rate-limit identity must not be spoofable by an untrusted client."""
+    headers = {"X-Forwarded-For": "203.0.113.9, 198.51.100.2"}
+
+    # No trusted proxy configured: the peer is always the identity.
+    assert client_address("198.51.100.2", _Headers(headers), ()) == "198.51.100.2"
+    # An untrusted peer cannot claim to be a proxy.
+    assert client_address("10.9.9.9", _Headers(headers), ("198.51.100.2",)) == "10.9.9.9"
+    # A trusted peer's chain is walked from the nearest hop outwards, skipping
+    # further trusted hops.
+    assert (
+        client_address(
+            "198.51.100.2",
+            _Headers(headers),
+            ("198.51.100.2", "198.51.100.3"),
+        )
+        == "203.0.113.9"
+    )
+    # Distinct forwarded clients stay in distinct buckets.
+    trusted = ("198.51.100.2",)
+    first = client_address(
+        "198.51.100.2", _Headers({"X-Forwarded-For": "203.0.113.9"}), trusted
+    )
+    second = client_address(
+        "198.51.100.2", _Headers({"X-Forwarded-For": "203.0.113.10"}), trusted
+    )
+    assert first != second
+    # RFC 7239 Forwarded wins, including quoted IPv6 with a port.
+    assert (
+        client_address(
+            "198.51.100.2",
+            _Headers(
+                {
+                    "Forwarded": 'for="[2001:db8::1]:4711";proto=https',
+                    "X-Forwarded-For": "203.0.113.9",
+                }
+            ),
+            trusted,
+        )
+        == "2001:db8::1"
+    )
+    # Garbage never becomes an identity.
+    assert (
+        client_address(
+            "198.51.100.2", _Headers({"X-Forwarded-For": "not-an-ip"}), trusted
+        )
+        == "198.51.100.2"
+    )
 
 
 def test_backpressure_and_safe_errors():
@@ -417,6 +535,8 @@ def test_model_switch_releases_previous_decoder():
 
 def main():
     test_protocol_and_security()
+    test_request_validation_rejects_coercible_types()
+    test_forwarded_headers_only_honored_for_trusted_proxies()
     test_backpressure_and_safe_errors()
     test_hard_process_timeout()
     test_worker_error_forces_restart()

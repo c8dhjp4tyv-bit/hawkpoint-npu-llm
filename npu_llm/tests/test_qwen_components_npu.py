@@ -8,17 +8,17 @@ import numpy as np
 
 
 ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT))
+sys.path.insert(0, str(ROOT.parent))
 
 import aie.iron as iron
 from aie.iron.device import from_name
 from aie.utils.hostruntime import set_current_device
-from designs.attention_block import attention_block
-from designs.elementwise import swiglu
-from designs.project import project
-from designs.project_bf16 import project_bf16
-from designs.qkv_rope import qkv_rope
-from designs.rmsnorm import rmsnorm
+from npu_llm.designs.attention_block import attention_block
+from npu_llm.designs.elementwise import swiglu
+from npu_llm.designs.project import project
+from npu_llm.designs.project_bf16 import project_bf16
+from npu_llm.designs.qkv_rope import qkv_rope
+from npu_llm.designs.rmsnorm import rmsnorm
 
 
 Q_HEADS = 14

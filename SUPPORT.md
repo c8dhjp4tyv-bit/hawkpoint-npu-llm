@@ -30,10 +30,28 @@ protocol/converter and upstream Ollama tests run first. The release then waits
 for a labeled physical Hawk Point runner to complete fresh pinned model
 conversion, SmolLM acceptance, Qwen component and 32-token CPU BF16/NPU
 agreement, a measured 1,000-completion model-switching soak, and an Ollama
-build/install/inference/rollback test. The four Ollama placements must produce
-the same response digest. The SBOM, signing, provenance, and GitHub release
-job has `needs: hawk-point`; it cannot run when hardware is absent or any
-hardware gate fails.
+build/install/inference/rollback test. The SBOM, signing, provenance, and
+GitHub release job has `needs: hawk-point`; it cannot run when hardware is
+absent or any hardware gate fails.
+
+The four Ollama placements (CPU only, GPU only, CPU+GPU, CPU+GPU+NPU) are
+gated as implemented in `tests/benchmark_ollama_matrix.py`:
+
+- every placement must complete all of its requests with zero errors;
+- within one placement, the response text must not change between requests;
+- **cross-placement exact response digests are informational.** CPU, CUDA,
+  and XDNA kernels diverge numerically, so identical text across backends is
+  not a realistic requirement and a digest mismatch alone never fails the
+  release. The hashes are still recorded in `ollama-placement-matrix.json`.
+- cross-placement correctness is decided by the teacher-forced logit
+  agreement pass: per position, top-1 agreement and top-k overlap against the
+  reference placement, where a top-1 mismatch fails only when the reference
+  logit margin is at or above the configured threshold
+  (`--logit-margin-threshold`, default `1.0`). Genuine low-margin near-ties
+  are tolerated.
+
+That gate is independent of, and does not weaken, the native runtime's exact
+checked-in 32-token Qwen sequence gate.
 
 All third-party Actions are pinned to full commit SHAs. Repository Actions
 policy also requires full-length SHA pinning. The separately dispatchable

@@ -7,6 +7,7 @@ from dataclasses import dataclass
 import gc
 import hmac
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import ipaddress
 import json
 import logging
 import multiprocessing
@@ -21,14 +22,35 @@ import uuid
 
 
 ROOT = Path(__file__).resolve().parent
-try:
-    from .model_catalog import DEFAULT_MODEL_ID, discover_models
-except ImportError:
-    from model_catalog import DEFAULT_MODEL_ID, discover_models
+if __package__ in (None, ""):
+    # Direct script execution (``python npu_llm/api_server.py``) puts this
+    # file's directory on sys.path instead of the repository root. Add the
+    # root so the package form of every internal import resolves the same way
+    # it does under ``python -m npu_llm.api_server``.
+    sys.path.insert(0, str(ROOT.parent))
+
+from npu_llm.model_catalog import DEFAULT_MODEL_ID, discover_models  # noqa: E402
 
 
 def _completion_id():
     return f"chatcmpl-{uuid.uuid4().hex}"
+
+
+def _validate_stream(value):
+    if not isinstance(value, bool):
+        raise ValueError("stream must be a boolean")
+    return value
+
+
+def _validate_max_tokens(value, limit):
+    # bool is a subclass of int, and JSON true/false here is a client bug.
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError("max_tokens must be an integer")
+    if value < 1:
+        raise ValueError("max_tokens must be at least 1")
+    # The hardware context is fixed, so larger requests are clamped rather
+    # than rejected; the prompt window shrinks by the same amount.
+    return min(value, limit)
 
 
 def _validate_messages(value):
@@ -61,6 +83,62 @@ class ServerConfig:
     request_timeout: float = 120.0
     queue_capacity: int = 2
     rate_limit_per_minute: int = 30
+    # Addresses whose Forwarded/X-Forwarded-For headers may be believed.
+    # Empty by default: an unconfigured server treats every peer as the
+    # client, so a forged header can never redirect someone else's quota.
+    trusted_proxies: tuple = ()
+
+
+def _normalize_address(value):
+    """Return the bare IP in a forwarded element, or None if it is not one."""
+    value = value.strip().strip('"')
+    if value.startswith("["):
+        value = value.partition("]")[0][1:]
+    elif value.count(":") == 1:
+        value = value.partition(":")[0]
+    try:
+        return str(ipaddress.ip_address(value))
+    except ValueError:
+        return None
+
+
+def _forwarded_chain(headers):
+    """Return proxy-reported addresses, left-to-right (original client first).
+
+    ``Forwarded`` (RFC 7239) wins over the de-facto ``X-Forwarded-For`` when
+    both are present. Unparsable elements are dropped rather than guessed at.
+    """
+    elements = []
+    for header in headers.get_all("Forwarded") or []:
+        for element in header.split(","):
+            for parameter in element.split(";"):
+                name, separator, value = parameter.partition("=")
+                if separator and name.strip().lower() == "for":
+                    elements.append(value)
+    if not elements:
+        for header in headers.get_all("X-Forwarded-For") or []:
+            elements.extend(header.split(","))
+    return [
+        address
+        for address in (_normalize_address(element) for element in elements)
+        if address is not None
+    ]
+
+
+def client_address(peer, headers, trusted_proxies):
+    """Resolve the rate-limiting identity for one request.
+
+    Forwarded headers are honored only when the immediate peer is a
+    configured trusted proxy; the chain is then walked from the nearest hop
+    outwards and the first address that is not itself a trusted proxy is the
+    client.
+    """
+    if peer not in trusted_proxies:
+        return peer
+    for address in reversed(_forwarded_chain(headers)):
+        if address not in trusted_proxies:
+            return address
+    return peer
 
 
 class RateLimiter:
@@ -360,12 +438,9 @@ class NPUDecoderFactory:
     npu_percent: float | None = None
 
     def __call__(self, path):
-        # runtime/ and designs/ import each other by top-level name, so the
-        # package directory has to be importable even when this module was
-        # loaded as npu_llm.api_server rather than run as a script.
-        if str(ROOT) not in sys.path:
-            sys.path.insert(0, str(ROOT))
-        from runtime.generate import NPUDecoder
+        # Imported lazily: the decoder pulls in MLIR-AIE/IRON, which only
+        # exists on a configured NPU host.
+        from npu_llm.runtime.generate import NPUDecoder
 
         metadata = json.loads((Path(path) / "metadata.json").read_text())
         layers = int(metadata["layers"])
@@ -481,7 +556,9 @@ def make_handler(engine, config=None):
                 return
             if not self._authorized():
                 return
-            client = self.client_address[0]
+            client = client_address(
+                self.client_address[0], self.headers, config.trusted_proxies
+            )
             if not limiter.allow(client):
                 self._error("rate limit exceeded", 429, "rate_limit_error")
                 return
@@ -500,7 +577,11 @@ def make_handler(engine, config=None):
                 if not isinstance(request, dict):
                     raise ValueError("request body must be a JSON object")
                 messages = _validate_messages(request.get("messages"))
-                model_id = request.get("model") or engine.default_model_id
+                stream = _validate_stream(request.get("stream", False))
+                model_id = request.get("model")
+                if model_id is not None and not isinstance(model_id, str):
+                    raise ValueError("model must be a string")
+                model_id = model_id or engine.default_model_id
                 if not engine.has_model(model_id):
                     self._error(
                         f"model {model_id!r} is not installed",
@@ -508,9 +589,8 @@ def make_handler(engine, config=None):
                         "model_not_found",
                     )
                     return
-                requested = int(request.get("max_tokens", 16))
-                max_tokens = min(
-                    max(1, requested),
+                max_tokens = _validate_max_tokens(
+                    request.get("max_tokens", 16),
                     engine.context_length(model_id) - 1,
                 )
             except (ValueError, TypeError, json.JSONDecodeError) as exc:
@@ -523,7 +603,7 @@ def make_handler(engine, config=None):
             self.connection.settimeout(config.request_timeout)
             self._deadline = time.monotonic() + config.request_timeout
             try:
-                if request.get("stream", False):
+                if stream:
                     self._stream(model_id, messages, max_tokens)
                 else:
                     self._complete(model_id, messages, max_tokens)
@@ -684,6 +764,16 @@ def main():
         dest="cors_origins",
         help="allowed browser origin; may be repeated",
     )
+    parser.add_argument(
+        "--trusted-proxy",
+        action="append",
+        dest="trusted_proxies",
+        help=(
+            "IP address of a reverse proxy whose Forwarded/X-Forwarded-For "
+            "header may be used to identify clients for rate limiting; "
+            "may be repeated"
+        ),
+    )
     parser.add_argument("--max-body-bytes", type=int, default=1_048_576)
     parser.add_argument("--request-timeout", type=float, default=120)
     parser.add_argument("--queue-capacity", type=int, default=2)
@@ -727,6 +817,11 @@ def main():
         parser.error("--npu-percent must be between 0 and 100")
     if args.npu_layers is not None and args.npu_layers < 0:
         parser.error("--npu-layers cannot be negative")
+    for proxy in args.trusted_proxies or ():
+        try:
+            ipaddress.ip_address(proxy)
+        except ValueError:
+            parser.error(f"--trusted-proxy must be an IP address: {proxy!r}")
 
     if args.model:
         discovered = discover_models(args.model.parent)
@@ -766,6 +861,7 @@ def main():
         request_timeout=args.request_timeout,
         queue_capacity=args.queue_capacity,
         rate_limit_per_minute=args.rate_limit_per_minute,
+        trusted_proxies=tuple(args.trusted_proxies or ()),
     )
     server = BoundedHTTPServer(
         (args.host, args.port),

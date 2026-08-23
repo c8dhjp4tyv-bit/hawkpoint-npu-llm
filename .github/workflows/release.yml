@@ -22,7 +22,10 @@ jobs:
           python npu_llm/tests/test_converter.py
           python npu_llm/tests/test_model_integrity.py
           python tests/test_api_server.py
+          python tests/test_chat_context.py
           python tests/test_release_gates.py
+          python npu_llm/api_server.py --help >/dev/null
+          python -m npu_llm.api_server --help >/dev/null
 
   hosted-ollama:
     runs-on: ubuntu-latest

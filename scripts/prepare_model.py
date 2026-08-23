@@ -34,8 +34,7 @@ def prepare(model_id, models_dir):
         ],
     )
 
-    sys.path.insert(0, str(ROOT / "npu_llm/tools"))
-    from convert_smollm2 import convert
+    from npu_llm.tools.convert_smollm2 import convert
 
     print(f"Converting model to {output}")
     manifest = convert(

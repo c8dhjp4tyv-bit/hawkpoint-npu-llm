@@ -68,6 +68,11 @@ the sunlight in all directions, including blue light. When sunlight enters
 the Earth's atmosphere,
 ```
 
+That sample was captured before the host switched to turn-aware context
+trimming. The acceptance prompt now reaches the model as one complete turn
+instead of a token slice, so the exact wording is re-captured on the next
+hardware run; the measured latency and memory figures above are unaffected.
+
 The fused Qwen2.5 0.5B path is checked against both the NumPy BF16 runtime and
 the upstream BF16 checkpoint. Release candidates require an exact checked-in
 32-token generated sequence. A separate 32-position prefill benchmark records
@@ -94,7 +99,7 @@ with memory pressure and CPU BLAS configuration.
 - AIE2 C++ kernels and IRON graph definitions
 
 Conversation history is retained by the client and automatically trimmed to
-the newest tokens that fit the current 64-token hardware context.
+the newest complete turns that fit the current 64-token hardware context.
 
 ## Supported models
 
@@ -256,10 +261,18 @@ curl http://localhost:8000/v1/chat/completions \
 
 For streaming output, set `"stream": true`.
 
-`max_tokens` is clamped to 63 and reserves its share of the fixed 64-token
-hardware context: when the prompt does not fit alongside it, the newest
-`64 - max_tokens` prompt tokens are kept. A large `max_tokens` therefore
-shortens the usable prompt window instead of extending the context.
+Request fields are validated strictly: `stream` must be a JSON boolean,
+`model` a string, and `max_tokens` a non-boolean integer of at least 1.
+Invalid types and non-positive values return `400` instead of being silently
+coerced. `max_tokens` above the hardware window is clamped to 63.
+
+`max_tokens` reserves its share of the fixed 64-token hardware context, so a
+large value shortens the usable prompt window instead of extending the
+context. When a conversation does not fit, whole turns are dropped
+oldest-first — the system message and newest turn are kept — so the retained
+prompt is always well-formed ChatML rather than a mid-token slice. If a
+single turn still does not fit, the identity preamble is dropped first and
+only then is that turn's own text shortened from the front.
 
 Select another installed model by changing the request's `model` field:
 
@@ -317,6 +330,20 @@ localhost. To run the server directly with TLS, pass `--tls-cert CERT.pem
 --tls-key KEY.pem`. For non-local deployment, use a trusted TLS reverse proxy
 and keep the backend private.
 
+Behind a reverse proxy every request arrives from the proxy's address, which
+would put all clients in one rate-limit bucket. Name the proxy explicitly to
+rate-limit per real client:
+
+```bash
+python npu_llm/api_server.py --trusted-proxy 127.0.0.1
+```
+
+`Forwarded` and `X-Forwarded-For` are read **only** when the connecting peer
+is one of the configured `--trusted-proxy` addresses; otherwise the peer
+address is used, so a client cannot forge its way into someone else's quota.
+The header chain is walked from the nearest hop outwards and the first
+address that is not itself a trusted proxy becomes the identity.
+
 ## Convert a model manually
 
 ```bash
@@ -339,6 +366,15 @@ Tests are directly executable and do not require pytest:
 python npu_llm/tests/test_converter.py
 python npu_llm/tests/test_model_runtime.py
 python tests/test_api_server.py
+python tests/test_chat_context.py
+```
+
+The repository is also an installable package (`pyproject.toml`), so the
+server runs either as a script or as a module:
+
+```bash
+python npu_llm/api_server.py --help
+python -m npu_llm.api_server --help
 ```
 
 Run the complete hardware acceptance test:
