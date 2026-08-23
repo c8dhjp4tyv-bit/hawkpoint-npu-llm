@@ -17,7 +17,10 @@ from npu_llm.runtime.prompts import (  # noqa: E402
     default_system_prompt,
     seed_messages,
 )
-from npu_llm.runtime.tokenizer import SmolLMTokenizer  # noqa: E402
+from npu_llm.runtime.tokenizer import (  # noqa: E402
+    PromptBudgetError,
+    SmolLMTokenizer,
+)
 
 
 MARKERS = ("<|im_start|>", "<|im_end|>")
@@ -78,6 +81,7 @@ def build_tokenizer(default_system="You are a helpful AI assistant named SmolLM.
     tokenizer.eos_token = "<|im_end|>"
     tokenizer.eos_id = tokenizer._tokenizer.token_to_id("<|im_end|>")
     tokenizer.default_system = default_system
+    tokenizer._minimum_prompt_tokens = None
     return tokenizer
 
 
@@ -175,9 +179,65 @@ def test_generation_budget_is_always_respected():
             for index in range(9)
         ],
     ]
+    minimum = tokenizer.minimum_prompt_tokens
     for max_new_tokens in range(1, CONTEXT):
-        ids = tokenizer.encode_chat_within(messages, CONTEXT - max_new_tokens)
+        budget = CONTEXT - max_new_tokens
+        if budget < minimum:
+            # Too little room for any valid prompt: must fail predictably.
+            try:
+                tokenizer.encode_chat_within(messages, budget)
+                raise AssertionError(
+                    f"budget {budget} unexpectedly produced a prompt"
+                )
+            except PromptBudgetError:
+                continue
+        ids = tokenizer.encode_chat_within(messages, budget)
         assert len(ids) + max_new_tokens <= CONTEXT, max_new_tokens
+        # Every accepted prompt, including the tightest ones, is valid ChatML.
+        assert_well_formed(tokenizer, ids)
+
+
+def test_tiny_budgets_never_slice_the_encoded_stream():
+    """A budget below one empty turn raises instead of returning a suffix."""
+    tokenizer = build_tokenizer()
+    messages = [{"role": "user", "content": "why is the sky blue"}]
+    minimum = tokenizer.minimum_prompt_tokens
+    assert minimum > 1
+
+    for budget in range(-1, minimum):
+        try:
+            tokenizer.encode_chat_within(messages, budget)
+            raise AssertionError(f"budget {budget} unexpectedly succeeded")
+        except PromptBudgetError:
+            pass
+
+    # Exactly at the minimum an empty-content turn is emitted, still valid.
+    ids = tokenizer.encode_chat_within(messages, minimum)
+    assert len(ids) == minimum
+    assert_well_formed(tokenizer, ids)
+
+
+def test_system_only_conversation_keeps_the_callers_text():
+    """An explicit system message is never swapped for the family default."""
+    tokenizer = build_tokenizer(default_system="DEFAULT IDENTITY TEXT")
+    messages = [{"role": "system", "content": "follow the house style closely"}]
+
+    ids = tokenizer.encode_chat_within(messages, CONTEXT - 16)
+    decoded = pieces(tokenizer, ids)
+    assert "house" in decoded and "style" in decoded
+    assert "DEFAULT" not in decoded
+    assert "IDENTITY" not in decoded
+    assert decoded[1] == "system"
+    assert_well_formed(tokenizer, ids)
+
+    # Same guarantee when the system message must itself be shortened.
+    long_system = [{"role": "system", "content": " ".join(f"rule{i}" for i in range(60))}]
+    ids = tokenizer.encode_chat_within(long_system, 20)
+    decoded = pieces(tokenizer, ids)
+    assert len(ids) <= 20
+    assert_well_formed(tokenizer, ids)
+    assert "rule59" in decoded
+    assert "DEFAULT" not in decoded
 
 
 def test_default_system_prompt_is_family_specific():
@@ -210,6 +270,8 @@ def main():
     test_newest_turn_wins_the_window_over_the_system_prompt()
     test_single_oversized_turn_is_shortened_but_stays_well_formed()
     test_generation_budget_is_always_respected()
+    test_tiny_budgets_never_slice_the_encoded_stream()
+    test_system_only_conversation_keeps_the_callers_text()
     test_default_system_prompt_is_family_specific()
     test_cli_only_seeds_a_system_message_when_asked()
     print("PASS chat context trimming and prompt defaults")

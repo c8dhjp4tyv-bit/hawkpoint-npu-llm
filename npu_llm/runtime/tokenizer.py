@@ -9,6 +9,10 @@ DEFAULT_SYSTEM = (
 )
 
 
+class PromptBudgetError(ValueError):
+    """The prompt budget is too small to hold any well-formed ChatML turn."""
+
+
 def _eos_token_text(value):
     """Return the literal EOS token from a ``tokenizer_config.json`` entry.
 
@@ -38,6 +42,7 @@ class SmolLMTokenizer:
                 f"{model_dir}"
             )
         self.default_system = default_system
+        self._minimum_prompt_tokens = None
 
     def format_chat(
         self,
@@ -67,6 +72,22 @@ class SmolLMTokenizer:
             )
         ).ids
 
+    @property
+    def minimum_prompt_tokens(self):
+        """Smallest well-formed ChatML prompt this tokenizer can emit.
+
+        One empty user turn plus the generation prompt. A budget below this
+        cannot hold a valid prompt at all, so no amount of trimming helps.
+        """
+        if self._minimum_prompt_tokens is None:
+            self._minimum_prompt_tokens = len(
+                self.encode_chat(
+                    [{"role": "user", "content": ""}],
+                    include_default_system=False,
+                )
+            )
+        return self._minimum_prompt_tokens
+
     def encode_chat_within(self, messages, budget):
         """Encode a conversation that fits ``budget`` tokens, by whole turns.
 
@@ -83,17 +104,33 @@ class SmolLMTokenizer:
         4. the newest turn with its content shortened from the front.
 
         Only the last step loses part of a message, and it still re-emits the
-        surrounding markers, so the result is always well-formed ChatML.
+        surrounding markers, so **every** returned encoding is well-formed
+        ChatML. A budget too small to hold even an empty turn raises
+        ``PromptBudgetError`` rather than degrading to a raw token slice.
+
+        A conversation of only a system message keeps that message: the
+        caller's text is never silently replaced by the family default.
         """
-        if budget <= 0:
-            raise ValueError("budget must be a positive number of tokens")
+        if budget < self.minimum_prompt_tokens:
+            raise PromptBudgetError(
+                f"a prompt budget of {budget} token(s) cannot hold a valid "
+                f"ChatML turn; this tokenizer needs at least "
+                f"{self.minimum_prompt_tokens}"
+            )
         system, turns = self._split_system(messages)
+        if not turns:
+            # System-only (or empty) conversation: encode it as given so an
+            # explicit system message is preserved verbatim.
+            ids = self.encode_chat(system, include_default_system=False)
+            if len(ids) <= budget:
+                return ids
+            return self._encode_shortened(system, budget)
         for start in _turn_starts(turns):
             ids = self.encode_chat([*system, *turns[start:]])
             if len(ids) <= budget:
                 return ids
         newest = turns[-1:]
-        if system and newest:
+        if system:
             ids = self.encode_chat(newest, include_default_system=False)
             if len(ids) <= budget:
                 return ids
@@ -108,8 +145,6 @@ class SmolLMTokenizer:
 
     def _encode_shortened(self, messages, budget):
         """Keep the newest content of the last message that still fits."""
-        if not messages:
-            return self.encode_chat(messages)[-budget:]
         tail = dict(messages[-1])
         content_ids = self._tokenizer.encode(tail["content"]).ids
         kept = None
@@ -127,14 +162,14 @@ class SmolLMTokenizer:
                 low = middle + 1
             else:
                 high = middle - 1
-        if kept is not None:
-            return kept
-        # The ChatML scaffolding alone exceeds the budget: nothing well-formed
-        # can be built, so fall back to the newest ids of an empty turn.
-        tail["content"] = ""
-        return self.encode_chat(
-            [*messages[:-1], tail], include_default_system=False
-        )[-budget:]
+        if kept is None:
+            # Only reachable if this message's own markers are larger than an
+            # empty user turn; never emit a malformed slice for it.
+            raise PromptBudgetError(
+                f"a prompt budget of {budget} token(s) cannot hold a valid "
+                f"{tail['role']!r} turn"
+            )
+        return kept
 
     def decode(self, token_ids, skip_special_tokens=False):
         return self._tokenizer.decode(

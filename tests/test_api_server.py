@@ -4,6 +4,7 @@
 from concurrent.futures import ThreadPoolExecutor
 from http.client import HTTPConnection
 import json
+import socket
 import os
 from pathlib import Path
 import sys
@@ -18,6 +19,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from npu_llm.api_server import (  # noqa: E402
+    MIN_PROMPT_TOKENS,
     BoundedHTTPServer,
     CompletionEngine,
     InferenceTimeout,
@@ -45,6 +47,25 @@ class FakeDecoder:
             "generated_tokens": 2,
             "finish_reason": "length",
             "decode_tokens_per_second": 2.5,
+        }
+
+
+class CountingDecoder:
+    """Counts how many generations actually reached the inference stage."""
+
+    context_length = 64
+
+    def __init__(self):
+        self.calls = 0
+
+    def generate_messages(self, messages, max_new_tokens):
+        self.calls += 1
+        yield "Hello", None
+        yield "!", None
+        yield "", {
+            "prompt_tokens": 4,
+            "generated_tokens": 2,
+            "finish_reason": "stop",
         }
 
 
@@ -192,13 +213,14 @@ def payload(model="smollm2-135m-xdna1"):
     }
 
 
-def start_server(models, **config):
+def start_server(models, *, max_connections=None, **config):
     server = BoundedHTTPServer(
         ("127.0.0.1", 0),
         make_handler(
             CompletionEngine(models),
             ServerConfig(api_key=API_KEY, **config),
         ),
+        max_connections=max_connections,
     )
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
@@ -298,14 +320,17 @@ def test_request_validation_rejects_coercible_types():
     finally:
         stop_server(server, thread)
 
-    # Above the context window max_tokens is clamped, not rejected.
+    # Above the context window max_tokens is clamped, not rejected, and the
+    # clamp leaves MIN_PROMPT_TOKENS of the context for a valid prompt.
     server, thread, base = start_server({"smollm2-135m-xdna1": EchoDecoder()})
     try:
         request = payload()
         request["max_tokens"] = 5000
         status, body, _ = fetch(f"{base}/v1/chat/completions", request)
         assert status == 200
-        assert json.loads(body)["choices"][0]["message"]["content"] == "63"
+        clamped = json.loads(body)["choices"][0]["message"]["content"]
+        assert clamped == str(64 - MIN_PROMPT_TOKENS)
+        assert int(clamped) + MIN_PROMPT_TOKENS == 64
     finally:
         stop_server(server, thread)
 
@@ -313,11 +338,17 @@ def test_request_validation_rejects_coercible_types():
 def test_forwarded_headers_only_honored_for_trusted_proxies():
     """Rate-limit identity must not be spoofable by an untrusted client."""
     headers = {"X-Forwarded-For": "203.0.113.9, 198.51.100.2"}
+    xff = "x-forwarded-for"
+    trusted = ("198.51.100.2",)
 
+    # Default mode reads no forwarding header at all.
+    assert client_address("198.51.100.2", _Headers(headers), trusted) == "198.51.100.2"
     # No trusted proxy configured: the peer is always the identity.
-    assert client_address("198.51.100.2", _Headers(headers), ()) == "198.51.100.2"
+    assert client_address("198.51.100.2", _Headers(headers), (), xff) == "198.51.100.2"
     # An untrusted peer cannot claim to be a proxy.
-    assert client_address("10.9.9.9", _Headers(headers), ("198.51.100.2",)) == "10.9.9.9"
+    assert (
+        client_address("10.9.9.9", _Headers(headers), trusted, xff) == "10.9.9.9"
+    )
     # A trusted peer's chain is walked from the nearest hop outwards, skipping
     # further trusted hops.
     assert (
@@ -325,39 +356,163 @@ def test_forwarded_headers_only_honored_for_trusted_proxies():
             "198.51.100.2",
             _Headers(headers),
             ("198.51.100.2", "198.51.100.3"),
+            xff,
         )
         == "203.0.113.9"
     )
     # Distinct forwarded clients stay in distinct buckets.
-    trusted = ("198.51.100.2",)
     first = client_address(
-        "198.51.100.2", _Headers({"X-Forwarded-For": "203.0.113.9"}), trusted
+        "198.51.100.2", _Headers({"X-Forwarded-For": "203.0.113.9"}), trusted, xff
     )
     second = client_address(
-        "198.51.100.2", _Headers({"X-Forwarded-For": "203.0.113.10"}), trusted
+        "198.51.100.2", _Headers({"X-Forwarded-For": "203.0.113.10"}), trusted, xff
     )
     assert first != second
-    # RFC 7239 Forwarded wins, including quoted IPv6 with a port.
+    # Quoted IPv6 with a port parses in RFC 7239 mode.
     assert (
         client_address(
             "198.51.100.2",
-            _Headers(
-                {
-                    "Forwarded": 'for="[2001:db8::1]:4711";proto=https',
-                    "X-Forwarded-For": "203.0.113.9",
-                }
-            ),
+            _Headers({"Forwarded": 'for="[2001:db8::1]:4711";proto=https'}),
             trusted,
+            "forwarded",
         )
         == "2001:db8::1"
     )
     # Garbage never becomes an identity.
     assert (
         client_address(
-            "198.51.100.2", _Headers({"X-Forwarded-For": "not-an-ip"}), trusted
+            "198.51.100.2", _Headers({"X-Forwarded-For": "not-an-ip"}), trusted, xff
         )
         == "198.51.100.2"
     )
+
+
+def test_only_the_configured_forwarding_header_is_read():
+    """Conflicting headers must resolve by configuration, not by precedence.
+
+    A client that smuggles the header its proxy does not overwrite must not
+    be able to pick its own rate-limit identity.
+    """
+    trusted = ("198.51.100.2",)
+    conflicting = _Headers(
+        {
+            "Forwarded": "for=192.0.2.50",
+            "X-Forwarded-For": "203.0.113.9",
+        }
+    )
+    assert (
+        client_address("198.51.100.2", conflicting, trusted, "x-forwarded-for")
+        == "203.0.113.9"
+    )
+    assert (
+        client_address("198.51.100.2", conflicting, trusted, "forwarded")
+        == "192.0.2.50"
+    )
+    assert (
+        client_address("198.51.100.2", conflicting, trusted, "none")
+        == "198.51.100.2"
+    )
+    # The unconfigured family is ignored even when the configured one is absent.
+    only_forwarded = _Headers({"Forwarded": "for=192.0.2.50"})
+    assert (
+        client_address("198.51.100.2", only_forwarded, trusted, "x-forwarded-for")
+        == "198.51.100.2"
+    )
+
+
+def test_slow_request_body_times_out_before_the_npu_queue():
+    """A drip-fed body must not hold a thread or reach the inference slot."""
+    decoder = CountingDecoder()
+    server, thread, base = start_server(
+        {"smollm2-135m-xdna1": decoder},
+        request_timeout=0.5,
+    )
+    host, port = "127.0.0.1", server.server_port
+    try:
+        body = json.dumps(payload()).encode()
+        stalled = socket.create_connection((host, port), timeout=5)
+        try:
+            stalled.sendall(
+                b"POST /v1/chat/completions HTTP/1.1\r\n"
+                b"Host: %s\r\n"
+                b"Authorization: Bearer %s\r\n"
+                b"Content-Type: application/json\r\n"
+                b"Content-Length: %d\r\n\r\n"
+                % (host.encode(), API_KEY.encode(), len(body))
+            )
+            # Send one byte and then stop: the rest never arrives.
+            stalled.sendall(body[:1])
+            started = time.monotonic()
+            stalled.settimeout(10)
+            response = b""
+            while b"\r\n\r\n" not in response:
+                chunk = stalled.recv(4096)
+                if not chunk:
+                    break
+                response += chunk
+            elapsed = time.monotonic() - started
+            # Either a 408 or a closed connection, but promptly and without
+            # waiting for the client.
+            assert elapsed < 8, elapsed
+            if response:
+                assert b" 408 " in response.split(b"\r\n")[0], response[:80]
+        finally:
+            stalled.close()
+
+        # The stalled request never reached the decoder, and the server is
+        # still serving other clients.
+        assert decoder.calls == 0
+        status, body_text, _ = fetch(f"{base}/v1/chat/completions", payload())
+        assert status == 200
+        assert json.loads(body_text)["choices"][0]["message"]["content"] == "Hello!"
+        assert decoder.calls == 1
+    finally:
+        stop_server(server, thread)
+
+
+def test_connection_ceiling_is_bounded():
+    """Open sockets beyond the ceiling are closed instead of taking threads."""
+    server, thread, base = start_server(
+        {"smollm2-135m-xdna1": FakeDecoder()},
+        request_timeout=1.0,
+        max_connections=2,
+    )
+    idle = []
+    try:
+        for _ in range(2):
+            connection = socket.create_connection(
+                ("127.0.0.1", server.server_port), timeout=5
+            )
+            connection.sendall(b"GET /health HTTP/1.1\r\nHost: x\r\n")
+            idle.append(connection)
+        time.sleep(0.2)
+        rejected = socket.create_connection(
+            ("127.0.0.1", server.server_port), timeout=5
+        )
+        try:
+            rejected.settimeout(5)
+            assert rejected.recv(1024) == b""
+        finally:
+            rejected.close()
+        for connection in idle:
+            connection.close()
+        idle.clear()
+        # Slots are returned once those connections finish.
+        status = None
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            try:
+                status, _, _ = fetch(f"{base}/health", api_key=None)
+            except Exception:
+                status = None
+            if status == 200:
+                break
+            time.sleep(0.1)
+        assert status == 200
+    finally:
+        for connection in idle:
+            connection.close()
+        stop_server(server, thread)
 
 
 def test_backpressure_and_safe_errors():
@@ -537,6 +692,9 @@ def main():
     test_protocol_and_security()
     test_request_validation_rejects_coercible_types()
     test_forwarded_headers_only_honored_for_trusted_proxies()
+    test_only_the_configured_forwarding_header_is_read()
+    test_slow_request_body_times_out_before_the_npu_queue()
+    test_connection_ceiling_is_bounded()
     test_backpressure_and_safe_errors()
     test_hard_process_timeout()
     test_worker_error_forces_restart()

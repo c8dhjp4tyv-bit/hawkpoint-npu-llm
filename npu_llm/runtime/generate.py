@@ -126,6 +126,11 @@ class NPUDecoder:
                     device="npu",
                 )
 
+    @property
+    def max_new_tokens_limit(self):
+        """Largest generation length that still leaves room for a prompt."""
+        return self.context_length - self.tokenizer.minimum_prompt_tokens
+
     def _raw_bf16(self, name):
         if name not in self._raw_weights:
             array = np.asarray(self.model.raw(name), dtype=np.float32).astype(bfloat16)
@@ -635,9 +640,13 @@ class NPUDecoder:
         grows beyond that window, whole turns are dropped oldest-first so the
         retained prompt stays well-formed ChatML.
         """
-        if not 0 < max_new_tokens < self.context_length:
+        limit = self.max_new_tokens_limit
+        if not 0 < max_new_tokens <= limit:
             raise ValueError(
-                f"max_new_tokens must be between 1 and {self.context_length - 1}"
+                f"max_new_tokens must be between 1 and {limit}; the remaining "
+                f"{self.tokenizer.minimum_prompt_tokens} token(s) of the "
+                f"{self.context_length}-token context are reserved for a "
+                f"valid prompt"
             )
         prompt_ids = self.tokenizer.encode_chat_within(
             messages, self.context_length - max_new_tokens

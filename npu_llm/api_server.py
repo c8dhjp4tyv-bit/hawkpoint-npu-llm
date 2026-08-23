@@ -36,6 +36,15 @@ def _completion_id():
     return f"chatcmpl-{uuid.uuid4().hex}"
 
 
+# Tokens of the fixed hardware context that max_tokens may never claim, so a
+# trimmed prompt is always a complete ChatML turn. An empty turn plus the
+# generation prompt is about eight tokens in the supported vocabularies
+# (`<|im_start|>user\n<|im_end|>\n<|im_start|>assistant\n`); the rest is
+# headroom for actual content. The runtime enforces its own exact minimum and
+# raises rather than emitting a malformed prompt.
+MIN_PROMPT_TOKENS = 16
+
+
 def _validate_stream(value):
     if not isinstance(value, bool):
         raise ValueError("stream must be a boolean")
@@ -83,10 +92,15 @@ class ServerConfig:
     request_timeout: float = 120.0
     queue_capacity: int = 2
     rate_limit_per_minute: int = 30
-    # Addresses whose Forwarded/X-Forwarded-For headers may be believed.
-    # Empty by default: an unconfigured server treats every peer as the
-    # client, so a forged header can never redirect someone else's quota.
+    # Addresses whose forwarding header may be believed. Empty by default: an
+    # unconfigured server treats every peer as the client, so a forged header
+    # can never redirect someone else's quota.
     trusted_proxies: tuple = ()
+    # Which forwarding header a trusted proxy is contractually required to
+    # set. Exactly one family is read; the operator names it, because
+    # preferring whichever header happens to be present lets a client that
+    # smuggles the other one past its proxy choose its own identity.
+    forwarded_header: str = "none"
 
 
 def _normalize_address(value):
@@ -102,22 +116,26 @@ def _normalize_address(value):
         return None
 
 
-def _forwarded_chain(headers):
-    """Return proxy-reported addresses, left-to-right (original client first).
+FORWARDED_HEADERS = ("none", "forwarded", "x-forwarded-for")
 
-    ``Forwarded`` (RFC 7239) wins over the de-facto ``X-Forwarded-For`` when
-    both are present. Unparsable elements are dropped rather than guessed at.
+
+def _forwarded_chain(headers, header):
+    """Return the named header's addresses, original client first.
+
+    Only the configured header family is read, and unparsable elements are
+    dropped rather than guessed at.
     """
     elements = []
-    for header in headers.get_all("Forwarded") or []:
-        for element in header.split(","):
-            for parameter in element.split(";"):
-                name, separator, value = parameter.partition("=")
-                if separator and name.strip().lower() == "for":
-                    elements.append(value)
-    if not elements:
-        for header in headers.get_all("X-Forwarded-For") or []:
-            elements.extend(header.split(","))
+    if header == "forwarded":
+        for value in headers.get_all("Forwarded") or []:
+            for element in value.split(","):
+                for parameter in element.split(";"):
+                    name, separator, parameter_value = parameter.partition("=")
+                    if separator and name.strip().lower() == "for":
+                        elements.append(parameter_value)
+    elif header == "x-forwarded-for":
+        for value in headers.get_all("X-Forwarded-For") or []:
+            elements.extend(value.split(","))
     return [
         address
         for address in (_normalize_address(element) for element in elements)
@@ -125,17 +143,22 @@ def _forwarded_chain(headers):
     ]
 
 
-def client_address(peer, headers, trusted_proxies):
+def client_address(peer, headers, trusted_proxies, header="none"):
     """Resolve the rate-limiting identity for one request.
 
-    Forwarded headers are honored only when the immediate peer is a
-    configured trusted proxy; the chain is then walked from the nearest hop
-    outwards and the first address that is not itself a trusted proxy is the
-    client.
+    The forwarding header is honored only when the immediate peer is a
+    configured trusted proxy **and** the operator named which header that
+    proxy sets. The chain is then walked from the nearest hop outwards and
+    the first address that is not itself a trusted proxy is the client.
+
+    This is only as strong as the proxy's own header handling: a trusted
+    proxy must overwrite (not append to) the header it is trusted for, or a
+    client can supply the first element of the chain. See the reverse-proxy
+    section of README.md.
     """
-    if peer not in trusted_proxies:
+    if header == "none" or peer not in trusted_proxies:
         return peer
-    for address in reversed(_forwarded_chain(headers)):
+    for address in reversed(_forwarded_chain(headers, header)):
         if address not in trusted_proxies:
             return address
     return peer
@@ -457,6 +480,9 @@ def make_handler(engine, config=None):
 
     class Handler(BaseHTTPRequestHandler):
         server_version = "HawkPointNPU/1.0"
+        # Applied by StreamRequestHandler.setup() before the request line is
+        # read, so a connection that stalls mid-header is dropped too.
+        timeout = config.request_timeout
 
         def log_message(self, fmt, *args):
             sys.stderr.write(
@@ -550,14 +576,41 @@ def make_handler(engine, config=None):
                 return
             self._error("not found", 404)
 
+        def _read_body(self, length, deadline):
+            """Read exactly ``length`` bytes, bounded by ``deadline``.
+
+            Reading in chunks keeps a client that declares a large
+            Content-Length and then drips it out from holding a server thread
+            past the request timeout. The socket timeout set in setup()
+            covers stalls between chunks.
+            """
+            chunks = []
+            remaining = length
+            while remaining > 0:
+                if time.monotonic() > deadline:
+                    raise InferenceTimeout("request body deadline exceeded")
+                chunk = self.rfile.read(min(remaining, 65536))
+                if not chunk:
+                    raise ValueError("request body was shorter than Content-Length")
+                chunks.append(chunk)
+                remaining -= len(chunk)
+            return b"".join(chunks)
+
         def do_POST(self):
+            # Arm the deadline before any body is consumed, so slow or
+            # incomplete bodies time out instead of occupying a thread until
+            # the client gives up. The NPU slot is only taken afterwards.
+            self._deadline = time.monotonic() + config.request_timeout
             if self.path.rstrip("/") != "/v1/chat/completions":
                 self._error("not found", 404)
                 return
             if not self._authorized():
                 return
             client = client_address(
-                self.client_address[0], self.headers, config.trusted_proxies
+                self.client_address[0],
+                self.headers,
+                config.trusted_proxies,
+                config.forwarded_header,
             )
             if not limiter.allow(client):
                 self._error("rate limit exceeded", 429, "rate_limit_error")
@@ -573,7 +626,7 @@ def make_handler(engine, config=None):
                 if length > config.max_body_bytes:
                     self._error("request body is too large", 413)
                     return
-                request = json.loads(self.rfile.read(length))
+                request = json.loads(self._read_body(length, self._deadline))
                 if not isinstance(request, dict):
                     raise ValueError("request body must be a JSON object")
                 messages = _validate_messages(request.get("messages"))
@@ -591,8 +644,16 @@ def make_handler(engine, config=None):
                     return
                 max_tokens = _validate_max_tokens(
                     request.get("max_tokens", 16),
-                    engine.context_length(model_id) - 1,
+                    engine.context_length(model_id) - MIN_PROMPT_TOKENS,
                 )
+            except (InferenceTimeout, socket.timeout):
+                self._error(
+                    "request body was not received in time",
+                    408,
+                    "timeout_error",
+                )
+                self.close_connection = True
+                return
             except (ValueError, TypeError, json.JSONDecodeError) as exc:
                 self._error(exc)
                 return
@@ -600,8 +661,6 @@ def make_handler(engine, config=None):
             if not slots.acquire(blocking=False):
                 self._error("NPU request queue is full", 429, "server_overloaded")
                 return
-            self.connection.settimeout(config.request_timeout)
-            self._deadline = time.monotonic() + config.request_timeout
             try:
                 if stream:
                     self._stream(model_id, messages, max_tokens)
@@ -743,8 +802,36 @@ def make_handler(engine, config=None):
 
 
 class BoundedHTTPServer(ThreadingHTTPServer):
+    """Threading server with a hard ceiling on in-flight connections.
+
+    The inference semaphore only bounds work that reached the NPU. Without a
+    connection ceiling, clients that hold a socket open before that point --
+    slow bodies, stalled headers -- can still exhaust the thread pool.
+    """
+
     daemon_threads = True
     request_queue_size = 16
+    max_connections = 32
+
+    def __init__(self, *args, max_connections=None, **kwargs):
+        if max_connections is not None:
+            self.max_connections = max_connections
+        self._connection_slots = threading.BoundedSemaphore(self.max_connections)
+        super().__init__(*args, **kwargs)
+
+    def process_request(self, request, client_address):
+        if not self._connection_slots.acquire(blocking=False):
+            # Close without dispatching a thread. close_request() does not go
+            # through shutdown_request(), so the slot stays unclaimed.
+            self.close_request(request)
+            return
+        super().process_request(request, client_address)
+
+    def shutdown_request(self, request):
+        try:
+            super().shutdown_request(request)
+        finally:
+            self._connection_slots.release()
 
 
 def main():
@@ -769,14 +856,29 @@ def main():
         action="append",
         dest="trusted_proxies",
         help=(
-            "IP address of a reverse proxy whose Forwarded/X-Forwarded-For "
-            "header may be used to identify clients for rate limiting; "
-            "may be repeated"
+            "IP address of a reverse proxy whose forwarding header may be "
+            "used to identify clients for rate limiting; may be repeated. "
+            "Requires --forwarded-header"
+        ),
+    )
+    parser.add_argument(
+        "--forwarded-header",
+        choices=FORWARDED_HEADERS,
+        default="none",
+        help=(
+            "which forwarding header trusted proxies set. The proxy must "
+            "overwrite it, not append to a client-supplied value"
         ),
     )
     parser.add_argument("--max-body-bytes", type=int, default=1_048_576)
     parser.add_argument("--request-timeout", type=float, default=120)
     parser.add_argument("--queue-capacity", type=int, default=2)
+    parser.add_argument(
+        "--max-connections",
+        type=int,
+        default=BoundedHTTPServer.max_connections,
+        help="ceiling on simultaneously open HTTP connections",
+    )
     parser.add_argument("--rate-limit-per-minute", type=int, default=30)
     parser.add_argument("--tls-cert", type=Path)
     parser.add_argument("--tls-key", type=Path)
@@ -811,6 +913,8 @@ def main():
         parser.error("--request-timeout must be positive")
     if args.queue_capacity < 0:
         parser.error("--queue-capacity cannot be negative")
+    if args.max_connections < 1:
+        parser.error("--max-connections must be at least 1")
     if bool(args.tls_cert) != bool(args.tls_key):
         parser.error("--tls-cert and --tls-key must be provided together")
     if args.npu_percent is not None and not 0 <= args.npu_percent <= 100:
@@ -822,6 +926,15 @@ def main():
             ipaddress.ip_address(proxy)
         except ValueError:
             parser.error(f"--trusted-proxy must be an IP address: {proxy!r}")
+    # Refuse the half-configured combinations instead of silently ignoring
+    # one of the two options.
+    if args.trusted_proxies and args.forwarded_header == "none":
+        parser.error(
+            "--trusted-proxy requires --forwarded-header; the proxy must "
+            "overwrite that header for every incoming request"
+        )
+    if args.forwarded_header != "none" and not args.trusted_proxies:
+        parser.error("--forwarded-header requires at least one --trusted-proxy")
 
     if args.model:
         discovered = discover_models(args.model.parent)
@@ -862,10 +975,12 @@ def main():
         queue_capacity=args.queue_capacity,
         rate_limit_per_minute=args.rate_limit_per_minute,
         trusted_proxies=tuple(args.trusted_proxies or ()),
+        forwarded_header=args.forwarded_header,
     )
     server = BoundedHTTPServer(
         (args.host, args.port),
         make_handler(engine, config),
+        max_connections=args.max_connections,
     )
     scheme = "http"
     if args.tls_cert:

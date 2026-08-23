@@ -299,14 +299,25 @@ def _convert_into(
 
 
 def convert(model_dir: Path, out_dir: Path, **metadata):
-    """Build and verify a complete model package, then publish it atomically."""
+    """Build and verify a complete model package, then publish it atomically.
+
+    Failure at any point leaves a usable package behind. Before publication
+    the previous output is untouched. After the directory rename has already
+    succeeded -- for example when the parent-directory fsync then fails --
+    the new package is moved aside under a ``.failed-`` name rather than
+    replaced in place or deleted, because ``os.replace`` cannot swap one
+    populated directory for another. Nothing on this path ever removes the
+    only good copy; the retained directory is named on the raised exception.
+    """
     model_dir = Path(model_dir)
     out_dir = Path(out_dir)
     out_dir.parent.mkdir(parents=True, exist_ok=True)
     staging = Path(
         tempfile.mkdtemp(prefix=f".{out_dir.name}.staging-", dir=out_dir.parent)
     )
-    backup = out_dir.with_name(f".{out_dir.name}.backup-{uuid.uuid4().hex}")
+    suffix = uuid.uuid4().hex
+    backup = out_dir.with_name(f".{out_dir.name}.backup-{suffix}")
+    rejected = out_dir.with_name(f".{out_dir.name}.failed-{suffix}")
     try:
         manifest = _convert_into(model_dir, staging, **metadata)
         for name, expected in manifest["files"].items():
@@ -322,11 +333,20 @@ def convert(model_dir: Path, out_dir: Path, **metadata):
         _fsync_directory(staging)
         if out_dir.exists():
             os.replace(out_dir, backup)
+        published = False
         try:
             os.replace(staging, out_dir)
+            published = True
             _fsync_directory(out_dir.parent)
-        except Exception:
+        except Exception as exc:
             if backup.exists():
+                if published and out_dir.exists():
+                    # The rename already landed: move the new package aside so
+                    # the previous one can be renamed back into place.
+                    os.replace(out_dir, rejected)
+                    exc.add_note(
+                        f"the unverified new package was kept at {rejected}"
+                    )
                 os.replace(backup, out_dir)
             raise
         if backup.exists():

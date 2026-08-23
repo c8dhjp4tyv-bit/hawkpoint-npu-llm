@@ -264,15 +264,27 @@ For streaming output, set `"stream": true`.
 Request fields are validated strictly: `stream` must be a JSON boolean,
 `model` a string, and `max_tokens` a non-boolean integer of at least 1.
 Invalid types and non-positive values return `400` instead of being silently
-coerced. `max_tokens` above the hardware window is clamped to 63.
+coerced.
 
 `max_tokens` reserves its share of the fixed 64-token hardware context, so a
 large value shortens the usable prompt window instead of extending the
-context. When a conversation does not fit, whole turns are dropped
-oldest-first — the system message and newest turn are kept — so the retained
-prompt is always well-formed ChatML rather than a mid-token slice. If a
-single turn still does not fit, the identity preamble is dropped first and
-only then is that turn's own text shortened from the front.
+context. It is clamped to 48: the server always keeps 16 tokens of the
+window free, which is more than one empty ChatML turn plus the generation
+prompt, so a valid prompt can always be built. The runtime enforces its own
+exact minimum and raises rather than emitting a malformed prompt.
+
+When a conversation does not fit, whole turns are dropped oldest-first — the
+system message and newest turn are kept — so the retained prompt is always
+well-formed ChatML rather than a mid-token slice. If a single turn still does
+not fit, the identity preamble is dropped first and only then is that turn's
+own text shortened from the front. A conversation of only a `system` message
+is accepted and kept verbatim; it is never replaced by the model family's
+default prompt.
+
+A request body that is not fully delivered within `--request-timeout`
+returns `408` and the connection is closed, before the request can occupy an
+inference slot. `--max-connections` (default 32) caps simultaneously open
+HTTP connections so stalled clients cannot exhaust the server's threads.
 
 Select another installed model by changing the request's `model` field:
 
@@ -314,7 +326,8 @@ The server serializes requests because one physical NPU execution context is
 shared. One active request and two queued requests are admitted by default;
 additional work receives `429` instead of accumulating waiting inference
 threads. Defaults also include a 1 MiB request limit, 120-second socket
-timeout, 30 requests/minute/client rate limit, bearer authentication, safe
+timeout applied from the moment a connection is accepted, a 32-connection
+ceiling, a 30 requests/minute/client rate limit, bearer authentication, safe
 internal errors, and an explicit browser-origin allowlist.
 
 The HTTP process never owns the XRT context. Inference runs in a persistent
@@ -331,18 +344,50 @@ localhost. To run the server directly with TLS, pass `--tls-cert CERT.pem
 and keep the backend private.
 
 Behind a reverse proxy every request arrives from the proxy's address, which
-would put all clients in one rate-limit bucket. Name the proxy explicitly to
-rate-limit per real client:
+would put all clients in one rate-limit bucket. Name both the proxy and the
+header it sets to rate-limit per real client:
 
 ```bash
-python npu_llm/api_server.py --trusted-proxy 127.0.0.1
+python npu_llm/api_server.py \
+  --trusted-proxy 127.0.0.1 \
+  --forwarded-header x-forwarded-for
 ```
 
-`Forwarded` and `X-Forwarded-For` are read **only** when the connecting peer
-is one of the configured `--trusted-proxy` addresses; otherwise the peer
-address is used, so a client cannot forge its way into someone else's quota.
-The header chain is walked from the nearest hop outwards and the first
-address that is not itself a trusted proxy becomes the identity.
+The two options are required together. A forwarding header is read **only**
+when the connecting peer is a configured `--trusted-proxy` address, and only
+the one header family named by `--forwarded-header` (`forwarded`,
+`x-forwarded-for`, or the default `none`) is read. Preferring whichever
+header happens to be present would let a client smuggle the other family
+past its proxy and choose its own identity. The configured header's chain is
+walked from the nearest hop outwards, and the first address that is not
+itself a trusted proxy becomes the rate-limit identity.
+
+**The proxy must overwrite that header, never append to a client-supplied
+value.** This backend cannot distinguish a client-written element from a
+proxy-written one, so the deployment contract is:
+
+```nginx
+# nginx: replace anything the client sent.
+location / {
+    proxy_set_header X-Forwarded-For $remote_addr;
+    proxy_set_header Forwarded "";
+    proxy_pass http://127.0.0.1:8000;
+}
+```
+
+```caddyfile
+# Caddy: reverse_proxy sets X-Forwarded-For itself; drop what the client sent
+# first so its value cannot be prepended to the chain.
+reverse_proxy 127.0.0.1:8000 {
+    header_up -Forwarded
+    header_up X-Forwarded-For {remote_host}
+}
+```
+
+Note that nginx's common `$proxy_add_x_forwarded_for` **appends** to the
+client's header and is not safe here. If the proxy cannot be configured this
+way, leave `--forwarded-header` unset: every request is then attributed to
+the proxy address, which under-counts per client but cannot be spoofed.
 
 ## Convert a model manually
 
