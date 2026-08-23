@@ -32,25 +32,24 @@ systemctl cat ollama.service >/dev/null || die "ollama.service is not installed"
 [[ -x /usr/local/bin/ollama ]] || die "/usr/local/bin/ollama is missing"
 [[ -d /usr/local/lib/ollama ]] || die "/usr/local/lib/ollama is missing"
 
-systemctl stop ollama
-if [[ -f "${drop_in}" ]]; then
-    cp -a "${drop_in}" "${drop_in_backup}"
-fi
-mv /usr/local/bin/ollama "${binary_backup}"
-mv /usr/local/lib/ollama "${runtime_backup}"
-install -d -m 0755 /usr/local/lib/ollama
-
+# Restore whatever of the previous install has already been moved aside. Each
+# step is guarded because the trap is armed before the moves happen: a failure
+# midway through them must never leave the host without an Ollama install.
 restore_previous() {
     systemctl stop ollama 2>/dev/null || true
-    if [[ -d /usr/local/lib/ollama ]]; then
-        mv /usr/local/lib/ollama "${failed_runtime}"
+    if [[ -d "${runtime_backup}" ]]; then
+        if [[ -d /usr/local/lib/ollama ]]; then
+            mv /usr/local/lib/ollama "${failed_runtime}"
+        fi
+        mv "${runtime_backup}" /usr/local/lib/ollama
     fi
-    mv "${runtime_backup}" /usr/local/lib/ollama
-    if [[ -e /usr/local/bin/ollama ]]; then
-        mv /usr/local/bin/ollama \
-            "/usr/local/bin/ollama.failed-xdna-${stamp}"
+    if [[ -e "${binary_backup}" ]]; then
+        if [[ -e /usr/local/bin/ollama ]]; then
+            mv /usr/local/bin/ollama \
+                "/usr/local/bin/ollama.failed-xdna-${stamp}"
+        fi
+        mv "${binary_backup}" /usr/local/bin/ollama
     fi
-    mv "${binary_backup}" /usr/local/bin/ollama
     if [[ -f "${drop_in_backup}" ]]; then
         mv "${drop_in_backup}" "${drop_in}"
     else
@@ -59,7 +58,15 @@ restore_previous() {
     systemctl daemon-reload
     systemctl start ollama
 }
+
+systemctl stop ollama
 trap restore_previous ERR
+if [[ -f "${drop_in}" ]]; then
+    cp -a "${drop_in}" "${drop_in_backup}"
+fi
+mv /usr/local/bin/ollama "${binary_backup}"
+mv /usr/local/lib/ollama "${runtime_backup}"
+install -d -m 0755 /usr/local/lib/ollama
 
 cp -a "${stage}/lib/ollama/." /usr/local/lib/ollama/
 install -m 0755 "${stage}/bin/ollama" /usr/local/bin/ollama

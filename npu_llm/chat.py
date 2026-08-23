@@ -24,7 +24,10 @@ def main():
     offload.add_argument("--npu-percent", type=float)
     p.add_argument(
         "--system-prompt",
-        default="You are a helpful AI assistant named SmolLM.",
+        help=(
+            "system message for the conversation; defaults to the prompt the "
+            "loaded checkpoint's family was trained with"
+        ),
     )
     args = p.parse_args()
 
@@ -39,11 +42,19 @@ def main():
         )
         npu_layers = round(layers * args.npu_percent / 100.0)
     decoder = NPUDecoder(args.model, npu_layers=npu_layers)
-    messages = [{"role": "system", "content": args.system_prompt}]
+    # An explicit system prompt wins; otherwise the tokenizer supplies the one
+    # matching the checkpoint family (SmolLM and Qwen expect different text).
+    messages = (
+        [{"role": "system", "content": args.system_prompt}]
+        if args.system_prompt
+        else []
+    )
+    history_start = len(messages)
+    label = "Qwen" if decoder.model_family == "qwen2" else "SmolLM"
 
     def complete(prompt):
         messages.append({"role": "user", "content": prompt})
-        print("SmolLM: ", end="", flush=True)
+        print(f"{label}: ", end="", flush=True)
         pieces = []
         stats = None
         for text, final_stats in decoder.generate_messages(
@@ -80,7 +91,7 @@ def main():
         if prompt in {"/exit", "/quit"}:
             break
         if prompt == "/reset":
-            messages[:] = messages[:1]
+            messages[:] = messages[:history_start]
             last_stats = None
             print("Conversation reset.")
             continue

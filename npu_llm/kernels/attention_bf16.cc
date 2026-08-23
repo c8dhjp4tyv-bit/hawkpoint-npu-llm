@@ -2,11 +2,12 @@
 // Separates score computation and value aggregation into two passes to fit
 // within the AIE2 tile's 64 KB data memory budget.
 //
-// The kernel operates on one pair of KV heads at a time (SmolLM uses 3 KV
-// heads). Per KV-head slice: 64 positions × 64 dim = 4,096 BF16 elements for
-// the K cache, plus an equally sized V cache. Across the three KV heads the
-// total cache is 3 × 2 × 4096 = 24,576 BF16 elements, but only one pair is
-// active per kernel invocation.
+// One invocation handles a single KV head together with the three query heads
+// grouped onto it (SmolLM has 9 query heads over 3 KV heads). Per KV-head
+// slice: 64 positions × 64 dim = 4,096 BF16 elements for the K cache, plus an
+// equally sized V cache. Across the three KV heads the total cache is
+// 3 × 2 × 4096 = 24,576 BF16 elements, but only one head's K/V pair is
+// resident per kernel invocation.
 //
 // By splitting attention into separate score and value-aggregation passes,
 // each pass stays within a reasonable fraction of the tile's 64 KB window.

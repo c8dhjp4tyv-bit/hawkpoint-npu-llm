@@ -80,7 +80,23 @@ class RateLimiter:
             if len(history) >= self.limit:
                 return False
             history.append(now)
+            self._evict_idle(now)
             return True
+
+    def _evict_idle(self, now):
+        """Drop clients with no request in the last minute.
+
+        ``_requests`` is keyed by client address; without this the server
+        accumulates one deque per address it ever saw and grows without bound
+        over a long-running session.
+        """
+        stale = [
+            client
+            for client, history in self._requests.items()
+            if not history or now - history[-1] >= 60
+        ]
+        for client in stale:
+            del self._requests[client]
 
 
 class CompletionEngine:
@@ -344,6 +360,11 @@ class NPUDecoderFactory:
     npu_percent: float | None = None
 
     def __call__(self, path):
+        # runtime/ and designs/ import each other by top-level name, so the
+        # package directory has to be importable even when this module was
+        # loaded as npu_llm.api_server rather than run as a script.
+        if str(ROOT) not in sys.path:
+            sys.path.insert(0, str(ROOT))
         from runtime.generate import NPUDecoder
 
         metadata = json.loads((Path(path) / "metadata.json").read_text())
@@ -377,6 +398,11 @@ def make_handler(engine, config=None):
         def _headers(self, status=200, content_type="application/json"):
             self.send_response(status)
             self.send_header("Content-Type", content_type)
+            if content_type == "text/event-stream":
+                # Keep intermediaries from buffering or replaying the stream;
+                # a cached SSE body would replay one client's completion.
+                self.send_header("Cache-Control", "no-cache, no-store")
+                self.send_header("X-Accel-Buffering", "no")
             self._cors()
             self.send_header(
                 "Access-Control-Allow-Headers",

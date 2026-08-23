@@ -9,13 +9,34 @@ DEFAULT_SYSTEM = (
 )
 
 
+def _eos_token_text(value):
+    """Return the literal EOS token from a ``tokenizer_config.json`` entry.
+
+    Hugging Face writes ``eos_token`` either as a plain string or as a
+    serialized ``AddedToken`` object; both forms appear across the supported
+    checkpoints.
+    """
+    if isinstance(value, dict):
+        value = value.get("content")
+    if isinstance(value, str) and value:
+        return value
+    return "<|im_end|>"
+
+
 class SmolLMTokenizer:
     def __init__(self, model_dir, default_system=DEFAULT_SYSTEM):
         model_dir = Path(model_dir)
         self._tokenizer = Tokenizer.from_file(str(model_dir / "tokenizer.json"))
         config = json.loads((model_dir / "tokenizer_config.json").read_text())
-        self.eos_token = config.get("eos_token", "<|im_end|>")
+        self.eos_token = _eos_token_text(config.get("eos_token"))
         self.eos_id = self._tokenizer.token_to_id(self.eos_token)
+        if self.eos_id is None:
+            # Without a real EOS id every generation would run to the token
+            # limit and report finish_reason="length", so fail loudly instead.
+            raise ValueError(
+                f"EOS token {self.eos_token!r} is not in the vocabulary of "
+                f"{model_dir}"
+            )
         self.default_system = default_system
 
     def format_chat(self, messages, add_generation_prompt=True):

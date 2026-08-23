@@ -22,6 +22,7 @@ from npu_llm.api_server import (  # noqa: E402
     CompletionEngine,
     InferenceTimeout,
     ProcessCompletionEngine,
+    RateLimiter,
     ServerConfig,
     make_handler,
 )
@@ -215,10 +216,12 @@ def test_protocol_and_security():
 
         streaming = payload()
         streaming["stream"] = True
-        status, body, _ = fetch(f"{base}/v1/chat/completions", streaming)
+        status, body, headers = fetch(f"{base}/v1/chat/completions", streaming)
         assert status == 200
         assert '"content":"Hello"' in body
         assert "data: [DONE]" in body
+        assert headers["Content-Type"] == "text/event-stream"
+        assert "no-store" in headers["Cache-Control"]
 
         status, _, _ = fetch(
             f"{base}/v1/chat/completions",
@@ -362,6 +365,27 @@ def test_inference_error_recreates_worker():
             engine.close()
 
 
+def test_rate_limiter_enforces_and_forgets_idle_clients():
+    """The limiter must bound clients and not retain them forever."""
+    limiter = RateLimiter(2)
+    assert limiter.allow("10.0.0.1")
+    assert limiter.allow("10.0.0.1")
+    assert not limiter.allow("10.0.0.1")
+
+    # Age the recorded client out of the window, then let another client in.
+    history = limiter._requests["10.0.0.1"]
+    history.clear()
+    history.append(time.monotonic() - 120)
+    assert limiter.allow("10.0.0.2")
+    assert "10.0.0.1" not in limiter._requests
+    assert list(limiter._requests) == ["10.0.0.2"]
+
+    # A disabled limiter allows everything and records nothing.
+    unlimited = RateLimiter(0)
+    assert all(unlimited.allow(f"10.0.1.{index}") for index in range(5))
+    assert not unlimited._requests
+
+
 def test_model_switch_releases_previous_decoder():
     """Switching models must deterministically close the previous decoder."""
     messages = [{"role": "user", "content": "Hello"}]
@@ -397,6 +421,7 @@ def main():
     test_hard_process_timeout()
     test_worker_error_forces_restart()
     test_inference_error_recreates_worker()
+    test_rate_limiter_enforces_and_forgets_idle_clients()
     test_model_switch_releases_previous_decoder()
     print("PASS API security and protocol")
 

@@ -147,9 +147,17 @@ def rss_mib(root):
 
 
 def energy_uj():
+    """Sum the top-level powercap zones only.
+
+    ``/sys/class/powercap`` links every RAPL zone as a sibling, subzones
+    (``intel-rapl:0:0``) included. Summing all of them counts the same joules
+    twice, so skip any zone whose parent zone is already counted.
+    """
     values = []
-    for path in Path("/sys/class/powercap").glob("**/energy_uj"):
+    for path in sorted(Path("/sys/class/powercap").glob("*/energy_uj")):
         try:
+            if (path.resolve().parent.parent / "energy_uj").exists():
+                continue
             values.append(int(path.read_text()))
         except (OSError, ValueError):
             pass

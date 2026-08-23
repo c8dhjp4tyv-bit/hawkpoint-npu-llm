@@ -266,7 +266,10 @@ class NPUDecoder:
         )
 
     def _rope_lut(self, position):
-        rope_theta = float(self.model.metadata.get("rope_theta", 100000.0))
+        # Keep this fallback identical to the converter's and to
+        # CPUDecoderStage's, otherwise a package without an explicit
+        # rope_theta would rotate differently on the NPU and on the CPU.
+        rope_theta = float(self.model.metadata.get("rope_theta", 10000.0))
         inv_freq = 1.0 / (
             rope_theta
             ** (np.arange(0, self.head_dim, 2) / self.head_dim)

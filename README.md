@@ -256,6 +256,11 @@ curl http://localhost:8000/v1/chat/completions \
 
 For streaming output, set `"stream": true`.
 
+`max_tokens` is clamped to 63 and reserves its share of the fixed 64-token
+hardware context: when the prompt does not fit alongside it, the newest
+`64 - max_tokens` prompt tokens are kept. A large `max_tokens` therefore
+shortens the usable prompt window instead of extending the context.
+
 Select another installed model by changing the request's `model` field:
 
 ```json
@@ -434,9 +439,10 @@ generation.
   combination**. `release-pins.json` records the validated stack. Component
   version drift causes silent failures (DRM_IOCTL_AMDXDNA_CREATE_HWCTX
   failures, `aie2_alloc_resource` exhaustion).
-- **No CUDA, ROCm, oneAPI, or Vulcan NPU delegates**: the AIE2 kernel follows
-  the old MTBL path. IREE, TPU-MLIR, open-Silicon, and XDNA-API-based builds
-  are not currently in scope.
+- **No inference-framework delegate**: every kernel is hand-written AIE2 C++
+  driven by MLIR-AIE/IRON graphs and dispatched through XRT. There is no
+  CUDA, ROCm, oneAPI, or Vulkan path, and IREE, TPU-MLIR, ONNX Runtime
+  VitisAI/Ryzen AI EP, and direct XDNA-driver builds are not in scope.
 - **Single-event completion model** — the inference worker uses
   `wait=True` on AIE command completion, not an interrupt-driven dispatch
   or multi-worker pipelining. Between-token gaps include XRT command submission

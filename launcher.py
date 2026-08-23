@@ -50,7 +50,9 @@ def wait_for_api(process, timeout=120):
                 return
         except URLError:
             time.sleep(1)
-    raise TimeoutError("API server did not become ready within 120 seconds")
+    raise TimeoutError(
+        f"API server did not become ready within {timeout:g} seconds"
+    )
 
 
 def run_openwebui(api_key, models_dir=None, npu_layers=None, npu_percent=None):
