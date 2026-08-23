@@ -576,24 +576,39 @@ def make_handler(engine, config=None):
                 return
             self._error("not found", 404)
 
-        def _read_body(self, length, deadline):
-            """Read exactly ``length`` bytes, bounded by ``deadline``.
+        def _remaining(self):
+            """Seconds left of this request's absolute deadline."""
+            return self._deadline - time.monotonic()
 
-            Reading in chunks keeps a client that declares a large
-            Content-Length and then drips it out from holding a server thread
-            past the request timeout. The socket timeout set in setup()
-            covers stalls between chunks.
+        def _read_body(self, length, deadline):
+            """Read exactly ``length`` bytes, bounded by the absolute deadline.
+
+            The socket timeout is re-armed to the *remaining* budget before
+            every read, so a client that trickles bytes steadily -- never
+            stalling for one full socket timeout -- still cannot hold a server
+            thread past the request deadline. ``read1`` is essential here:
+            ``read(n)`` issues however many recv calls it needs to fill n
+            bytes, and each one would get a fresh timeout, so a steady drip
+            could keep a single call alive indefinitely.
             """
             chunks = []
             remaining = length
-            while remaining > 0:
-                if time.monotonic() > deadline:
-                    raise InferenceTimeout("request body deadline exceeded")
-                chunk = self.rfile.read(min(remaining, 65536))
-                if not chunk:
-                    raise ValueError("request body was shorter than Content-Length")
-                chunks.append(chunk)
-                remaining -= len(chunk)
+            try:
+                while remaining > 0:
+                    budget = deadline - time.monotonic()
+                    if budget <= 0:
+                        raise InferenceTimeout("request body deadline exceeded")
+                    self.connection.settimeout(budget)
+                    chunk = self.rfile.read1(min(remaining, 65536))
+                    if not chunk:
+                        raise ValueError(
+                            "request body was shorter than Content-Length"
+                        )
+                    chunks.append(chunk)
+                    remaining -= len(chunk)
+            finally:
+                # Restore the per-operation timeout for the response phase.
+                self.connection.settimeout(config.request_timeout)
             return b"".join(chunks)
 
         def do_POST(self):
@@ -658,6 +673,15 @@ def make_handler(engine, config=None):
                 self._error(exc)
                 return
 
+            # Parsing already consumed part of the budget; do not start work
+            # that the deadline no longer allows.
+            if self._remaining() <= 0:
+                self._error(
+                    "request deadline expired before inference started",
+                    504,
+                    "timeout_error",
+                )
+                return
             if not slots.acquire(blocking=False):
                 self._error("NPU request queue is full", 429, "server_overloaded")
                 return
@@ -677,7 +701,9 @@ def make_handler(engine, config=None):
                     model_id,
                     messages,
                     max_tokens,
-                    timeout=config.request_timeout,
+                    # The engine gets what is left of the request's absolute
+                    # deadline, not a fresh full timeout.
+                    timeout=self._remaining(),
                 ):
                     if time.monotonic() > self._deadline:
                         raise TimeoutError
@@ -751,7 +777,9 @@ def make_handler(engine, config=None):
                     model_id,
                     messages,
                     max_tokens,
-                    timeout=config.request_timeout,
+                    # The engine gets what is left of the request's absolute
+                    # deadline, not a fresh full timeout.
+                    timeout=self._remaining(),
                 ):
                     if time.monotonic() > self._deadline:
                         raise TimeoutError

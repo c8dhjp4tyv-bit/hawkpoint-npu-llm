@@ -15,10 +15,15 @@ from pathlib import Path
 import re
 import statistics
 import subprocess
+import sys
 import threading
 import time
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+import powercap  # noqa: E402
 
 
 BASE_URL = os.environ.get("HAWKPOINT_API_URL", "http://127.0.0.1:8000")
@@ -147,21 +152,8 @@ def rss_mib(root):
 
 
 def energy_uj():
-    """Sum the top-level powercap zones only.
-
-    ``/sys/class/powercap`` links every RAPL zone as a sibling, subzones
-    (``intel-rapl:0:0``) included. Summing all of them counts the same joules
-    twice, so skip any zone whose parent zone is already counted.
-    """
-    values = []
-    for path in sorted(Path("/sys/class/powercap").glob("*/energy_uj")):
-        try:
-            if (path.resolve().parent.parent / "energy_uj").exists():
-                continue
-            values.append(int(path.read_text()))
-        except (OSError, ValueError):
-            pass
-    return sum(values) if values else None
+    """Sum the top-level powercap zones only (see tests/powercap.py)."""
+    return powercap.energy_uj()
 
 
 def kernel_errors(since_epoch, api_log):
@@ -229,6 +221,7 @@ __all__ = [
     "complete_once",
     "defaultdict",
     "energy_uj",
+    "powercap",
     "installed_models",
     "kernel_errors",
     "load_expected",

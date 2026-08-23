@@ -25,6 +25,12 @@ PROMPT = [
         ),
     }
 ]
+# Pinned CPU BF16 reference for PROMPT under the production prompt path
+# (NPUDecoder.prompt_ids -> encode_chat_within). It was captured while this
+# script sliced the encoded ChatML stream itself, so it MUST be re-captured
+# and deliberately reviewed on the pinned Hawk Point machine now that the
+# retained prompt is a complete turn. A mismatch here is a real signal:
+# re-record it from a hardware run, never edit it to match a failing run.
 EXPECTED_CPU_BF16_TOKENS = [
     785,
     12884,
@@ -62,26 +68,42 @@ EXPECTED_CPU_BF16_TOKENS = [
 
 
 def sequence(model_dir, npu_layers, count):
-    decoder = NPUDecoder(model_dir, npu_layers=npu_layers)
-    if npu_layers:
-        decoder.warmup()
-    prompt_ids = decoder.tokenizer.encode_chat(PROMPT)
-    prompt_ids = prompt_ids[-(decoder.context_length - count) :]
-    next_token = None
-    timings = []
-    position = 0
-    for token_id in prompt_ids:
-        next_token, elapsed = decoder.decode_token(token_id, position)
-        timings.append(elapsed)
-        position += 1
-    generated = []
-    for index in range(count):
-        generated.append(next_token)
-        if index + 1 < count:
-            next_token, elapsed = decoder.decode_token(next_token, position)
+    """Run the pinned prompt through one placement and return its tokens.
+
+    The prompt is prepared with ``NPUDecoder.prompt_ids()`` -- the same call
+    ``generate_messages()`` makes -- so this gate exercises the production
+    trimming semantics instead of slicing the encoded ChatML stream itself.
+    One decoder is live at a time; its NPU/XRT contexts are released before
+    the caller builds the next placement.
+    """
+    with NPUDecoder(model_dir, npu_layers=npu_layers) as decoder:
+        if npu_layers:
+            decoder.warmup()
+        prompt_ids = decoder.prompt_ids(PROMPT, count)
+        prompt_text = decoder.tokenizer.decode(prompt_ids)
+        if not prompt_text.startswith("<|im_start|>"):
+            raise AssertionError(
+                f"retained prompt is not well-formed ChatML: {prompt_text!r}"
+            )
+        if not prompt_text.endswith("<|im_start|>assistant\n"):
+            raise AssertionError(
+                f"retained prompt lost its generation prompt: {prompt_text!r}"
+            )
+        next_token = None
+        timings = []
+        position = 0
+        for token_id in prompt_ids:
+            next_token, elapsed = decoder.decode_token(token_id, position)
             timings.append(elapsed)
             position += 1
-    return generated, timings, decoder.tokenizer.eos_id
+        generated = []
+        for index in range(count):
+            generated.append(next_token)
+            if index + 1 < count:
+                next_token, elapsed = decoder.decode_token(next_token, position)
+                timings.append(elapsed)
+                position += 1
+        return generated, timings, decoder.tokenizer.eos_id, prompt_ids
 
 
 def main():
@@ -96,15 +118,21 @@ def main():
             "for the pinned reference"
         )
 
-    cpu_tokens, cpu_times, eos_id = sequence(args.model_dir, 0, args.tokens)
+    cpu_tokens, cpu_times, eos_id, cpu_prompt_ids = sequence(
+        args.model_dir, 0, args.tokens
+    )
     gc.collect()
-    npu_tokens, npu_times, npu_eos_id = sequence(
+    npu_tokens, npu_times, npu_eos_id, npu_prompt_ids = sequence(
         args.model_dir,
         24,
         args.tokens,
     )
     if npu_eos_id != eos_id:
         raise AssertionError("CPU and NPU tokenizers disagree on EOS")
+    if cpu_prompt_ids != npu_prompt_ids:
+        raise AssertionError(
+            "CPU and NPU placements were given different prompt tokens"
+        )
     cpu_reference_differences = [
         index
         for index, pair in enumerate(
@@ -135,6 +163,7 @@ def main():
         "prompt": PROMPT,
         "token_count": args.tokens,
         "expected_cpu_bf16_token_ids": EXPECTED_CPU_BF16_TOKENS,
+        "prompt_token_ids": cpu_prompt_ids,
         "actual_cpu_bf16_token_ids": cpu_tokens,
         "actual_npu_token_ids": npu_tokens,
         "agreement": args.tokens - len(npu_reference_differences),

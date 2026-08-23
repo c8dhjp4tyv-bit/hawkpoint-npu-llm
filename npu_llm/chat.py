@@ -42,60 +42,62 @@ def main():
             json.loads((args.model / "metadata.json").read_text())["layers"]
         )
         npu_layers = round(layers * args.npu_percent / 100.0)
-    decoder = NPUDecoder(args.model, npu_layers=npu_layers)
-    # An explicit system prompt wins; otherwise the tokenizer supplies the one
-    # matching the checkpoint family (SmolLM and Qwen expect different text).
-    messages = seed_messages(args.system_prompt)
-    history_start = len(messages)
-    label = "Qwen" if decoder.model_family == "qwen2" else "SmolLM"
+    # Context-managed so the NPU/XRT contexts are released deterministically
+    # when the session ends, rather than at interpreter shutdown.
+    with NPUDecoder(args.model, npu_layers=npu_layers) as decoder:
+        # An explicit system prompt wins; otherwise the tokenizer supplies the one
+        # matching the checkpoint family (SmolLM and Qwen expect different text).
+        messages = seed_messages(args.system_prompt)
+        history_start = len(messages)
+        label = "Qwen" if decoder.model_family == "qwen2" else "SmolLM"
 
-    def complete(prompt):
-        messages.append({"role": "user", "content": prompt})
-        print(f"{label}: ", end="", flush=True)
-        pieces = []
-        stats = None
-        for text, final_stats in decoder.generate_messages(
-            messages, args.max_new_tokens
-        ):
-            pieces.append(text)
-            print(text, end="", flush=True)
-            if final_stats is not None:
-                stats = final_stats
-        print()
-        messages.append({"role": "assistant", "content": "".join(pieces)})
-        return stats
-
-    if args.prompt:
-        stats = complete(args.prompt)
-        print(
-            f"tokens={stats['generated_tokens']} "
-            f"tok/s={stats['decode_tokens_per_second']:.2f} "
-            f"TTFT={stats['ttft_seconds']:.2f}s "
-            f"peak_RAM={stats['peak_ram_mib']:.1f}MiB"
-        )
-        return
-
-    print("Interactive NPU chat. Commands: /reset, /stats, /exit")
-    last_stats = None
-    while True:
-        try:
-            prompt = input("You: ").strip()
-        except (EOFError, KeyboardInterrupt):
+        def complete(prompt):
+            messages.append({"role": "user", "content": prompt})
+            print(f"{label}: ", end="", flush=True)
+            pieces = []
+            stats = None
+            for text, final_stats in decoder.generate_messages(
+                messages, args.max_new_tokens
+            ):
+                pieces.append(text)
+                print(text, end="", flush=True)
+                if final_stats is not None:
+                    stats = final_stats
             print()
-            break
-        if not prompt:
-            continue
-        if prompt in {"/exit", "/quit"}:
-            break
-        if prompt == "/reset":
-            messages[:] = messages[:history_start]
-            last_stats = None
-            print("Conversation reset.")
-            continue
-        if prompt == "/stats":
-            print(last_stats or "No generation statistics yet.")
-            continue
-        last_stats = complete(prompt)
+            messages.append({"role": "assistant", "content": "".join(pieces)})
+            return stats
+
+        if args.prompt:
+            stats = complete(args.prompt)
+            print(
+                f"tokens={stats['generated_tokens']} "
+                f"tok/s={stats['decode_tokens_per_second']:.2f} "
+                f"TTFT={stats['ttft_seconds']:.2f}s "
+                f"peak_RAM={stats['peak_ram_mib']:.1f}MiB"
+            )
+            return
+
+        print("Interactive NPU chat. Commands: /reset, /stats, /exit")
+        last_stats = None
+        while True:
+            try:
+                prompt = input("You: ").strip()
+            except (EOFError, KeyboardInterrupt):
+                print()
+                break
+            if not prompt:
+                continue
+            if prompt in {"/exit", "/quit"}:
+                break
+            if prompt == "/reset":
+                messages[:] = messages[:history_start]
+                last_stats = None
+                print("Conversation reset.")
+                continue
+            if prompt == "/stats":
+                print(last_stats or "No generation statistics yet.")
+                continue
+            last_stats = complete(prompt)
 
 
 if __name__ == "__main__":

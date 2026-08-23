@@ -13,6 +13,7 @@ import threading
 import time
 from urllib.request import Request, urlopen
 
+import powercap
 from placement_agreement import PlacementError, run_placement_agreement
 from verify_ollama_manifest import verify_manifest
 
@@ -81,13 +82,8 @@ def gpu_vram_mib():
 
 
 def energy_uj():
-    readings = []
-    for path in Path("/sys/class/powercap").glob("**/energy_uj"):
-        try:
-            readings.append(int(path.read_text()))
-        except (OSError, ValueError):
-            pass
-    return sum(readings) if readings else None
+    """Top-level powercap zones only; see tests/powercap.py."""
+    return powercap.energy_uj()
 
 
 def api(port, path, payload=None, timeout=600):
@@ -224,6 +220,9 @@ def benchmark_mode(args, mode, index):
             ):
                 streaming_generate(port, payload)
                 warmup_requests += 1
+            # Close the warm-up window here: measuring it after the request
+            # loop would report warm-up plus benchmark duration.
+            warmup_seconds = time.monotonic() - warmup_started
             peak_ram = rss_mib(process.pid)
             peak_vram = gpu_vram_mib()
             stop = threading.Event()
@@ -245,7 +244,8 @@ def benchmark_mode(args, mode, index):
             total_times = []
             response_hashes = []
             failures = []
-            start_energy = energy_uj()
+            start_energy, energy_zone_names = powercap.energy_uj_with_zones()
+            measurement_started = time.monotonic()
             started = time.time()
             for request_index in range(args.requests):
                 try:
@@ -264,6 +264,7 @@ def benchmark_mode(args, mode, index):
                         {"request": request_index, "error": str(exc)[:500]}
                     )
             completed = time.time()
+            measurement_seconds = time.monotonic() - measurement_started
             end_energy = energy_uj()
             stop.set()
             monitor_thread.join(timeout=2)
@@ -301,8 +302,11 @@ def benchmark_mode(args, mode, index):
             and end_energy >= start_energy
             else None
         ),
+        "energy_zones": energy_zone_names,
         "wall_seconds": completed - started,
-        "warmup_seconds": time.monotonic() - warmup_started,
+        "measurement_seconds": measurement_seconds,
+        "total_wall_seconds": warmup_seconds + measurement_seconds,
+        "warmup_seconds": warmup_seconds,
         "warmup_requests": warmup_requests,
         "num_gpu": mode["num_gpu"],
         "xdna_enabled": mode["xdna"],
@@ -383,7 +387,10 @@ def main():
                     "peak_ram_mib": None,
                     "peak_gpu_vram_mib": None,
                     "energy_joules": None,
+                    "energy_zones": [],
                     "wall_seconds": None,
+                    "measurement_seconds": None,
+                    "total_wall_seconds": None,
                     "warmup_seconds": None,
                     "warmup_requests": 0,
                     "num_gpu": mode["num_gpu"],

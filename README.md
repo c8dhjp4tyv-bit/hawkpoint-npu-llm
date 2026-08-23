@@ -281,10 +281,15 @@ own text shortened from the front. A conversation of only a `system` message
 is accepted and kept verbatim; it is never replaced by the model family's
 default prompt.
 
-A request body that is not fully delivered within `--request-timeout`
-returns `408` and the connection is closed, before the request can occupy an
-inference slot. `--max-connections` (default 32) caps simultaneously open
-HTTP connections so stalled clients cannot exhaust the server's threads.
+`--request-timeout` is one absolute deadline for the whole request. It is
+armed when the connection is accepted, the socket timeout is re-armed to the
+remaining budget before every blocking body read, and inference is given only
+what is left rather than a fresh full timeout. A body that is not delivered
+in time returns `408` and the connection is closed, before the request can
+occupy an inference slot; a request whose deadline expired during parsing
+returns `504` without starting work. `--max-connections` (default 32) caps
+simultaneously open HTTP connections so stalled clients cannot exhaust the
+server's threads.
 
 Select another installed model by changing the request's `model` field:
 
@@ -296,7 +301,10 @@ Select another installed model by changing the request's `model` field:
 ```
 
 An unknown or unprepared model returns `404 model_not_found`; it is never
-silently routed to a different checkpoint. Only one checkpoint is retained by
+silently routed to a different checkpoint. A model directory whose
+`metadata.json` is unreadable, is not a JSON object, or declares an
+unsupported context length is skipped with a warning naming the directory,
+so one damaged package cannot hide the other installed models. Only one checkpoint is retained by
 the server at a time to limit host RAM usage. The default model is loaded and
 prewarmed during server startup. A model selected later is prewarmed while it
 is switched in. Pass `--no-prewarm` directly to `api_server.py` only when
@@ -412,6 +420,8 @@ python npu_llm/tests/test_converter.py
 python npu_llm/tests/test_model_runtime.py
 python tests/test_api_server.py
 python tests/test_chat_context.py
+python tests/test_evidence_helpers.py
+python tests/test_rollback_script.py
 ```
 
 The repository is also an installable package (`pyproject.toml`), so the

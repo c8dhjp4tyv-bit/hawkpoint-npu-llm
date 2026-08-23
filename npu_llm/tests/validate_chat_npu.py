@@ -19,24 +19,27 @@ def main():
         )
     )
 
-    smoke = NPUDecoder(model_dir)
-    first_token, cold_seconds = smoke.decode_token(2, 0)
-    second_token, warm_seconds = smoke.decode_token(2, 1)
+    # One live decoder at a time: XRT hardware contexts are a constrained
+    # driver-level resource, so the smoke decoder must be closed before the
+    # acceptance decoder is created, even if an assertion fails first.
+    with NPUDecoder(model_dir) as smoke:
+        first_token, cold_seconds = smoke.decode_token(2, 0)
+        second_token, warm_seconds = smoke.decode_token(2, 1)
     assert first_token == 198, (
         f"reference-logit argmax mismatch: expected 198, got {first_token}"
     )
 
-    decoder = NPUDecoder(model_dir)
     prompt = (
         "Explain in simple terms why the sky looks blue during the day. "
         "Give a detailed answer."
     )
     pieces = []
     stats = None
-    for text, final_stats in decoder.generate(prompt, max_new_tokens=32):
-        pieces.append(text)
-        if final_stats is not None:
-            stats = final_stats
+    with NPUDecoder(model_dir) as decoder:
+        for text, final_stats in decoder.generate(prompt, max_new_tokens=32):
+            pieces.append(text)
+            if final_stats is not None:
+                stats = final_stats
     answer = "".join(pieces)
     assert stats is not None
     assert stats["generated_tokens"] == 32

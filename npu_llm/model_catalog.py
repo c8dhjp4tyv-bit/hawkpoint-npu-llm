@@ -1,6 +1,7 @@
 """Known checkpoints compatible with the implemented XDNA1 graphs."""
 
 import json
+import logging
 from pathlib import Path
 
 
@@ -34,8 +35,34 @@ MODEL_PRESETS = {
 DEFAULT_MODEL_ID = "smollm2-135m-xdna1"
 
 
+# The only context length the compiled IRON graphs and kernels support.
+SUPPORTED_CONTEXT_LENGTH = 64
+
+
+def _text(value, fallback):
+    """Accept a non-empty string, otherwise fall back."""
+    return value if isinstance(value, str) and value else fallback
+
+
+def _context_length(value):
+    """Return the supported context length, or None if the record is invalid."""
+    if value is None:
+        return SUPPORTED_CONTEXT_LENGTH
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None
+    if value != SUPPORTED_CONTEXT_LENGTH:
+        return None
+    return value
+
+
 def discover_models(models_dir):
-    """Return installed runtime models as model-id -> metadata/path records."""
+    """Return installed runtime models as model-id -> metadata/path records.
+
+    A directory whose ``metadata.json`` is unreadable, is not a JSON object,
+    or carries fields of the wrong type is skipped with a warning. One broken
+    package must never keep the server from serving the other installed
+    models, so nothing here raises.
+    """
     models_dir = Path(models_dir)
     discovered = {}
     if not models_dir.exists():
@@ -46,25 +73,44 @@ def discover_models(models_dir):
         for model_id, preset in MODEL_PRESETS.items()
     }
     for metadata_path in sorted(models_dir.glob("*/metadata.json")):
+        model_dir = metadata_path.parent
         try:
             metadata = json.loads(metadata_path.read_text())
-        except (OSError, json.JSONDecodeError):
+        except (OSError, json.JSONDecodeError) as exc:
+            _skip(model_dir, f"metadata.json could not be read: {exc}")
             continue
-        model_dir = metadata_path.parent
-        model_id = metadata.get("model_id") or directory_to_id.get(model_dir.name)
+        if not isinstance(metadata, dict):
+            _skip(model_dir, "metadata.json is not a JSON object")
+            continue
+        model_id = _text(
+            metadata.get("model_id"), directory_to_id.get(model_dir.name)
+        )
         if not model_id:
+            _skip(model_dir, "no usable model_id")
+            continue
+        context_length = _context_length(metadata.get("context_length"))
+        if context_length is None:
+            _skip(
+                model_dir,
+                "context_length must be the supported "
+                f"{SUPPORTED_CONTEXT_LENGTH}, got "
+                f"{metadata.get('context_length')!r}",
+            )
             continue
         preset = MODEL_PRESETS.get(model_id, {})
         discovered[model_id] = {
             "path": model_dir,
-            "display_name": metadata.get(
-                "display_name",
+            "display_name": _text(
+                metadata.get("display_name"),
                 preset.get("display_name", model_id),
             ),
-            "source_model": metadata.get(
-                "source_model",
-                preset.get("repo_id"),
+            "source_model": _text(
+                metadata.get("source_model"), preset.get("repo_id")
             ),
-            "context_length": int(metadata.get("context_length", 64)),
+            "context_length": context_length,
         }
     return discovered
+
+
+def _skip(model_dir, reason):
+    logging.warning("skipping model directory %s: %s", model_dir, reason)

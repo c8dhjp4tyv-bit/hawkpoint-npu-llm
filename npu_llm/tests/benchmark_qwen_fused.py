@@ -29,21 +29,22 @@ BENCHMARK_PROMPT = [
 
 
 def run_prefix(model_dir, npu_layers, token_ids):
-    decoder = NPUDecoder(model_dir, npu_layers=npu_layers)
-    if npu_layers:
-        decoder.warmup()
+    """Replay one placement over a fixed prefix, releasing its NPU contexts."""
     output = []
     timings = []
     diagnostics = []
-    for position, token_id in enumerate(token_ids):
-        next_token, elapsed, details = decoder.decode_token(
-            token_id,
-            position,
-            diagnostics=True,
-        )
-        output.append(next_token)
-        timings.append(elapsed)
-        diagnostics.append(details)
+    with NPUDecoder(model_dir, npu_layers=npu_layers) as decoder:
+        if npu_layers:
+            decoder.warmup()
+        for position, token_id in enumerate(token_ids):
+            next_token, elapsed, details = decoder.decode_token(
+                token_id,
+                position,
+                diagnostics=True,
+            )
+            output.append(next_token)
+            timings.append(elapsed)
+            diagnostics.append(details)
     return output, timings, diagnostics
 
 
@@ -64,15 +65,14 @@ def main():
     )
     args = parser.parse_args()
 
-    tokenizer_decoder = NPUDecoder(args.model_dir, npu_layers=0)
-    token_ids = tokenizer_decoder.tokenizer.encode_chat(BENCHMARK_PROMPT)[
-        : args.positions
-    ]
+    with NPUDecoder(args.model_dir, npu_layers=0) as tokenizer_decoder:
+        token_ids = tokenizer_decoder.tokenizer.encode_chat(BENCHMARK_PROMPT)[
+            : args.positions
+        ]
     if len(token_ids) != args.positions:
         raise AssertionError(
             f"benchmark prompt has only {len(token_ids)} token positions"
         )
-    del tokenizer_decoder
     gc.collect()
 
     cpu_tokens, cpu_times, cpu_diagnostics = run_prefix(

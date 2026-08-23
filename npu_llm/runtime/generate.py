@@ -126,10 +126,34 @@ class NPUDecoder:
                     device="npu",
                 )
 
+    def __enter__(self):
+        """Use as a context manager so hardware contexts cannot leak.
+
+        Two live decoders must never overlap: the XRT hardware contexts are a
+        driver-level, system-wide resource, so the previous decoder has to be
+        closed before the next one is created.
+        """
+        return self
+
+    def __exit__(self, *exception):
+        self.close()
+        return False
+
     @property
     def max_new_tokens_limit(self):
         """Largest generation length that still leaves room for a prompt."""
         return self.context_length - self.tokenizer.minimum_prompt_tokens
+
+    def prompt_ids(self, messages, max_new_tokens):
+        """Prepare the prompt exactly as generation does.
+
+        The one place prompts are built, so validation and benchmark scripts
+        exercise the same trimming semantics as the served path instead of
+        slicing the encoded stream themselves.
+        """
+        return self.tokenizer.encode_chat_within(
+            messages, self.context_length - max_new_tokens
+        )
 
     def _raw_bf16(self, name):
         if name not in self._raw_weights:
@@ -648,9 +672,7 @@ class NPUDecoder:
                 f"{self.context_length}-token context are reserved for a "
                 f"valid prompt"
             )
-        prompt_ids = self.tokenizer.encode_chat_within(
-            messages, self.context_length - max_new_tokens
-        )
+        prompt_ids = self.prompt_ids(messages, max_new_tokens)
         timings = []
         next_token = None
         position = 0

@@ -27,6 +27,7 @@ jobs:
         run: |
           python tests/test_api_server.py
           python tests/test_chat_context.py
+          python tests/test_evidence_helpers.py
           python tests/test_release_gates.py
       - name: Both execution modes resolve internal imports
         run: |
@@ -49,6 +50,8 @@ jobs:
         run: |
           bash -n ollama-xdna/scripts/*.sh
           shellcheck ollama-xdna/scripts/*.sh
+      - name: Rollback fault injection
+        run: python3 tests/test_rollback_script.py
       - name: Verify prebuilt AIE artifacts
         run: |
           cd ollama-xdna/backend/artifacts

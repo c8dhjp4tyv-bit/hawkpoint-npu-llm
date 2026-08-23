@@ -4,6 +4,7 @@
 from concurrent.futures import ThreadPoolExecutor
 from http.client import HTTPConnection
 import json
+import select
 import socket
 import os
 from pathlib import Path
@@ -470,6 +471,131 @@ def test_slow_request_body_times_out_before_the_npu_queue():
         stop_server(server, thread)
 
 
+class RecordingEngine:
+    """Wraps an engine and records the timeout each request was given."""
+
+    def __init__(self, inner):
+        self._inner = inner
+        self.timeouts = []
+
+    def __getattr__(self, name):
+        return getattr(self._inner, name)
+
+    def generate(self, model_id, messages, max_tokens, timeout=None):
+        self.timeouts.append(timeout)
+        yield from self._inner.generate(model_id, messages, max_tokens)
+
+
+def _send_headers(connection, host, length):
+    connection.sendall(
+        b"POST /v1/chat/completions HTTP/1.1\r\n"
+        b"Host: %s\r\n"
+        b"Authorization: Bearer %s\r\n"
+        b"Content-Type: application/json\r\n"
+        b"Content-Length: %d\r\n\r\n"
+        % (host.encode(), API_KEY.encode(), length)
+    )
+
+
+def _read_status(connection, timeout=15):
+    connection.settimeout(timeout)
+    response = b""
+    while b"\r\n\r\n" not in response:
+        try:
+            chunk = connection.recv(4096)
+        except (TimeoutError, OSError):
+            break
+        if not chunk:
+            break
+        response += chunk
+    return response
+
+
+def test_trickled_body_cannot_outlive_the_absolute_deadline():
+    """Steady dripping never stalls the socket, but must still be cut off."""
+    request_timeout = 1.0
+    decoder = CountingDecoder()
+    server, thread, base = start_server(
+        {"smollm2-135m-xdna1": decoder},
+        request_timeout=request_timeout,
+    )
+    host, port = "127.0.0.1", server.server_port
+    try:
+        # Padding keeps the body long enough that a steady drip cannot finish.
+        body = json.dumps(
+            {**payload(), "padding": "x" * 4000}
+        ).encode()
+        connection = socket.create_connection((host, port), timeout=5)
+        try:
+            _send_headers(connection, host, len(body))
+            started = time.monotonic()
+            index = 0
+            try:
+                # One byte every 100 ms: ten times faster than the socket
+                # would time out, but far slower than the total deadline.
+                # Stop as soon as the server answers or hangs up.
+                while index < len(body) and time.monotonic() - started < 10:
+                    if select.select([connection], [], [], 0)[0]:
+                        break
+                    connection.sendall(body[index : index + 1])
+                    index += 1
+                    time.sleep(0.1)
+            except OSError:
+                pass  # the server closed on us, which is the point
+            elapsed = time.monotonic() - started
+            response = _read_status(connection)
+            assert index < len(body), "body was fully delivered; test too slow"
+            # Bounded by the configured deadline plus scheduling slack, not by
+            # how long the client is willing to keep dripping.
+            assert elapsed < request_timeout + 2, elapsed
+            if response:
+                assert b" 408 " in response.split(b"\r\n")[0], response[:80]
+        finally:
+            connection.close()
+        assert decoder.calls == 0
+    finally:
+        stop_server(server, thread)
+
+
+def test_inference_receives_only_the_remaining_deadline():
+    """Time spent reading the body is deducted from the inference budget."""
+    request_timeout = 3.0
+    engine = RecordingEngine(
+        CompletionEngine({"smollm2-135m-xdna1": CountingDecoder()})
+    )
+    server = BoundedHTTPServer(
+        ("127.0.0.1", 0),
+        make_handler(
+            engine,
+            ServerConfig(api_key=API_KEY, request_timeout=request_timeout),
+        ),
+        max_connections=None,
+    )
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    host, port = "127.0.0.1", server.server_port
+    try:
+        body = json.dumps(payload()).encode()
+        connection = socket.create_connection((host, port), timeout=10)
+        try:
+            _send_headers(connection, host, len(body))
+            connection.sendall(body[:10])
+            time.sleep(1.2)
+            connection.sendall(body[10:])
+            response = _read_status(connection)
+            assert b" 200 " in response.split(b"\r\n")[0], response[:80]
+        finally:
+            connection.close()
+        assert len(engine.timeouts) == 1
+        granted = engine.timeouts[0]
+        # The pause came out of the request's budget, not on top of it.
+        assert 0 < granted < request_timeout - 1.0, granted
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+
 def test_connection_ceiling_is_bounded():
     """Open sockets beyond the ceiling are closed instead of taking threads."""
     server, thread, base = start_server(
@@ -694,6 +820,8 @@ def main():
     test_forwarded_headers_only_honored_for_trusted_proxies()
     test_only_the_configured_forwarding_header_is_read()
     test_slow_request_body_times_out_before_the_npu_queue()
+    test_trickled_body_cannot_outlive_the_absolute_deadline()
+    test_inference_receives_only_the_remaining_deadline()
     test_connection_ceiling_is_bounded()
     test_backpressure_and_safe_errors()
     test_hard_process_timeout()

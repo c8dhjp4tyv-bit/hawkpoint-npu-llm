@@ -25,15 +25,16 @@ def main():
     references = {}
     prompt = [{"role": "user", "content": "Reply with exactly OK."}]
     for model_id, record in discover_models(args.models_dir).items():
-        decoder = NPUDecoder(record["path"], npu_layers=0)
-        stats = None
-        for _, candidate in decoder.generate_messages(prompt, args.tokens):
-            if candidate is not None:
-                stats = candidate
+        # One decoder at a time: close it before the next model is loaded so
+        # its NPU/XRT contexts are released deterministically.
+        with NPUDecoder(record["path"], npu_layers=0) as decoder:
+            stats = None
+            for _, candidate in decoder.generate_messages(prompt, args.tokens):
+                if candidate is not None:
+                    stats = candidate
         if stats is None or not stats["generated_token_ids"]:
             raise RuntimeError(f"{model_id} produced no reference tokens")
         references[model_id] = stats["generated_token_ids"]
-        del decoder
         gc.collect()
     args.output.parent.mkdir(parents=True, exist_ok=True)
     temporary = args.output.with_suffix(args.output.suffix + ".tmp")

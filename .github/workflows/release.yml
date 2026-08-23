@@ -23,6 +23,7 @@ jobs:
           python npu_llm/tests/test_model_integrity.py
           python tests/test_api_server.py
           python tests/test_chat_context.py
+          python tests/test_evidence_helpers.py
           python tests/test_release_gates.py
           python npu_llm/api_server.py --help >/dev/null
           python -m npu_llm.api_server --help >/dev/null
@@ -35,6 +36,7 @@ jobs:
       - run: |
           bash -n ollama-xdna/scripts/*.sh
           shellcheck ollama-xdna/scripts/*.sh
+          python3 tests/test_rollback_script.py
           cd ollama-xdna/backend/artifacts
           sha256sum --check SHA256SUMS
       - name: Apply patch and run upstream Go tests
