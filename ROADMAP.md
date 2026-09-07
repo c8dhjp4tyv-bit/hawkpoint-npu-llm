@@ -23,9 +23,16 @@ Overlap host-side tokenization and LM head with NPU compute by submitting the
 next layer's work while the current one finishes. Requires vertex-driven dispatch
 and reworked IRON runtimes.
 
+## Completed
+
 ### Sampling parameter support
-Add temperature, top-k, top-p, and repetition-penalty sampling to the
-OpenAI-compatible API. Currently only greedy decoding is supported.
+Temperature, top-k, top-p, repetition/presence/frequency penalties, and a
+reproducible `seed` are supported by the runtime, the terminal chat, and the
+OpenAI-compatible API. Greedy decoding remains the default so the exact-token
+release gates are unaffected.
+
+Still missing from the completion API: `n > 1`, beam search, `logprobs`, and
+stop sequences.
 
 ## XDNA2 / NPU4 Compatibility
 

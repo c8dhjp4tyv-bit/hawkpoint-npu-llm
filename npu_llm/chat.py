@@ -8,6 +8,7 @@ ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT))
 
 from runtime.generate import NPUDecoder
+from runtime.sampling import SamplingParams
 
 
 def main():
@@ -26,7 +27,32 @@ def main():
         "--system-prompt",
         default="You are a helpful AI assistant named SmolLM.",
     )
+    sampling = p.add_argument_group("sampling (default: greedy)")
+    sampling.add_argument("--temperature", type=float)
+    sampling.add_argument("--top-p", type=float)
+    sampling.add_argument("--top-k", type=int)
+    sampling.add_argument("--repetition-penalty", type=float)
+    sampling.add_argument("--presence-penalty", type=float)
+    sampling.add_argument("--frequency-penalty", type=float)
+    sampling.add_argument(
+        "--seed",
+        type=int,
+        help="reproduce a sampled run; ignored when decoding greedily",
+    )
     args = p.parse_args()
+
+    try:
+        params = SamplingParams.build(
+            temperature=args.temperature,
+            top_p=args.top_p,
+            top_k=args.top_k,
+            repetition_penalty=args.repetition_penalty,
+            presence_penalty=args.presence_penalty,
+            frequency_penalty=args.frequency_penalty,
+            seed=args.seed,
+        )
+    except ValueError as exc:
+        p.error(str(exc))
 
     npu_layers = args.npu_layers
     if args.npu_percent is not None:
@@ -47,7 +73,7 @@ def main():
         pieces = []
         stats = None
         for text, final_stats in decoder.generate_messages(
-            messages, args.max_new_tokens
+            messages, args.max_new_tokens, sampling=params
         ):
             pieces.append(text)
             print(text, end="", flush=True)

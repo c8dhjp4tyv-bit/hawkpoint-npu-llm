@@ -46,6 +46,25 @@ class FakeDecoder:
         }
 
 
+class RecordingDecoder:
+    """Echoes back the sampling configuration the server forwarded."""
+
+    context_length = 64
+
+    def __init__(self):
+        self.calls = []
+
+    def generate_messages(self, messages, max_new_tokens, sampling=None):
+        self.calls.append(sampling)
+        yield "ok", None
+        yield "", {
+            "prompt_tokens": 1,
+            "generated_tokens": 1,
+            "finish_reason": "stop",
+            "sampling": sampling,
+        }
+
+
 class FailingDecoder:
     context_length = 64
 
@@ -391,8 +410,68 @@ def test_model_switch_releases_previous_decoder():
     assert factory.created[1].closed is True
 
 
+def test_sampling_parameters_reach_the_decoder():
+    decoder = RecordingDecoder()
+    server, thread, base = start_server({"smollm2-135m-xdna1": decoder})
+    try:
+        # A request with no sampling fields keeps the historical greedy path:
+        # the decoder is called without a sampling argument at all.
+        status, body, _ = fetch(f"{base}/v1/chat/completions", payload())
+        assert status == 200
+        assert decoder.calls == [None]
+        assert json.loads(body)["x_hawkpoint_stats"]["sampling"] is None
+
+        sampled = payload()
+        sampled.update({"temperature": 0.8, "top_p": 0.9, "top_k": 40, "seed": 7})
+        status, body, _ = fetch(f"{base}/v1/chat/completions", sampled)
+        assert status == 200
+        forwarded = decoder.calls[-1]
+        assert forwarded["temperature"] == 0.8
+        assert forwarded["top_p"] == 0.9
+        assert forwarded["top_k"] == 40
+        assert forwarded["seed"] == 7
+        assert forwarded["repetition_penalty"] == 1.0
+        assert json.loads(body)["x_hawkpoint_stats"]["sampling"] == forwarded
+
+        # Streaming takes the same path.
+        streaming = payload()
+        streaming.update({"stream": True, "temperature": 1.0})
+        status, body, _ = fetch(f"{base}/v1/chat/completions", streaming)
+        assert status == 200
+        assert decoder.calls[-1]["temperature"] == 1.0
+
+        # Explicit defaults are still recognized as greedy.
+        neutral = payload()
+        neutral.update({"temperature": 0, "top_p": 1.0})
+        status, _, _ = fetch(f"{base}/v1/chat/completions", neutral)
+        assert status == 200
+        assert decoder.calls[-1] is None
+
+        before = len(decoder.calls)
+        for invalid in (
+            {"temperature": 5},
+            {"temperature": "hot"},
+            {"top_p": 0},
+            {"top_k": -3},
+            {"repetition_penalty": 0},
+            {"presence_penalty": 99},
+            {"seed": -1},
+            {"n": 2},
+        ):
+            request = payload()
+            request.update(invalid)
+            status, body, _ = fetch(f"{base}/v1/chat/completions", request)
+            assert status == 400, (invalid, status)
+            assert json.loads(body)["error"]["type"] == "invalid_request_error"
+        # A rejected request never reaches the NPU worker.
+        assert len(decoder.calls) == before
+    finally:
+        stop_server(server, thread)
+
+
 def main():
     test_protocol_and_security()
+    test_sampling_parameters_reach_the_decoder()
     test_backpressure_and_safe_errors()
     test_hard_process_timeout()
     test_worker_error_forces_restart()

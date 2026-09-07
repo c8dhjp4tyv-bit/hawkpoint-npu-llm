@@ -5,6 +5,20 @@ versioning while its public API is experimental.
 
 ## [Unreleased]
 
+- Add sampling to the runtime, the terminal chat, and the OpenAI-compatible
+  endpoint: `temperature`, `top_p`, `top_k`, `repetition_penalty`,
+  `presence_penalty`, `frequency_penalty`, and `seed`. Penalties are scored over
+  the prompt as well as the generated tokens, filters are applied in the
+  llama.cpp/vLLM order, and the sampler is engaged once per emitted token rather
+  than once per ingested prompt position. Greedy decoding stays the default: a
+  request that sets no sampling field takes the previous code path unchanged, so
+  the exact-token acceptance and release gates still hold. An unseeded sampled
+  request draws a seed and reports it in `x_hawkpoint_stats.sampling` so the run
+  can be replayed. Out-of-range values are rejected with `400` at the HTTP
+  boundary and revalidated inside the inference worker before reaching a
+  decoder. Adds hardware-free tests for the sampler and the decode loop, plus a
+  hardware gate asserting `temperature: 0` reproduces the greedy sequence and a
+  seeded sampled run is reproducible.
 - Fix the RC3 release blocker: deterministically close the active decoder and
   release its XRT/NPU hardware context before another model loads, in worker
   finally blocks and on worker termination, instead of relying on garbage

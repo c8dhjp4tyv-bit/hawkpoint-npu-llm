@@ -9,6 +9,17 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from runtime.generate import NPUDecoder
+from runtime.sampling import SamplingParams
+
+
+def _token_ids(decoder, prompt, sampling):
+    """Generate once and return only the generated token ids."""
+    for _, final_stats in decoder.generate(
+        prompt, max_new_tokens=32, sampling=sampling
+    ):
+        if final_stats is not None:
+            return final_stats["generated_token_ids"]
+    raise AssertionError("generation produced no statistics")
 
 
 def main():
@@ -43,12 +54,32 @@ def main():
     assert "sky" in answer.lower() and "blue" in answer.lower()
     assert len(answer.split()) >= 15
 
+    # Sampling gate: an explicit greedy request must reproduce the greedy
+    # tokens exactly, and a seeded sampled request must be reproducible.
+    greedy_ids = stats["generated_token_ids"]
+    explicit_greedy = _token_ids(
+        decoder, prompt, SamplingParams.build(temperature=0.0)
+    )
+    assert explicit_greedy == greedy_ids, (
+        "temperature=0 diverged from the greedy reference path"
+    )
+
+    seeded = SamplingParams.build(temperature=0.8, top_p=0.95, seed=20260907)
+    first_sampled = _token_ids(decoder, prompt, seeded)
+    second_sampled = _token_ids(decoder, prompt, seeded)
+    assert first_sampled == second_sampled, (
+        "a seeded sampled run was not reproducible"
+    )
+    assert len(first_sampled) == 32
+
     print("PASS NPU end-to-end")
     print(f"argmax={first_token}")
     print(f"cold_seconds={cold_seconds:.4f}")
     print(f"warm_seconds={warm_seconds:.4f}")
     print(f"answer={answer!r}")
     print(f"stats={stats}")
+    print(f"greedy_token_ids={greedy_ids}")
+    print(f"seeded_sampled_token_ids={first_sampled}")
 
 
 if __name__ == "__main__":

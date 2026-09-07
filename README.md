@@ -89,6 +89,7 @@ with memory pressure and CPU BLAS configuration.
 - OpenAI-compatible `GET /v1/models`
 - OpenAI-compatible `POST /v1/chat/completions`
 - Streaming chat completions over server-sent events
+- Temperature, top-k, top-p, penalty, and seed sampling (greedy by default)
 - One-command API or API + Open WebUI launcher
 - Weight converter and hardware component/acceptance tests
 - AIE2 C++ kernels and IRON graph definitions
@@ -256,6 +257,55 @@ curl http://localhost:8000/v1/chat/completions \
 
 For streaming output, set `"stream": true`.
 
+### Sampling
+
+Generation is greedy unless a request opts in. `temperature: 0` (the default)
+selects the highest-scoring token, which keeps the reproducible acceptance
+sequences intact.
+
+| Field | Default | Accepted range |
+|---|---|---|
+| `temperature` | `0` | `0`–`2`, `0` means greedy |
+| `top_p` | `1.0` | greater than `0` through `1.0` |
+| `top_k` | `0` | `0` (disabled) or a positive integer |
+| `repetition_penalty` | `1.0` | `0.1`–`2.0` |
+| `presence_penalty` | `0` | `-2.0`–`2.0` |
+| `frequency_penalty` | `0` | `-2.0`–`2.0` |
+| `seed` | none | `0`–`2^63 - 1` |
+
+Filters are applied in the order penalties, temperature, `top_k`, `top_p`, and
+then a multinomial draw. Penalties are scored over the prompt tokens as well as
+the generated ones. An out-of-range value is rejected with `400
+invalid_request_error` and never reaches the NPU worker.
+
+```bash
+curl http://localhost:8000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $HAWKPOINT_API_KEY" \
+  -d '{
+    "model": "smollm2-135m-xdna1",
+    "messages": [{"role": "user", "content": "Write one sentence about rain."}],
+    "max_tokens": 24,
+    "temperature": 0.8,
+    "top_p": 0.95,
+    "repetition_penalty": 1.1,
+    "seed": 1234
+  }'
+```
+
+A request that supplies `seed` reproduces its output exactly. An unseeded
+sampled request draws a seed and reports it, so a run can be replayed:
+`x_hawkpoint_stats.sampling` carries the effective mode, seed, and every
+resolved parameter.
+
+The terminal chat exposes the same options:
+
+```bash
+python npu_llm/chat.py \
+  --prompt "Write one sentence about rain." \
+  --temperature 0.8 --top-p 0.95 --repetition-penalty 1.1 --seed 1234
+```
+
 Select another installed model by changing the request's `model` field:
 
 ```json
@@ -333,8 +383,14 @@ Tests are directly executable and do not require pytest:
 ```bash
 python npu_llm/tests/test_converter.py
 python npu_llm/tests/test_model_runtime.py
+python npu_llm/tests/test_sampling.py
+python npu_llm/tests/test_decode_loop.py
 python tests/test_api_server.py
 ```
+
+`test_sampling.py` and `test_decode_loop.py` need no NPU: token selection is a
+host operation, so the sampler and the decode loop's use of it are covered with
+canned logits.
 
 Run the complete hardware acceptance test:
 
@@ -406,9 +462,11 @@ generation.
   layer count, attention layout, or vocabulary differ from a known template.
   SmolLM2-360M, SmolLM2-1.7B, larger Qwen variants, and non-Llama architectures
   fail at conversion time, not silently at runtime.
-- **No sampling parameters**. Generation is greedy. Temperature, top-k, top-p,
-  and repetition penalty are accepted by neither the runtime nor the
-  OpenAI-compatible API endpoint.
+- **Greedy by default, with opt-in sampling**. `temperature`, `top_p`,
+  `top_k`, `repetition_penalty`, `presence_penalty`, `frequency_penalty`, and
+  `seed` are supported. A request that sets none of them decodes greedily and
+  reproduces the checked-in acceptance sequences exactly. `n > 1`, beam search,
+  `logprobs`, and stop sequences are still unsupported.
 
 ### Performance
 

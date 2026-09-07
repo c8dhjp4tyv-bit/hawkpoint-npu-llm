@@ -26,6 +26,10 @@ try:
 except ImportError:
     from model_catalog import DEFAULT_MODEL_ID, discover_models
 
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+from runtime.sampling import GREEDY, SamplingParams  # noqa: E402
+
 
 def _completion_id():
     return f"chatcmpl-{uuid.uuid4().hex}"
@@ -174,10 +178,15 @@ class CompletionEngine:
     def ready(self):
         return True
 
-    def generate(self, model_id, messages, max_tokens, timeout=None):
+    def generate(self, model_id, messages, max_tokens, timeout=None, sampling=None):
         with self.lock:
             decoder = self._load(model_id)
-            yield from decoder.generate_messages(messages, max_tokens)
+            if sampling is None:
+                yield from decoder.generate_messages(messages, max_tokens)
+                return
+            yield from decoder.generate_messages(
+                messages, max_tokens, sampling=sampling
+            )
 
 
 class InferenceTimeout(TimeoutError):
@@ -200,6 +209,7 @@ def _worker_loop(models, decoder_factory, connection):
                     command["model"],
                     command["messages"],
                     command["max_tokens"],
+                    sampling=command.get("sampling"),
                 ):
                     connection.send(("chunk", (text, stats)))
                 connection.send(("done", None))
@@ -298,7 +308,7 @@ class ProcessCompletionEngine:
                 raise RuntimeError("inference worker prewarm failed")
             self._ready = True
 
-    def generate(self, model_id, messages, max_tokens, timeout=None):
+    def generate(self, model_id, messages, max_tokens, timeout=None, sampling=None):
         deadline = time.monotonic() + (timeout or self.timeout)
         with self._lock:
             self._start()
@@ -308,6 +318,9 @@ class ProcessCompletionEngine:
                     "model": model_id,
                     "messages": messages,
                     "max_tokens": max_tokens,
+                    # Sent as a plain dict, never a live object, and revalidated
+                    # inside the worker before it reaches the decoder.
+                    "sampling": sampling,
                 }
             )
             try:
@@ -487,6 +500,13 @@ def make_handler(engine, config=None):
                     max(1, requested),
                     engine.context_length(model_id) - 1,
                 )
+                if request.get("n", 1) != 1:
+                    raise ValueError("only n=1 is supported")
+                params = SamplingParams.from_request(request)
+                # A request that asks for nothing but the defaults keeps the
+                # original greedy call path, so decoders that predate sampling
+                # are still driven with their historical signature.
+                sampling = None if params == GREEDY else params.to_dict()
             except (ValueError, TypeError, json.JSONDecodeError) as exc:
                 self._error(exc)
                 return
@@ -498,13 +518,13 @@ def make_handler(engine, config=None):
             self._deadline = time.monotonic() + config.request_timeout
             try:
                 if request.get("stream", False):
-                    self._stream(model_id, messages, max_tokens)
+                    self._stream(model_id, messages, max_tokens, sampling)
                 else:
-                    self._complete(model_id, messages, max_tokens)
+                    self._complete(model_id, messages, max_tokens, sampling)
             finally:
                 slots.release()
 
-        def _complete(self, model_id, messages, max_tokens):
+        def _complete(self, model_id, messages, max_tokens, sampling=None):
             pieces = []
             stats = None
             try:
@@ -513,6 +533,7 @@ def make_handler(engine, config=None):
                     messages,
                     max_tokens,
                     timeout=config.request_timeout,
+                    sampling=sampling,
                 ):
                     if time.monotonic() > self._deadline:
                         raise TimeoutError
@@ -555,7 +576,7 @@ def make_handler(engine, config=None):
                 }
             )
 
-        def _stream(self, model_id, messages, max_tokens):
+        def _stream(self, model_id, messages, max_tokens, sampling=None):
             completion_id = _completion_id()
             created = int(time.time())
             self._headers(200, "text/event-stream")
@@ -587,6 +608,7 @@ def make_handler(engine, config=None):
                     messages,
                     max_tokens,
                     timeout=config.request_timeout,
+                    sampling=sampling,
                 ):
                     if time.monotonic() > self._deadline:
                         raise TimeoutError

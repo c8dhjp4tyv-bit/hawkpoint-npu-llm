@@ -26,6 +26,7 @@ from designs.rmsnorm import rmsnorm
 from designs.tensor_copy import slice_bf16
 from runtime.model import XDNA1Model
 from runtime.cpu_backend import CPUDecoderStage, _bf16 as _bf16_cpu
+from runtime.sampling import GREEDY, Sampler, SamplingParams
 from runtime.tokenizer import SmolLMTokenizer
 
 
@@ -520,9 +521,11 @@ class NPUDecoder:
         )
 
     @staticmethod
-    def _decode_result(logits, start, diagnostics):
+    def _decode_result(logits, start, diagnostics, select=None):
         logits_f32 = np.asarray(logits, dtype=np.float32)
-        next_token = int(np.argmax(logits_f32))
+        next_token = (
+            int(np.argmax(logits_f32)) if select is None else int(select(logits_f32))
+        )
         elapsed = time.perf_counter() - start
         if not diagnostics:
             return next_token, elapsed
@@ -540,7 +543,13 @@ class NPUDecoder:
             ),
         }
 
-    def decode_token(self, token_id, position, *, diagnostics=False):
+    def decode_token(self, token_id, position, *, diagnostics=False, select=None):
+        """Run one decode step and return ``(next_token, elapsed_seconds)``.
+
+        ``select`` overrides token selection with a callable taking the float32
+        logit vector and returning a token id. It defaults to ``argmax`` so the
+        greedy reference path and the exact-token release gates are unchanged.
+        """
         if not 0 <= position < self.context_length:
             raise ValueError("position outside the 64-token context")
         start = time.perf_counter()
@@ -574,7 +583,7 @@ class NPUDecoder:
             for layer in range(self.npu_layers, self.layers):
                 hidden = self.cpu_stage.layer(hidden, layer, position)
             logits = self.cpu_stage.logits(hidden)
-            return self._decode_result(logits, start, diagnostics)
+            return self._decode_result(logits, start, diagnostics, select)
         normalized = iron.zeros(self.hidden_size, dtype=bfloat16, device="npu")
         rmsnorm(
             hidden,
@@ -588,7 +597,7 @@ class NPUDecoder:
             if self.model_family == "qwen2"
             else self._project(normalized, "lm_head")
         )
-        return self._decode_result(logits.numpy(), start, diagnostics)
+        return self._decode_result(logits.numpy(), start, diagnostics, select)
 
     def warmup(self):
         """Compile and populate the hot path before the first request."""
@@ -626,31 +635,58 @@ class NPUDecoder:
             for cache in self.cpu_stage.value_cache.values():
                 cache.fill(0)
 
-    def generate_messages(self, messages, max_new_tokens=16):
+    def generate_messages(self, messages, max_new_tokens=16, sampling=None):
         """Generate a response for an OpenAI-style list of chat messages.
 
         The hardware attention cache is fixed at 64 tokens. When a conversation
         grows beyond that window, the newest prompt tokens are retained.
+
+        ``sampling`` accepts a :class:`~runtime.sampling.SamplingParams` (or a
+        transport dict) and defaults to greedy decoding.
         """
         if not 0 < max_new_tokens < self.context_length:
             raise ValueError(
                 f"max_new_tokens must be between 1 and {self.context_length - 1}"
             )
+        if sampling is None:
+            params = GREEDY
+        elif isinstance(sampling, SamplingParams):
+            params = sampling
+        else:
+            params = SamplingParams.from_dict(sampling)
+        sampler = Sampler(params)
         prompt_ids = self.tokenizer.encode_chat(messages)
         if len(prompt_ids) + max_new_tokens > self.context_length:
             prompt_ids = prompt_ids[-(self.context_length - max_new_tokens) :]
         timings = []
         next_token = None
         position = 0
-        for token in prompt_ids:
-            next_token, elapsed = self.decode_token(token, position)
+        # Penalties are scored against the prompt as well as the generated text,
+        # matching llama.cpp and vLLM.
+        history = list(prompt_ids)
+        select = (
+            None
+            if sampler.greedy
+            else (lambda logits: sampler.select(logits, history))
+        )
+        last_prompt_index = len(prompt_ids) - 1
+        for index, token in enumerate(prompt_ids):
+            # Only the final prompt position produces a token that is used, so
+            # the sampler (and its random stream) is engaged exactly once per
+            # emitted token instead of once per ingested position.
+            next_token, elapsed = self.decode_token(
+                token,
+                position,
+                select=select if index == last_prompt_index else None,
+            )
             timings.append(elapsed)
             position += 1
         generated = []
         while len(generated) < max_new_tokens and next_token != self.tokenizer.eos_id:
             generated.append(next_token)
+            history.append(next_token)
             yield self.tokenizer.decode([next_token]), None
-            next_token, elapsed = self.decode_token(next_token, position)
+            next_token, elapsed = self.decode_token(next_token, position, select=select)
             timings.append(elapsed)
             position += 1
         stats = {
@@ -668,14 +704,16 @@ class NPUDecoder:
                 / max(1e-9, sum(timings[len(prompt_ids) :]))
             ),
             "peak_ram_mib": resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024,
+            "sampling": sampler.stats(),
         }
         yield "", stats
 
-    def generate(self, prompt, max_new_tokens=32):
+    def generate(self, prompt, max_new_tokens=32, sampling=None):
         """Backward-compatible single-prompt generation."""
         yield from self.generate_messages(
             [{"role": "user", "content": prompt}],
             max_new_tokens=max_new_tokens,
+            sampling=sampling,
         )
 
     def close(self):
