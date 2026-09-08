@@ -40,16 +40,17 @@ DEFAULT_INSTS = (
 )
 PROBE_SOURCE = ROOT / "ollama-xdna" / "backend" / "test_experts.cpp"
 DEFAULT_XRT_ROOT = Path("/opt/xilinx/xrt")
+DEFAULT_COMMAND_TIMEOUT = 30.0
 
 
 def command(*arguments, timeout=None):
-    """Run a command and return combined text output."""
+    """Run a command with a finite default timeout and return its output."""
 
     return subprocess.check_output(
         arguments,
         text=True,
         stderr=subprocess.STDOUT,
-        timeout=timeout,
+        timeout=DEFAULT_COMMAND_TIMEOUT if timeout is None else timeout,
     )
 
 
@@ -104,6 +105,7 @@ def nvidia_versions():
         RuntimeError,
         subprocess.CalledProcessError,
         IndexError,
+        subprocess.TimeoutExpired,
         ValueError,
     ) as exc:
         return values, str(exc)
@@ -150,7 +152,11 @@ def amdxdna_loaded():
             line.split() and line.split()[0] == "amdxdna"
             for line in command("lsmod").splitlines()
         )
-    except (OSError, subprocess.CalledProcessError):
+    except (
+        OSError,
+        subprocess.CalledProcessError,
+        subprocess.TimeoutExpired,
+    ):
         return False
 
 
@@ -309,14 +315,17 @@ def evaluate_gate(observed, pins, capabilities, strict_release):
     """Return non-version and (optionally) strict version failures.
 
     Keeping this decision separate from host probing makes the two policies
-    explicit and lets hosted tests exercise them without an XDNA device.
+    explicit and lets hosted tests exercise them without an XDNA device. A
+    capability marked ``required=False`` is an informational observation; this
+    is important when xrt-smi changes its field or device-name formatting while
+    the functional probe still succeeds.
     """
 
     differences = version_differences(observed, pins)
     failures = [
         f"capability:{name}"
         for name, result in capabilities.items()
-        if not result.get("ok")
+        if result.get("required", True) and not result.get("ok")
     ]
     if strict_release:
         failures.extend(f"version:{name}" for name in sorted(differences))
@@ -324,7 +333,7 @@ def evaluate_gate(observed, pins, capabilities, strict_release):
 
 
 def capability_report(observed, xrt_output, probe):
-    """Return capability checks that are independent of version strings."""
+    """Return required probe checks and non-fatal host observations."""
 
     runtime_ok, runtime_detail = xrt_runtime_present()
     xrt_visible = bool(xrt_output and observed.get("npu_name"))
@@ -339,63 +348,78 @@ def capability_report(observed, xrt_output, probe):
     return {
         "amdxdna_present": {
             "ok": amdxdna_ok,
+            "required": False,
             "detail": "amdxdna module is loaded"
             if amdxdna_ok
             else "amdxdna module is not loaded",
         },
         "xdna1_hardware": {
             "ok": xdna1,
+            "required": False,
             "detail": observed.get("npu_name") or "XDNA device name unavailable",
         },
         "npu_device_node": {
             "ok": accelerator_ok,
+            "required": False,
             "detail": "/dev/accel/accel0 is readable and writable"
             if accelerator_ok
             else "/dev/accel/accel0 is missing or inaccessible",
         },
-        "xrt_runtime": {"ok": runtime_ok, "detail": runtime_detail},
+        "xrt_runtime": {
+            "ok": runtime_ok,
+            "required": False,
+            "detail": runtime_detail,
+        },
         "xrt_device_visible": {
             "ok": xrt_visible,
+            "required": False,
             "detail": "xrt-smi examine reports an NPU"
             if xrt_visible
             else "xrt-smi did not report an NPU",
         },
         "xrt_can_open_device": {
             "ok": probe_ok,
+            "required": True,
             "detail": "covered by the known-good XRT probe"
             if probe_ok
             else probe.get("detail", "XRT probe failed"),
         },
         "xrt_can_create_hwctx": {
             "ok": probe_ok,
+            "required": True,
             "detail": "covered by the known-good XRT probe"
             if probe_ok
             else probe.get("detail", "XRT probe failed"),
         },
         "xrt_can_allocate_bo": {
             "ok": probe_ok,
+            "required": True,
             "detail": "covered by the known-good XRT probe"
             if probe_ok
             else probe.get("detail", "XRT probe failed"),
         },
         "xrt_can_sync_bo": {
             "ok": probe_ok,
+            "required": True,
             "detail": "covered by the known-good XRT probe"
             if probe_ok
             else probe.get("detail", "XRT probe failed"),
         },
         "xrt_can_load_xclbin": {
             "ok": probe_ok,
+            "required": True,
             "detail": "covered by the known-good XRT probe"
             if probe_ok
             else probe.get("detail", "XRT probe failed"),
         },
         "xrt_can_submit_kernel": {
             "ok": probe_ok,
+            "required": True,
             "detail": probe.get("detail", "XRT probe failed"),
         },
         "xrt_required_ioctls": {
             "ok": probe_ok,
+            "required": True,
             "detail": "device, hwctx, BO, sync, xclbin, submit, and wait path passed"
             if probe_ok
             else probe.get("detail", "XRT probe failed"),
@@ -463,7 +487,11 @@ def main():
         "policy": {
             "exact_version_check": args.strict_release,
             "version_differences_are_fatal": args.strict_release,
-            "required_capabilities": list(capabilities),
+            "required_capabilities": [
+                name
+                for name, result in capabilities.items()
+                if result.get("required", True)
+            ],
         },
         "expected": pins,
         "observed": observed,
@@ -474,7 +502,14 @@ def main():
         "version_differences": differences,
         "capabilities": capabilities,
         "capability_failures": [
-            name for name, result in capabilities.items() if not result.get("ok")
+            name
+            for name, result in capabilities.items()
+            if result.get("required", True) and not result.get("ok")
+        ],
+        "capability_observations": [
+            name
+            for name, result in capabilities.items()
+            if not result.get("required", True)
         ],
         "failures": failures,
         "collection_errors": collection_errors,

@@ -105,7 +105,10 @@ def test_hardware_gate_separates_compatibility_from_release_certification():
         "kernel_release": "7.3.0-compatible",
         "amdxdna_version": "7.3.0-compatible",
     }
-    capabilities = {"xrt_can_submit_kernel": {"ok": True}}
+    capabilities = {
+        "xdna1_hardware": {"ok": False, "required": False},
+        "xrt_can_submit_kernel": {"ok": True, "required": True},
+    }
 
     differences, compatibility_failures = evaluate_gate(
         observed, pins, capabilities, strict_release=False
@@ -120,6 +123,11 @@ def test_hardware_gate_separates_compatibility_from_release_certification():
         "version:amdxdna_version",
         "version:kernel_release",
     ]
+    capabilities["xrt_can_submit_kernel"]["ok"] = False
+    _, probe_failures = evaluate_gate(
+        observed, pins, capabilities, strict_release=False
+    )
+    assert probe_failures == ["capability:xrt_can_submit_kernel"]
     assert is_xdna1_name("RyzenAI-npu1")
     assert not is_xdna1_name("RyzenAI-npu2")
 

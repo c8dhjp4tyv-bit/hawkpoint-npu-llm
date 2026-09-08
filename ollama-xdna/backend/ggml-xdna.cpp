@@ -297,7 +297,7 @@ struct ggml_backend_xdna_context {
                   kernel.group_id(4)),
               weights_host(weights.map<int8_t *>()),
               scales_host(scales.map<float *>()),
-              bytes(weight_bytes) {}
+              bytes(weight_bytes + scale_count * sizeof(float)) {}
     };
 
     xrt::device device;
@@ -347,6 +347,7 @@ struct ggml_backend_xdna_context {
         std::shared_ptr<native_packed_expert>,
         expert_cache_key_hash>
         native_cache;
+    std::list<expert_cache_key> native_lru;
     size_t native_cache_bytes = 0;
     std::unordered_map<
         dense_cache_key,
@@ -503,6 +504,14 @@ struct ggml_backend_xdna_context {
         expert_lru.push_back(key);
     }
 
+    void touch_native_expert(const expert_cache_key & key) {
+        const auto found = std::find(native_lru.begin(), native_lru.end(), key);
+        if (found != native_lru.end()) {
+            native_lru.erase(found);
+        }
+        native_lru.push_back(key);
+    }
+
     void touch_dense(const dense_cache_key & key) {
         const auto found = std::find(dense_lru.begin(), dense_lru.end(), key);
         if (found != dense_lru.end()) {
@@ -536,6 +545,20 @@ struct ggml_backend_xdna_context {
             }
             dense_cache_bytes -= found->second->bytes;
             dense_cache.erase(found);
+        }
+    }
+
+    void evict_native_experts(size_t required) {
+        while (native_cache_bytes + required > weight_cache_limit &&
+               !native_lru.empty()) {
+            const expert_cache_key key = native_lru.front();
+            native_lru.pop_front();
+            const auto found = native_cache.find(key);
+            if (found == native_cache.end()) {
+                continue;
+            }
+            native_cache_bytes -= found->second->bytes;
+            native_cache.erase(found);
         }
     }
 
@@ -712,9 +735,7 @@ struct ggml_backend_xdna_context {
         evict_dense(tile_bytes);
         auto tile = pack_dense_tile(weights, output_base, input_base);
         dense_cache.emplace(key, tile);
-        dense_cache_bytes += tile->bytes +
-                             static_cast<size_t>(kExpertBatch) *
-                                 kExpertDimension * sizeof(float);
+        dense_cache_bytes += tile->bytes;
         dense_lru.push_back(key);
         return tile;
     }
@@ -798,20 +819,21 @@ struct ggml_backend_xdna_context {
             expert};
         const auto found = native_cache.find(key);
         if (found != native_cache.end()) {
+            touch_native_expert(key);
             return found->second;
         }
         auto packed = pack_native_expert(weights, expert);
         if (!packed || weight_cache_limit == 0 ||
-            native_cache_bytes + packed->bytes > weight_cache_limit) {
+            packed->bytes > weight_cache_limit) {
             return packed;
         }
-        while (native_cache_bytes + packed->bytes > weight_cache_limit &&
-               !native_cache.empty()) {
-            native_cache_bytes -= native_cache.begin()->second->bytes;
-            native_cache.erase(native_cache.begin());
+        evict_native_experts(packed->bytes);
+        if (native_cache_bytes + packed->bytes > weight_cache_limit) {
+            return packed;
         }
         native_cache.emplace(key, packed);
         native_cache_bytes += packed->bytes;
+        native_lru.push_back(key);
         return packed;
     }
 
@@ -914,9 +936,7 @@ struct ggml_backend_xdna_context {
                 for (size_t block = 0; block < block_count; ++block) {
                     std::memcpy(
                         destination + block * native_quant->block_bytes,
-                        source +
-                            (source_block + block) *
-                                native_quant->source_block_bytes,
+                        source + block * native_quant->source_block_bytes,
                         native_quant->source_block_bytes);
                 }
             }
