@@ -33,7 +33,7 @@ For the Ollama path, install distro-specific build dependencies first:
 ./ollama-xdna/scripts/verify-system.sh
 ```
 
-Then patch a clean upstream Ollama v0.32.5 checkout, build all matching native
+Then patch a clean upstream Ollama v0.33.3 checkout, build all matching native
 components, run the XDNA hardware test, and install:
 
 ```bash
@@ -404,8 +404,11 @@ least 100 switches, a 1,000-completion endurance soak of 250 consecutive
 requests per model, and an Ollama install/inference/rollback test with
 `--jobs 8` before its publish job can start. See [SUPPORT.md](SUPPORT.md) for the gate and
 [BENCHMARKS.md](BENCHMARKS.md) for the controlled comparison protocol.
-`release-pins.json` is the machine-readable authority for the Ollama source
-commit, Ollama model manifest, and accepted hardware/software stack.
+`release-pins.json` is the machine-readable authority for the Ollama source tag
+and commit, Ollama model manifest, and the hardware/software stack used for
+release certification. It is not an exact kernel requirement for every runtime;
+the compatibility validator checks capabilities and preserves observed version
+differences in its report.
 
 Component examples:
 
@@ -475,12 +478,12 @@ generation.
   of BF16 peak throughput compared to a Zen 4 CPU core cluster at comparable
   throughput with much lower launch overhead. See [Performance
   Analysis](docs/PERFORMANCE-ANALYSIS.md) for a detailed breakdown.
-- The **Ollama XDNA backend** converts GGML rows to W8 for each decoded token
-  and streams padded weights through host→NPU DMA. This overhead makes the
-  NPU path slower than the optimized CPU/GPU path for all measured models.
-  A persistent packed-weight kernel (Q4_K/Q6_K→BF16 fused) would eliminate this
-  bottleneck — this is the highest-value optimization and is tracked as
-  a future work item in [ROADMAP.md](ROADMAP.md).
+- The **Ollama XDNA backend** now packs GGML rows once and retains dense tiles
+  and selected MoE experts in a bounded persistent cache. Unchanged decode
+  steps no longer repeat CPU dequantize/requantize or weight DMA. Native
+  Q4_K/Q6_K AIE2 kernels are included under `npu_llm/kernels/` and can be
+  compiled with `ollama-xdna/backend/compile_quantized.py`; their xclbins are
+  opt-in until the physical release gates validate the exact toolchain stack.
 - **Warm decode is line-rate only for a single token stream**
   with no batching. The NPU has one execution context shared across all
   requests; the HTTP server serializes inference and returns `429 Too Many
@@ -488,10 +491,13 @@ generation.
 
 ### Software
 
-- Requires a specific **XRT + firmware + kernel + MLIR-AIE version
-  combination**. `release-pins.json` records the validated stack. Component
-  version drift causes silent failures (DRM_IOCTL_AMDXDNA_CREATE_HWCTX
-  failures, `aie2_alloc_resource` exhaustion).
+- Requires a working **XRT + firmware + amdxdna + MLIR-AIE combination**. The
+  exact stack in `release-pins.json` is the reproducible release certificate,
+  not a runtime kernel pin. Run `python scripts/verify_hardware_versions.py`
+  for capability-based compatibility validation; the release workflow adds
+  `--strict-release` to enforce the certified version strings as well. A
+  compatible kernel/driver must still pass device open, hardware-context,
+  buffer sync, xclbin load, and minimal kernel-submission checks.
 - **No CUDA, ROCm, oneAPI, or Vulcan NPU delegates**: the AIE2 kernel follows
   the old MTBL path. IREE, TPU-MLIR, open-Silicon, and XDNA-API-based builds
   are not currently in scope.

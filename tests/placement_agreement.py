@@ -45,6 +45,9 @@ DEFAULT_OLLAMA_LIB = "/usr/local/lib/ollama"
 PLACEMENTS = {
     "cpu_only": {"ngl": 0, "xdna": False},
     "gpu_only": {"ngl": 999, "xdna": False},
+    # Exercise the XDNA backend without GPU layer offload. This catches a
+    # backend that only works accidentally when CUDA is also present.
+    "xdna_only": {"ngl": 0, "xdna": True},
     "cpu_gpu": {"ngl": 8, "xdna": False},
     "cpu_gpu_npu": {"ngl": 8, "xdna": True},
 }

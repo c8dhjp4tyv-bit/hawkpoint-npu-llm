@@ -7,16 +7,20 @@ project — entries represent investigation directions.
 ## High-Impact Optimizations
 
 ### Persistent packed-weight kernel for Ollama backend
-The current Ollama XDNA backend converts GGML quantized rows (Q4_K, Q6_K, Q8_0)
-to W8 BF16 on the CPU for every decoded token and DMA-streams the result to the
-NPU. This per-token weight movement dominates end-to-end latency.
+The default W8 path now packs each GGML row once and keeps dense tiles and
+selected MoE experts in a bounded, persistent XRT/host cache. Repeated decode
+steps therefore do not call `to_float` or upload unchanged expert slots.
 
-A Q4_K/Q6_K-aware AIE2 kernel would:
-- Keep quantized weights resident in XRT buffers across tokens
-- Fuse dequantization + matrix-vector product on the AIE array
-- Remove host→NPU weight streaming entirely
+The repository also includes native Q4_K and Q6_K AIE2 kernels and an IRON
+compiler (`ollama-xdna/backend/compile_quantized.py`). When their matching
+xclbin is built and selected with `GGML_XDNA_NATIVE_QUANT_*`, GGML blocks stay
+quantized in the persistent XRT BO and dequantization is fused with GEMV on the
+AIE array. The native artifacts remain opt-in until the exact hardware/toolchain
+stack has passed the physical release gates.
 
-**Estimated impact**: 3–8× decode throughput improvement for Ollama Qwen models.
+**Target**: remove host-side dequantize/requantize and per-token weight
+movement; measure the eventual 3–8× decode estimate on hardware rather than
+assuming it.
 
 ### Multi-context NPU pipelining
 Overlap host-side tokenization and LM head with NPU compute by submitting the

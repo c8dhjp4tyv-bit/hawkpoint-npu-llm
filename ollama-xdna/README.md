@@ -5,14 +5,15 @@ so Qwen operations can be shared across CPU, GPU, and the first-generation AMD
 Ryzen AI NPU. It adds an external GGML backend for `amdxdna`/XRT and preserves
 Ollama's CLI, REST API, model store, and Open WebUI compatibility.
 
-Validated combination:
+Target combination (the physical release gate certifies this exact stack;
+other compatible kernels are accepted when the capability probe passes):
 
 | Component | Validated value |
 |---|---|
 | APU/NPU | AMD Ryzen 7 250, Hawk Point XDNA1 |
 | NPU device | `/dev/accel/accel0`, `amdxdna` |
-| Linux | Fedora 45 prerelease, kernel 7.2-rc5 |
-| Ollama | `v0.32.5` |
+| Linux | Fedora 45 prerelease, kernel 7.2-rc5 (release-certified example) |
+| Ollama | `v0.33.3` (hosted patch port; physical gate pending) |
 | Model | `qwen3-coder:30b` |
 | GPU | NVIDIA RTX 5060 Laptop, CUDA 13 |
 | Placement | `23%/33%/44% CPU/GPU/NPU` |
@@ -49,7 +50,7 @@ The script detects `/etc/os-release` and supports:
 - openSUSE family with `zypper`
 
 It installs GCC/G++, Make, CMake, Ninja, ccache, Git, Go, curl, jq, pkg-config,
-polkit, and PCI utilities. Ollama v0.32.5 requires Go 1.26 or newer. If a
+polkit, and PCI utilities. Ollama v0.33.3 requires Go 1.26 or newer. If a
 distribution ships an older Go release, install a current Go toolchain from
 [go.dev](https://go.dev/doc/install), then run the verifier again.
 
@@ -94,7 +95,7 @@ sudo zypper install gcc gcc-c++ make cmake ninja ccache git go curl jq \
 You need all of the following before building:
 
 - A kernel with the `amdxdna` driver loaded
-- Matching Ryzen AI NPU firmware
+- Ryzen AI NPU firmware that is compatible with the installed XRT/amdxdna stack
 - `/dev/accel/accel0` accessible to the current user
 - XRT runtime and development files under `/opt/xilinx/xrt`
 - `/opt/xilinx/xrt/include/xrt/xrt_bo.h`
@@ -111,6 +112,18 @@ Verify the complete host:
 ```bash
 ./ollama-xdna/scripts/verify-system.sh
 ```
+
+Check runtime compatibility and capture the observed stack (kernel and driver
+versions are reported but are not exact-match requirements):
+
+```bash
+python scripts/verify_hardware_versions.py \
+  --report /tmp/hawkpoint-hardware-compatibility.json
+```
+
+Release certification additionally uses `--strict-release`, which compares the
+observed values with `release-pins.json` after the same functional XRT/NPU
+probe succeeds.
 
 Every required line must report `PASS`. Useful manual checks are:
 
@@ -132,7 +145,7 @@ binary plus the small XDNA backend. It performs these steps in a temporary
 directory:
 
 1. Clones the selected tag from `ollama/ollama`.
-2. Applies `patches/ollama-v0.32.5-xdna.patch`.
+2. Applies `patches/ollama-v0.33.3-xdna.patch`.
 3. Formats and tests all modified Go packages.
 4. Confirms that installed Ollama matches the patch version and stages a copy
    of its native CPU/GPU runtime.
@@ -227,7 +240,7 @@ Increase `--jobs` only when enough free RAM is available. The same value limits
 CMake/Ninja and Go parallelism. `ccache` speeds up interrupted and repeated
 builds without increasing active compiler concurrency.
 
-The only supported patch base is currently `v0.32.5`. This is deliberate:
+The only supported patch base is currently `v0.33.3`. This is deliberate:
 external GGML backends must be rebuilt against the exact llama.cpp ABI bundled
 with each Ollama version.
 
@@ -349,7 +362,7 @@ To rebuild the currently supported release:
 
 ```bash
 OLLAMA_XDNA_GPU_BACKEND=cuda_v13 \
-  ./ollama-xdna/scripts/update-ollama-xdna.sh v0.32.5
+  ./ollama-xdna/scripts/update-ollama-xdna.sh v0.33.3
 ```
 
 To attempt the newest upstream release:
@@ -405,12 +418,39 @@ source /path/to/mlir-aie/utils/env_setup.sh \
 python ollama-xdna/backend/compile_experts.py
 ```
 
+### Build the native quantized kernels
+
+The native Q4_K and Q6_K programs keep GGML blocks in the XRT weight BO and
+perform dequantization inside the AIE GEMV kernel. They are separate from the
+validated W8 artifact and must be rebuilt on the exact release-gate toolchain:
+
+```bash
+python ollama-xdna/backend/compile_quantized.py --quant q4_k
+python ollama-xdna/backend/compile_quantized.py --quant q6_k
+```
+
+Select one matching pair explicitly when testing a generated artifact:
+
+```bash
+export GGML_XDNA_NATIVE_QUANT_FORMAT=q4_k
+export GGML_XDNA_NATIVE_QUANT_XCLBIN="$PWD/ollama-xdna/backend/artifacts/experts-q4_k-8x2048x2048/experts.xclbin"
+export GGML_XDNA_NATIVE_QUANT_INSTS="$PWD/ollama-xdna/backend/artifacts/experts-q4_k-8x2048x2048/insts.bin"
+```
+
+The native program is opt-in; the stock installer continues to use the
+validated W8 artifact until the generated xclbin passes CPU-only, CUDA-only,
+XDNA-only, and placement-agreement gates on the pinned Hawk Point machine.
+
 ## Known limitations
 
-- The current expert path converts selected GGML rows to W8 on the CPU and
-  streams padded weights for every decoded token.
-- That conversion and transfer overhead makes this proof-of-execution slower
-  than the optimized CPU/GPU path on the validated machine.
+- The default W8 path packs selected GGML rows once and keeps them in a bounded
+  persistent cache. Set `GGML_XDNA_WEIGHT_CACHE_MB=0` to force the old
+  streaming path for comparison; the cache limit applies independently to
+  expert rows and dense tiles.
+- Native Q4_K/Q6_K execution requires a freshly generated matching xclbin and
+  is intentionally disabled unless all `GGML_XDNA_NATIVE_QUANT_*` variables
+  are set. Its performance and numerical agreement are not claimed until the
+  physical release gate has run.
 - Prompt processing with batches larger than one usually remains on CPU/GPU;
   the NPU backend primarily targets single-token decoding operations.
 - The `npu_percent` field is an operation-count estimate for Qwen3 MoE, not a
@@ -419,6 +459,7 @@ python ollama-xdna/backend/compile_experts.py
 - The patch is maintained out of tree and may require adaptation after Ollama
   or its bundled llama.cpp changes ABI.
 
-The highest-value optimization is a Q4_K/Q6_K-aware AIE kernel with persistent
-or reusable packed weights. It would remove CPU dequantize/requantize work and
-greatly reduce per-token host-to-NPU traffic.
+The next benchmark target is the native Q4_K/Q6_K path: it removes the
+remaining host-side conversion and lets the AIE kernel dequantize directly
+from persistent quantized blocks. Do not treat the estimated 3–8× gain as a
+result until the generated artifacts have passed the physical gate.

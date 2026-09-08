@@ -2,8 +2,8 @@
 set -euo pipefail
 
 PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-SUPPORTED_TAG="v0.32.5"
-SUPPORTED_COMMIT="eec8e0b9458b8a01be0c216a9cc53eefde24ef50"
+SUPPORTED_TAG="v0.33.3"
+SUPPORTED_COMMIT="b79067b0db7417f20108363bc22adb97f35c966a"
 tag="${SUPPORTED_TAG}"
 backend="cpu"
 build_root=""
@@ -146,7 +146,7 @@ fi
 source_dir="${build_root}/source"
 native_build="${build_root}/native"
 stage="${build_root}/stage"
-patch_file="${PROJECT_ROOT}/patches/ollama-v0.32.5-xdna.patch"
+patch_file="${PROJECT_ROOT}/patches/ollama-v0.33.3-xdna.patch"
 export CMAKE_BUILD_PARALLEL_LEVEL="${jobs}"
 export GOMAXPROCS="${jobs}"
 

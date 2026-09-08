@@ -63,8 +63,9 @@ experiments, without claiming a speedup until they are benchmarked:
   latency.
 - Measure CPU LM-head and tokenization costs with the exact validated model
   and prompt.
-- Compare persistent quantized-weight kernels against the current host-to-NPU
-  weight-transfer path in the Ollama integration.
+- Compare the default persistent W8 cache against the opt-in native Q4_K/Q6_K
+  kernels. The comparison must include first-use packing, warm-token latency,
+  cache hit/upload bytes, and numerical agreement on the pinned model.
 - Measure continuous batching or pipelining only with fixed prompt, context,
   generation length, warm-up, and stability criteria from `BENCHMARKS.md`.
 - Run any XDNA2 port as a separate hardware-validation effort; XDNA2 is not

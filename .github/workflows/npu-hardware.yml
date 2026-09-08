@@ -33,14 +33,14 @@ jobs:
         run: python -m pip install --require-hashes -r requirements.lock
       - name: Verify fresh host prerequisites
         run: ./ollama-xdna/scripts/verify-system.sh
-      - name: Verify and capture pinned hardware versions
-        run: |
-          python scripts/verify_hardware_versions.py \
-            --report "$RUNNER_TEMP/hardware-versions.json"
-      - name: Verify artifacts and patch
+      - name: Verify checked-in AIE probe artifacts
         run: |
           cd ollama-xdna/backend/artifacts
           sha256sum --check SHA256SUMS
+      - name: Verify compatible hardware capabilities
+        run: |
+          python scripts/verify_hardware_versions.py \
+            --report "$RUNNER_TEMP/hardware-versions.json"
       - name: Download pinned sources and convert every supported model
         run: |
           python scripts/prepare_model.py \

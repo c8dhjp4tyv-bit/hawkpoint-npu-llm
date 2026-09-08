@@ -25,7 +25,7 @@ if command -v go >/dev/null 2>&1; then
     if printf '%s\n%s\n' "1.26" "${go_version}" | sort -V -C; then
         pass "Go ${go_version} (minimum 1.26)"
     else
-        fail "Go ${go_version} is too old; Ollama v0.32.5 requires Go 1.26"
+        fail "Go ${go_version} is too old; Ollama v0.33.3 requires Go 1.26"
     fi
 fi
 

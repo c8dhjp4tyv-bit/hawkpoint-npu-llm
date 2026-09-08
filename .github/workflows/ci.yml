@@ -49,13 +49,16 @@ jobs:
           sha256sum --check SHA256SUMS
       - name: Verify the patch against supported Ollama
         run: |
-          git clone --quiet --filter=blob:none --branch v0.32.5 \
+          ollama_tag="$(jq -er '.ollama.source_tag' release-pins.json)"
+          ollama_commit="$(jq -er '.ollama.source_commit' release-pins.json)"
+          patch_file="$GITHUB_WORKSPACE/ollama-xdna/patches/ollama-${ollama_tag}-xdna.patch"
+          git clone --quiet --filter=blob:none --branch "$ollama_tag" \
             https://github.com/ollama/ollama.git /tmp/ollama
           test "$(git -C /tmp/ollama rev-parse HEAD)" = \
-            "eec8e0b9458b8a01be0c216a9cc53eefde24ef50"
+            "$ollama_commit"
           git -C /tmp/ollama apply --check \
-            "$GITHUB_WORKSPACE/ollama-xdna/patches/ollama-v0.32.5-xdna.patch"
+            "$patch_file"
           git -C /tmp/ollama apply \
-            "$GITHUB_WORKSPACE/ollama-xdna/patches/ollama-v0.32.5-xdna.patch"
+            "$patch_file"
           cd /tmp/ollama
           go test ./api ./cmd ./discover ./llm ./server
