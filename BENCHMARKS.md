@@ -50,10 +50,11 @@ own placement.
 Cross-placement agreement is judged at the logit level, not by byte-for-byte
 text equality: CPU, CUDA, and XDNA kernels diverge numerically, so identical
 generated text is not a realistic requirement. A separate `llama-server` pass
-teacher-forces every placement onto one fixed token prefix and compares, per
-position, top-1 token agreement, top-k overlap, and the reference logit margin.
-A top-1 mismatch fails the release only when the reference margin is at or above
-the tolerance threshold; genuinely ambiguous low-margin near-ties are tolerated.
+teacher-forces CPU-only, CUDA-only, XDNA-only, CPU+GPU, and CPU+GPU+NPU onto one
+fixed token prefix and compares, per position, top-1 token agreement, top-k
+overlap, and the reference logit margin. A top-1 mismatch fails the release
+only when the reference margin is at or above the tolerance threshold;
+genuinely ambiguous low-margin near-ties are tolerated.
 The pass also proves each placement really ran on its intended backend -- CUDA
 placements must hold GPU memory, the NPU placement must show XDNA dispatch, and
 no placement may silently fall back to CPU. Exact response hashes are still

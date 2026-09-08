@@ -1,8 +1,8 @@
 diff --git a/api/types.go b/api/types.go
-index ce11b66..f98e4ea 100644
+index 82dd9a4..8792246 100644
 --- a/api/types.go
 +++ b/api/types.go
-@@ -854,6 +854,8 @@ type ProcessModelResponse struct {
+@@ -851,6 +851,8 @@ type ProcessModelResponse struct {
  	Details       ModelDetails `json:"details,omitempty"`
  	ExpiresAt     time.Time    `json:"expires_at"`
  	SizeVRAM      int64        `json:"size_vram"`
@@ -12,10 +12,10 @@ index ce11b66..f98e4ea 100644
  }
  
 diff --git a/cmd/cmd.go b/cmd/cmd.go
-index e65d125..d96342e 100644
+index 5b34235..76d6c23 100644
 --- a/cmd/cmd.go
 +++ b/cmd/cmd.go
-@@ -1110,6 +1110,47 @@ func ListHandler(cmd *cobra.Command, args []string) error {
+@@ -1121,6 +1121,47 @@ func ListHandler(cmd *cobra.Command, args []string) error {
  	return nil
  }
  
@@ -63,7 +63,7 @@ index e65d125..d96342e 100644
  func ListRunningHandler(cmd *cobra.Command, args []string) error {
  	client, err := api.ClientFromEnvironment()
  	if err != nil {
-@@ -1125,19 +1166,7 @@ func ListRunningHandler(cmd *cobra.Command, args []string) error {
+@@ -1136,19 +1177,7 @@ func ListRunningHandler(cmd *cobra.Command, args []string) error {
  
  	for _, m := range models.Models {
  		if len(args) == 0 || strings.HasPrefix(m.Name, args[0]) {
@@ -85,7 +85,7 @@ index e65d125..d96342e 100644
  			var until string
  			delta := time.Since(m.ExpiresAt)
 diff --git a/cmd/cmd_test.go b/cmd/cmd_test.go
-index 821c0ee..41d8f9f 100644
+index b2970d9..e893930 100644
 --- a/cmd/cmd_test.go
 +++ b/cmd/cmd_test.go
 @@ -22,6 +22,57 @@ import (
@@ -147,7 +147,7 @@ index 821c0ee..41d8f9f 100644
  	t.Run("bare details", func(t *testing.T) {
  		var b bytes.Buffer
 diff --git a/discover/llama_server.go b/discover/llama_server.go
-index a66c34e..f73c894 100644
+index ba8ace5..737a7d7 100644
 --- a/discover/llama_server.go
 +++ b/discover/llama_server.go
 @@ -179,6 +179,8 @@ var deviceLineRegex = regexp.MustCompile(
@@ -159,7 +159,7 @@ index a66c34e..f73c894 100644
  // cudaCCRegex matches CUDA stderr lines like:
  //
  //	Device 0: NVIDIA GeForce GTX 1060 6GB, compute capability 6.1, VMM: yes, VRAM: 6063 MiB
-@@ -281,6 +283,10 @@ func parseLlamaServerDevicesWithNative(output, nativeOutput string, libDirs []st
+@@ -277,6 +279,10 @@ func parseLlamaServerDevicesWithNative(output, nativeOutput string, libDirs []st
  		totalMiB, _ := strconv.ParseUint(matches[3], 10, 64)
  		freeMiB, _ := strconv.ParseUint(matches[4], 10, 64)
  		library := inferLibrary(name, description)
@@ -170,7 +170,7 @@ index a66c34e..f73c894 100644
  
  		// Skip pseudo-devices like BLAS/Accelerate that report zero memory.
  		// These are CPU math libraries, not real GPUs — they shouldn't appear
-@@ -293,7 +299,7 @@ func parseLlamaServerDevicesWithNative(output, nativeOutput string, libDirs []st
+@@ -289,7 +295,7 @@ func parseLlamaServerDevicesWithNative(output, nativeOutput string, libDirs []st
  
  		// For CUDA devices, check if this variant supports the device's CC
  		if library == "CUDA" {
@@ -179,7 +179,7 @@ index a66c34e..f73c894 100644
  			if ok && len(cudaArchSet) > 0 {
  				if !cudaArchSet[cc.arch] {
  					slog.Info("skipping CUDA device — compute capability not in compiled architectures",
-@@ -315,15 +321,15 @@ func parseLlamaServerDevicesWithNative(output, nativeOutput string, libDirs []st
+@@ -311,15 +317,15 @@ func parseLlamaServerDevicesWithNative(output, nativeOutput string, libDirs []st
  			}
  		}
  
@@ -198,7 +198,7 @@ index a66c34e..f73c894 100644
  				Library: library,
  			},
  			Name:         name,
-@@ -333,8 +339,8 @@ func parseLlamaServerDevicesWithNative(output, nativeOutput string, libDirs []st
+@@ -329,8 +335,8 @@ func parseLlamaServerDevicesWithNative(output, nativeOutput string, libDirs []st
  			ComputeMajor: computeMajor,
  			ComputeMinor: computeMinor,
  			LibraryPath:  libDirs,
@@ -210,7 +210,7 @@ index a66c34e..f73c894 100644
  		if hasNativeDevice {
  			if nativeDevice.DeviceID != "" {
 diff --git a/discover/llama_server_test.go b/discover/llama_server_test.go
-index 563da94..e50f696 100644
+index 0418dc2..5dde637 100644
 --- a/discover/llama_server_test.go
 +++ b/discover/llama_server_test.go
 @@ -11,6 +11,26 @@ import (
@@ -225,7 +225,7 @@ index 563da94..e50f696 100644
 +  XDNA0: AMD Ryzen AI XDNA1 NPU (0 MiB, 0 MiB free)
 +  CUDA0: NVIDIA GeForce RTX 5060 Laptop GPU (7746 MiB, 7532 MiB free)
 +`
-+	devices := parseLlamaServerDevices(output, []string{"/lib/ollama", "/lib/ollama/cuda_v13"})
++	devices := parseLlamaServerDevicesWithNative(output, "", []string{"/lib/ollama", "/lib/ollama/cuda_v13"}, nil)
 +	if len(devices) != 1 {
 +		t.Fatalf("got %d devices, want 1", len(devices))
 +	}
@@ -241,10 +241,10 @@ index 563da94..e50f696 100644
  	originalProbe := probeLlamaServerVulkanDevices
  	probeLlamaServerVulkanDevices = func(_ []string) ([]vulkanPhysicalDevice, error) {
 diff --git a/llm/llama_server.go b/llm/llama_server.go
-index e529cfc..9639be5 100644
+index fc3edfb..5ede95b 100644
 --- a/llm/llama_server.go
 +++ b/llm/llama_server.go
-@@ -228,6 +228,38 @@ func (s *llamaServerRunner) llamaServerMediaMarker() string {
+@@ -231,6 +231,38 @@ func (s *llamaServerRunner) llamaServerMediaMarker() string {
  	return "<__media__>"
  }
  
@@ -283,7 +283,7 @@ index e529cfc..9639be5 100644
  func newLlamaServerMediaMarker() string {
  	var b [16]byte
  	if _, err := crand.Read(b[:]); err == nil {
-@@ -408,15 +440,7 @@ func startLlamaServer(launch llamaServerLaunchConfig, out io.Writer) (cmd *exec.
+@@ -399,15 +431,7 @@ func startLlamaServer(launch llamaServerLaunchConfig, out io.Writer) (cmd *exec.
  
  	params = appendBatchArgs(params, launch.opts, launch.embedding, launch.numParallel)
  
@@ -300,7 +300,7 @@ index e529cfc..9639be5 100644
  
  	// Thread count — only pass if user explicitly set it.
  	// Default behavior: let llama-server auto-detect.
-@@ -889,6 +913,9 @@ func NewLlamaServerRunner(
+@@ -926,6 +950,9 @@ func NewLlamaServerRunner(
  		serverEnvs[k] = v
  	}
  	serverEnvs["LLAMA_MEDIA_MARKER"] = mediaMarker
@@ -311,10 +311,10 @@ index e529cfc..9639be5 100644
  	launch := llamaServerLaunchConfig{
  		modelPath:    modelPath,
 diff --git a/llm/llama_server_test.go b/llm/llama_server_test.go
-index d39b5b0..2c58985 100644
+index 4d4300b..b98d2eb 100644
 --- a/llm/llama_server_test.go
 +++ b/llm/llama_server_test.go
-@@ -2036,6 +2036,35 @@ func TestAppendFlashAttentionArgs(t *testing.T) {
+@@ -2060,6 +2060,35 @@ func TestAppendFlashAttentionArgs(t *testing.T) {
  	}
  }
  
@@ -351,10 +351,10 @@ index d39b5b0..2c58985 100644
  	tests := []struct {
  		name string
 diff --git a/server/routes.go b/server/routes.go
-index ed75d15..849b4c0 100644
+index 263c7e2..b3c6b5f 100644
 --- a/server/routes.go
 +++ b/server/routes.go
-@@ -2273,11 +2273,15 @@ func (s *Server) PsHandler(c *gin.Context) {
+@@ -2286,11 +2286,15 @@ func (s *Server) PsHandler(c *gin.Context) {
  			QuantizationLevel: m.Config.FileType,
  		}
  
@@ -370,7 +370,7 @@ index ed75d15..849b4c0 100644
  			Digest:        m.Digest,
  			Details:       modelDetails,
  			ExpiresAt:     v.expiresAt,
-@@ -2293,6 +2297,31 @@ func (s *Server) PsHandler(c *gin.Context) {
+@@ -2306,6 +2310,31 @@ func (s *Server) PsHandler(c *gin.Context) {
  	c.JSON(http.StatusOK, api.ProcessResponse{Models: models})
  }
  
@@ -403,7 +403,7 @@ index ed75d15..849b4c0 100644
  	const letterBytes = "abcdefghijklmnopqrstuvwxyz0123456789"
  	b := make([]byte, 8)
 diff --git a/server/routes_test.go b/server/routes_test.go
-index 894035e..f6f40d6 100644
+index 8164454..10ebe02 100644
 --- a/server/routes_test.go
 +++ b/server/routes_test.go
 @@ -32,6 +32,38 @@ import (

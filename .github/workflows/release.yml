@@ -36,12 +36,16 @@ jobs:
           sha256sum --check SHA256SUMS
       - name: Apply patch and run upstream Go tests
         run: |
-          git clone --quiet --filter=blob:none --branch v0.32.5 \
+          ollama_tag="$(jq -er '.ollama.source_tag' release-pins.json)"
+          ollama_commit="$(jq -er '.ollama.source_commit' release-pins.json)"
+          patch_file="$GITHUB_WORKSPACE/ollama-xdna/patches/ollama-${ollama_tag}-xdna.patch"
+          git clone --quiet --filter=blob:none --branch "$ollama_tag" \
             https://github.com/ollama/ollama.git /tmp/ollama
           test "$(git -C /tmp/ollama rev-parse HEAD)" = \
-            "eec8e0b9458b8a01be0c216a9cc53eefde24ef50"
+            "$ollama_commit"
+          git -C /tmp/ollama apply --check "$patch_file"
           git -C /tmp/ollama apply \
-            "$GITHUB_WORKSPACE/ollama-xdna/patches/ollama-v0.32.5-xdna.patch"
+            "$patch_file"
           cd /tmp/ollama
           GOMAXPROCS=8 go test -p 8 ./api ./cmd ./discover ./llm ./server
 
@@ -61,9 +65,14 @@ jobs:
         run: ./scripts/configure-hardware-runner.sh
       - run: python -m pip install --require-hashes -r requirements.lock
       - run: ./ollama-xdna/scripts/verify-system.sh
-      - name: Verify and capture pinned hardware versions
+      - name: Verify checked-in AIE probe artifacts
+        run: |
+          cd ollama-xdna/backend/artifacts
+          sha256sum --check SHA256SUMS
+      - name: Certify release hardware stack and capture compatibility report
         run: |
           python scripts/verify_hardware_versions.py \
+            --strict-release \
             --report "$RUNNER_TEMP/hardware-versions.json"
       - name: Verify dedicated runner install privileges
         run: sudo -n true
@@ -118,12 +127,14 @@ jobs:
           HAWKPOINT_API_PID="$api_pid" python tests/soak_api.py
       - name: Ollama build, install, inference, and rollback gate
         run: |
+          ollama_tag="$(jq -er '.ollama.source_tag' release-pins.json)"
           backend="${OLLAMA_XDNA_GPU_BACKEND:-cuda_v13}"
           model="$(jq -r '.ollama.model' release-pins.json)"
           model_manifest="$(
             jq -r '.ollama.model_manifest_sha256' release-pins.json
           )"
           ./ollama-xdna/scripts/build-and-install.sh \
+            --tag "$ollama_tag" \
             --backend "$backend" \
             --jobs 8 \
             --build-root "$RUNNER_TEMP/ollama-release-build" \
@@ -147,7 +158,7 @@ jobs:
           trap rollback EXIT
           sudo ./ollama-xdna/scripts/install-stage.sh \
             "$RUNNER_TEMP/ollama-release-build/stage" \
-            0.32.5 \
+            "${ollama_tag#v}" \
             "$backend" \
             0
           installed=1

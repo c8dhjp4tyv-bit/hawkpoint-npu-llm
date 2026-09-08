@@ -11,9 +11,11 @@ import tempfile
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tests"))
+sys.path.insert(0, str(ROOT / "scripts"))
 
 from benchmark_ollama_matrix import compare_placement_responses  # noqa: E402
-from placement_agreement import evaluate_agreement  # noqa: E402
+from placement_agreement import PLACEMENTS, evaluate_agreement  # noqa: E402
+from verify_hardware_versions import evaluate_gate, is_xdna1_name  # noqa: E402
 from verify_ollama_manifest import verify_manifest  # noqa: E402
 
 
@@ -68,12 +70,75 @@ def test_logit_agreement_tolerance():
 def test_release_pins():
     pins = json.loads((ROOT / "release-pins.json").read_text())
     ollama = pins["ollama"]
+    assert re.fullmatch(r"v\d+\.\d+\.\d+", ollama["source_tag"])
     assert re.fullmatch(r"[0-9a-f]{40}", ollama["source_commit"])
     assert re.fullmatch(r"[0-9a-f]{64}", ollama["model_manifest_sha256"])
     build_script = (
         ROOT / "ollama-xdna" / "scripts" / "build-and-install.sh"
     ).read_text()
+    patch_file = (
+        ROOT
+        / "ollama-xdna"
+        / "patches"
+        / f"ollama-{ollama['source_tag']}-xdna.patch"
+    )
+    assert patch_file.is_file()
+    assert not (
+        ROOT / "ollama-xdna" / "patches" / "ollama-v0.32.5-xdna.patch"
+    ).exists()
+    assert ollama["source_tag"] in patch_file.name
+    assert ollama["source_tag"] in build_script
     assert ollama["source_commit"] in build_script
+    assert (
+        ROOT / "ollama-xdna" / "backend" / "compile_quantized.py"
+    ).is_file()
+    for kernel in ("project_q4k_bf16.cc", "project_q6k_bf16.cc"):
+        assert (ROOT / "npu_llm" / "kernels" / kernel).is_file()
+
+
+def test_hardware_gate_separates_compatibility_from_release_certification():
+    pins = {
+        "kernel_release": "7.2.0-certified",
+        "amdxdna_version": "7.2.0-certified",
+    }
+    observed = {
+        "kernel_release": "7.3.0-compatible",
+        "amdxdna_version": "7.3.0-compatible",
+    }
+    capabilities = {
+        "xdna1_hardware": {"ok": False, "required": False},
+        "xrt_can_submit_kernel": {"ok": True, "required": True},
+    }
+
+    differences, compatibility_failures = evaluate_gate(
+        observed, pins, capabilities, strict_release=False
+    )
+    assert set(differences) == set(pins)
+    assert compatibility_failures == []
+
+    _, strict_failures = evaluate_gate(
+        observed, pins, capabilities, strict_release=True
+    )
+    assert strict_failures == [
+        "version:amdxdna_version",
+        "version:kernel_release",
+    ]
+    capabilities["xrt_can_submit_kernel"]["ok"] = False
+    _, probe_failures = evaluate_gate(
+        observed, pins, capabilities, strict_release=False
+    )
+    assert probe_failures == ["capability:xrt_can_submit_kernel"]
+    assert is_xdna1_name("RyzenAI-npu1")
+    assert not is_xdna1_name("RyzenAI-npu2")
+
+
+def test_hardware_workflows_use_the_intended_validation_mode():
+    release_workflow = (ROOT / ".github/workflows/release.yml").read_text()
+    compatibility_workflow = (
+        ROOT / ".github/workflows/npu-hardware.yml"
+    ).read_text()
+    assert "--strict-release" in release_workflow
+    assert "--strict-release" not in compatibility_workflow
 
 
 def test_manifest_digest():
@@ -116,11 +181,18 @@ def test_cross_placement_agreement():
     assert not agreed
 
 
+def test_placement_matrix_exercises_xdna_without_cuda():
+    assert PLACEMENTS["xdna_only"] == {"ngl": 0, "xdna": True}
+
+
 def main():
     test_release_pins()
     test_manifest_digest()
     test_cross_placement_agreement()
+    test_placement_matrix_exercises_xdna_without_cuda()
     test_logit_agreement_tolerance()
+    test_hardware_gate_separates_compatibility_from_release_certification()
+    test_hardware_workflows_use_the_intended_validation_mode()
     print("PASS immutable release gates")
 
 

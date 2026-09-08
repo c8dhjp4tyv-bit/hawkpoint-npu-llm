@@ -5,6 +5,32 @@ versioning while its public API is experimental.
 
 ## [Unreleased]
 
+The repository has Git tags through `v0.1.0-rc.9`; this unreleased work should
+ship as the next gated candidate (`v0.1.0-rc.10`) only after the physical
+Hawk Point job succeeds. Existing RC tags without GitHub Release records remain
+tag history, not published artifacts.
+
+- Port the Ollama XDNA patch and release pin from `v0.32.5` to the clean
+  upstream `v0.33.3` commit `b79067b0db7417f20108363bc22adb97f35c966a`.
+  Hosted CI now reads the tag, commit, and patch filename from
+  `release-pins.json`, applies the patch with an explicit `--check`, and runs
+  the upstream Go tests before a hardware-gated publication can proceed.
+- Clarify the release boundary and placement gate: CPU/CUDA/XDNA text hashes are
+  diagnostic only; release correctness uses deterministic per-placement runs,
+  real backend-dispatch evidence (including an isolated XDNA-only run), and
+  teacher-forced top-1/top-k logit agreement with a low-margin near-tie
+  tolerance.
+- Add a bounded persistent weight cache to the Ollama backend. Dense tiles and
+  selected MoE experts are packed once and unchanged slots remain resident in
+  XRT BOs across decode steps. Add opt-in native Q4_K/Q6_K AIE2 kernels and the
+  IRON compiler needed to keep GGML blocks quantized while dequantizing inside
+  the fused GEMV; generated native xclbins still require the physical gate.
+- Split hardware validation into capability-based compatibility mode and
+  `--strict-release` certification mode. Compatibility reports retain observed
+  kernel, amdxdna, XRT, firmware, and GPU versions without exact-string
+  rejection, then run a known-good XRT/AIE probe for device open, hwctx, BO,
+  sync, xclbin, and kernel-submit support. Release certification applies the
+  exact values from `release-pins.json` on top of those functional checks.
 - Add sampling to the runtime, the terminal chat, and the OpenAI-compatible
   endpoint: `temperature`, `top_p`, `top_k`, `repetition_penalty`,
   `presence_penalty`, `frequency_penalty`, and `seed`. Penalties are scored over
@@ -84,7 +110,8 @@ versioning while its public API is experimental.
 
 - Native SmolLM and Qwen2.5 XDNA1 runtimes.
 - OpenAI-compatible authenticated API and local Open WebUI launcher.
-- Ollama v0.32.5 XDNA1 backend patch with CPU/GPU/NPU model placement.
+- Historical Ollama v0.32.5 XDNA1 backend patch with CPU/GPU/NPU model
+  placement (the supported patch base is now v0.33.3).
 - Hash-locked Python environment, pinned model revisions, atomic model
   conversion, and runtime package integrity verification.
 - Hosted protocol/converter/Ollama tests and an opt-in self-hosted Hawk Point
@@ -96,3 +123,9 @@ versioning while its public API is experimental.
 [0.1.0-rc.1]: https://github.com/c8dhjp4tyv-bit/hawkpoint-npu-llm/compare/v0.1.0-alpha.1...v0.1.0-rc.1
 [0.1.0-rc.2]: https://github.com/c8dhjp4tyv-bit/hawkpoint-npu-llm/compare/v0.1.0-rc.1...v0.1.0-rc.2
 [0.1.0-rc.3]: https://github.com/c8dhjp4tyv-bit/hawkpoint-npu-llm/compare/v0.1.0-rc.2...v0.1.0-rc.3
+[0.1.0-rc.4]: https://github.com/c8dhjp4tyv-bit/hawkpoint-npu-llm/compare/v0.1.0-rc.3...v0.1.0-rc.4
+[0.1.0-rc.5]: https://github.com/c8dhjp4tyv-bit/hawkpoint-npu-llm/compare/v0.1.0-rc.4...v0.1.0-rc.5
+[0.1.0-rc.6]: https://github.com/c8dhjp4tyv-bit/hawkpoint-npu-llm/compare/v0.1.0-rc.5...v0.1.0-rc.6
+[0.1.0-rc.7]: https://github.com/c8dhjp4tyv-bit/hawkpoint-npu-llm/compare/v0.1.0-rc.6...v0.1.0-rc.7
+[0.1.0-rc.8]: https://github.com/c8dhjp4tyv-bit/hawkpoint-npu-llm/compare/v0.1.0-rc.7...v0.1.0-rc.8
+[0.1.0-rc.9]: https://github.com/c8dhjp4tyv-bit/hawkpoint-npu-llm/compare/v0.1.0-rc.8...v0.1.0-rc.9
