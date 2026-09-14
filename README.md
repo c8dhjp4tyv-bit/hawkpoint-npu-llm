@@ -15,7 +15,9 @@ kernels.
 
 The versioned support boundary is in [SUPPORT.md](SUPPORT.md), release changes
 are in [CHANGELOG.md](CHANGELOG.md), and responsible disclosure is described
-in [SECURITY.md](SECURITY.md). An alpha tag does not mean production-ready.
+in [SECURITY.md](SECURITY.md). Deployment, monitoring, shutdown, recovery, and
+release procedures are in the [operations guide](docs/OPERATIONS.md). An alpha
+tag does not mean production-ready.
 
 ## Choose a runtime
 
@@ -283,6 +285,13 @@ Clients can retrieve one installed model with `GET /v1/models/{model_id}`.
 Rate-limit and full-queue `429` responses include `Retry-After`. SIGINT and
 SIGTERM trigger graceful HTTP shutdown and deterministic NPU worker cleanup,
 which is particularly important under systemd and container supervisors.
+During shutdown, newly arriving completions receive `503` while already
+admitted inference drains for up to `--graceful-shutdown-timeout` seconds
+(130 by default, slightly longer than the request deadline).
+`GET /ready` switches to `503` immediately and reports `draining` plus the
+active request count, allowing a reverse proxy or service manager to stop
+routing new work before process exit. Access logs include the same request ID
+returned to the client for correlation.
 
 ### Sampling
 

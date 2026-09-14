@@ -15,6 +15,12 @@
 - Periodically evict idle rate-limit buckets during long-running service.
 - Add single-model retrieval, actionable `Retry-After` headers, and graceful
   SIGINT/SIGTERM shutdown with deterministic NPU worker cleanup.
+- Drain admitted inference during shutdown, reject new completions with `503`,
+  validate the drain timeout, and bound/cancel superseded CI runs.
+- Make readiness drain-aware, expose active request counts, and correlate
+  access logs and browser-visible response headers with `X-Request-ID`.
+- Add a deployment/monitoring/recovery runbook and weekly Dependabot coverage
+  for locked Python dependencies and commit-pinned GitHub Actions.
 
 
 All notable changes are documented here. This project follows semantic

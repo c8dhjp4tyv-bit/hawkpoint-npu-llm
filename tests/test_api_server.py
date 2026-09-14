@@ -21,6 +21,7 @@ from npu_llm.api_server import (  # noqa: E402
     BoundedHTTPServer,
     CompletionEngine,
     InferenceTimeout,
+    InferenceTracker,
     ProcessCompletionEngine,
     RateLimiter,
     ServerConfig,
@@ -213,6 +214,8 @@ def test_protocol_and_security():
         status, body, _ = fetch(f"{base}/ready", api_key=None)
         assert status == 200
         assert json.loads(body)["status"] == "ready"
+        assert json.loads(body)["draining"] is False
+        assert json.loads(body)["active_requests"] == 0
 
         status, body, headers = fetch(
             f"{base}/v1/models",
@@ -537,6 +540,7 @@ def test_modern_token_alias_routes_and_headers():
         assert headers["X-Request-ID"].startswith("req-")
         assert headers["X-Content-Type-Options"] == "nosniff"
         assert headers["Cache-Control"] == "no-store"
+        assert "X-Request-ID" in headers["Access-Control-Expose-Headers"]
 
         status, _, model_headers = fetch(f"{base}/v1/models?limit=1")
         assert status == 200
@@ -561,6 +565,24 @@ def test_rate_limiter_evicts_idle_clients():
     now[0] = 61.0
     assert limiter.allow("second")
     assert "first" not in limiter._requests
+
+
+def test_inference_tracker_drains_admitted_work():
+    tracker = InferenceTracker()
+    assert tracker.try_enter()
+    assert tracker.active == 1
+    tracker.begin_shutdown()
+    assert tracker.draining
+    assert not tracker.try_enter()
+    assert not tracker.wait(0.01)
+    tracker.leave()
+    assert tracker.active == 0
+    assert tracker.wait(0.01)
+    try:
+        tracker.leave()
+        raise AssertionError("unbalanced tracker leave was accepted")
+    except RuntimeError:
+        pass
 
 
 class ServeLifecycleEngine:
@@ -704,6 +726,7 @@ def test_cancelled_process_generation_recovers():
         engine.close()
 
 def main():
+    test_inference_tracker_drains_admitted_work()
     test_serve_closes_resources()
     test_modern_token_alias_routes_and_headers()
     test_rate_limiter_evicts_idle_clients()

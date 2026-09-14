@@ -113,6 +113,56 @@ class ServerConfig:
     request_timeout: float = 120.0
     queue_capacity: int = 2
     rate_limit_per_minute: int = 30
+    graceful_shutdown_timeout: float = 130.0
+
+
+class InferenceTracker:
+    """Reject new inference during shutdown and wait for admitted work."""
+
+    def __init__(self):
+        self._active = 0
+        self._draining = False
+        self._condition = threading.Condition()
+
+    @property
+    def draining(self):
+        with self._condition:
+            return self._draining
+
+    @property
+    def active(self):
+        with self._condition:
+            return self._active
+
+    def try_enter(self):
+        with self._condition:
+            if self._draining:
+                return False
+            self._active += 1
+            return True
+
+    def leave(self):
+        with self._condition:
+            if self._active <= 0:
+                raise RuntimeError("inference tracker leave without enter")
+            self._active -= 1
+            if self._active == 0:
+                self._condition.notify_all()
+
+    def begin_shutdown(self):
+        with self._condition:
+            self._draining = True
+            self._condition.notify_all()
+
+    def wait(self, timeout):
+        deadline = time.monotonic() + timeout
+        with self._condition:
+            while self._active:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return False
+                self._condition.wait(remaining)
+            return True
 
 
 class RateLimiter:
@@ -445,9 +495,12 @@ def make_handler(engine, config=None):
     config = config or ServerConfig(api_key="test-only")
     slots = threading.BoundedSemaphore(config.queue_capacity + 1)
     limiter = RateLimiter(config.rate_limit_per_minute)
+    inference_tracker = InferenceTracker()
 
     class Handler(BaseHTTPRequestHandler):
         server_version = "HawkPointNPU/1.0"
+        tracker = inference_tracker
+        server_config = config
 
         def setup(self):
             super().setup()
@@ -457,7 +510,8 @@ def make_handler(engine, config=None):
 
         def log_message(self, fmt, *args):
             sys.stderr.write(
-                f"[{self.log_date_time_string()}] {self.address_string()} "
+                f"[{self.log_date_time_string()}] {self.request_id} "
+                f"{self.address_string()} "
                 f"{fmt % args}\n"
             )
 
@@ -471,6 +525,10 @@ def make_handler(engine, config=None):
             self.send_header("X-Request-ID", self.request_id)
             self.send_header("X-Content-Type-Options", "nosniff")
             self.send_header("Cache-Control", "no-store")
+            self.send_header(
+                "Access-Control-Expose-Headers",
+                "X-Request-ID, Retry-After",
+            )
 
         def _headers(self, status=200, content_type="application/json"):
             self.send_response(status)
@@ -538,10 +596,12 @@ def make_handler(engine, config=None):
                 )
                 return
             if path == "/ready":
-                ready = engine.ready
+                ready = engine.ready and not inference_tracker.draining
                 self._json(
                     {
                         "status": "ready" if ready else "not_ready",
+                        "draining": inference_tracker.draining,
+                        "active_requests": inference_tracker.active,
                         "models": list(engine.models),
                         "device": "npu1",
                         "worker_restarts": getattr(engine, "worker_restarts", 0),
@@ -580,6 +640,14 @@ def make_handler(engine, config=None):
                 self._error("not found", 404)
                 return
             if not self._authorized():
+                return
+            if inference_tracker.draining:
+                self._error(
+                    "server is shutting down",
+                    503,
+                    "server_unavailable",
+                    {"Retry-After": "1"},
+                )
                 return
             client = self.client_address[0]
             if not limiter.allow(client):
@@ -638,6 +706,15 @@ def make_handler(engine, config=None):
                     {"Retry-After": "1"},
                 )
                 return
+            if not inference_tracker.try_enter():
+                slots.release()
+                self._error(
+                    "server is shutting down",
+                    503,
+                    "server_unavailable",
+                    {"Retry-After": "1"},
+                )
+                return
             self.connection.settimeout(config.request_timeout)
             self._deadline = time.monotonic() + config.request_timeout
             try:
@@ -646,6 +723,7 @@ def make_handler(engine, config=None):
                 else:
                     self._complete(model_id, messages, max_tokens, sampling)
             finally:
+                inference_tracker.leave()
                 slots.release()
 
         def _complete(self, model_id, messages, max_tokens, sampling=None):
@@ -805,8 +883,17 @@ class BoundedHTTPServer(ThreadingHTTPServer):
 def serve(server, engine):
     """Serve until interrupted and release HTTP plus NPU resources cleanly."""
     previous_handlers = {}
+    handler = server.RequestHandlerClass
+    tracker = getattr(handler, "tracker", None)
+    shutdown_timeout = getattr(
+        getattr(handler, "server_config", None),
+        "graceful_shutdown_timeout",
+        130.0,
+    )
 
     def request_shutdown(signum, frame):
+        if tracker is not None:
+            tracker.begin_shutdown()
         # shutdown() must run outside serve_forever()'s thread.
         threading.Thread(
             target=server.shutdown,
@@ -820,9 +907,15 @@ def serve(server, engine):
     try:
         server.serve_forever()
     finally:
+        if tracker is not None:
+            tracker.begin_shutdown()
         for signum, handler in previous_handlers.items():
             signal.signal(signum, handler)
         server.server_close()
+        if tracker is not None and not tracker.wait(shutdown_timeout):
+            logging.warning(
+                "graceful shutdown deadline expired with active inference"
+            )
         engine.close()
 
 
@@ -847,6 +940,12 @@ def main():
     parser.add_argument("--request-timeout", type=float, default=120)
     parser.add_argument("--queue-capacity", type=int, default=2)
     parser.add_argument("--rate-limit-per-minute", type=int, default=30)
+    parser.add_argument(
+        "--graceful-shutdown-timeout",
+        type=float,
+        default=130,
+        help="seconds to drain admitted inference before worker termination",
+    )
     parser.add_argument("--tls-cert", type=Path)
     parser.add_argument("--tls-key", type=Path)
     parser.add_argument(
@@ -880,6 +979,10 @@ def main():
         parser.error("--request-timeout must be positive")
     if args.queue_capacity < 0:
         parser.error("--queue-capacity cannot be negative")
+    if args.rate_limit_per_minute < 0:
+        parser.error("--rate-limit-per-minute cannot be negative")
+    if args.graceful_shutdown_timeout <= 0:
+        parser.error("--graceful-shutdown-timeout must be positive")
     if bool(args.tls_cert) != bool(args.tls_key):
         parser.error("--tls-cert and --tls-key must be provided together")
     if args.npu_percent is not None and not 0 <= args.npu_percent <= 100:
@@ -925,6 +1028,7 @@ def main():
         request_timeout=args.request_timeout,
         queue_capacity=args.queue_capacity,
         rate_limit_per_minute=args.rate_limit_per_minute,
+        graceful_shutdown_timeout=args.graceful_shutdown_timeout,
     )
     server = BoundedHTTPServer(
         (args.host, args.port),
