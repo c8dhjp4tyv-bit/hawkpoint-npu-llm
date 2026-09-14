@@ -469,7 +469,157 @@ def test_sampling_parameters_reach_the_decoder():
         stop_server(server, thread)
 
 
+
+def test_strict_request_types():
+    decoder = RecordingDecoder()
+    server, thread, base = start_server(
+        {"smollm2-135m-xdna1": decoder}, rate_limit_per_minute=0
+    )
+    try:
+        invalid = [
+            {"model": value} for value in ([], {}, 123, False, "")
+        ] + [
+            {"max_tokens": value} for value in (0, -1, True, 1.5, "5", None)
+        ] + [
+            {"stream": value} for value in ("false", 1, [], None)
+        ] + [
+            {"n": True}, {"n": 1.0},
+            {"messages": [{"role": [], "content": "Hello"}]},
+            {"stream_options": {"include_usage": True}},
+            {"stream": True, "stream_options": []},
+            {"stream": True, "stream_options": {"include_usage": "yes"}},
+            {"stream": True, "stream_options": {"unknown": True}},
+        ]
+        for fields in invalid:
+            status, body, _ = fetch(
+                f"{base}/v1/chat/completions", {**payload(), **fields}
+            )
+            assert status == 400, (fields, status, body)
+            assert json.loads(body)["error"]["type"] == "invalid_request_error"
+        assert decoder.calls == []
+        status, _, _ = fetch(f"{base}/v1/models", api_key="invalid-é")
+        assert status == 401
+        # Invalid clients must not leave the server unable to serve valid work.
+        assert fetch(f"{base}/v1/chat/completions", payload())[0] == 200
+    finally:
+        stop_server(server, thread)
+
+
+def test_stream_usage_and_errors():
+    server, thread, base = start_server({"smollm2-135m-xdna1": FakeDecoder()})
+    try:
+        for options in (None, {"include_usage": False}, {"include_usage": True}):
+            request = {**payload(), "stream": True}
+            if options is not None:
+                request["stream_options"] = options
+            status, body, _ = fetch(f"{base}/v1/chat/completions", request)
+            assert status == 200
+            frames = [line[6:] for line in body.splitlines() if line.startswith("data: ")]
+            assert frames[-1] == "[DONE]"
+            chunks = [json.loads(frame) for frame in frames[:-1]]
+            assert len({chunk["id"] for chunk in chunks}) == 1
+            if options and options["include_usage"]:
+                assert chunks[-1]["choices"] == []
+                assert chunks[-1]["usage"] == {
+                    "prompt_tokens": 4, "completion_tokens": 2, "total_tokens": 6
+                }
+                assert all(chunk["usage"] is None for chunk in chunks[:-1])
+                assert chunks[-2]["choices"][0]["finish_reason"] == "length"
+            else:
+                assert all("usage" not in chunk for chunk in chunks)
+    finally:
+        stop_server(server, thread)
+
+    server, thread, base = start_server({"smollm2-135m-xdna1": FailingDecoder()})
+    try:
+        status, body, _ = fetch(
+            f"{base}/v1/chat/completions", {**payload(), "stream": True}
+        )
+        assert status == 200  # Headers precede inference; the error is an SSE event.
+        assert '"type":"server_error"' in body
+        assert "secret internal detail" not in body
+        assert "[DONE]" not in body
+    finally:
+        stop_server(server, thread)
+
+
+class CleanupDecoder:
+    context_length = 64
+
+    def __init__(self):
+        self.closed = threading.Event()
+
+    def generate_messages(self, messages, max_new_tokens):
+        try:
+            time.sleep(0.08)
+            yield "late", None
+        finally:
+            self.closed.set()
+
+
+def test_timeout_closes_generation():
+    for stream in (False, True):
+        decoder = CleanupDecoder()
+        server, thread, base = start_server(
+            {"smollm2-135m-xdna1": decoder}, request_timeout=0.04
+        )
+        try:
+            status, body, _ = fetch(
+                f"{base}/v1/chat/completions", {**payload(), "stream": stream}
+            )
+            assert status == (200 if stream else 504)
+            assert "timeout_error" in body
+            assert "late" not in body
+            assert decoder.closed.wait(1)
+            assert "[DONE]" not in body
+        finally:
+            stop_server(server, thread)
+
+
+def test_body_read_timeout():
+    decoder = RecordingDecoder()
+    server, thread, base = start_server(
+        {"smollm2-135m-xdna1": decoder}, request_timeout=0.1
+    )
+    connection = HTTPConnection("127.0.0.1", server.server_port, timeout=2)
+    try:
+        connection.putrequest("POST", "/v1/chat/completions")
+        connection.putheader("Authorization", f"Bearer {API_KEY}")
+        connection.putheader("Content-Length", "100")
+        connection.endheaders()
+        connection.send(b"{")
+        response = connection.getresponse()
+        assert response.status == 408
+        assert json.loads(response.read())["error"]["type"] == "timeout_error"
+        assert decoder.calls == []
+    finally:
+        connection.close()
+        stop_server(server, thread)
+
+
+def test_cancelled_process_generation_recovers():
+    engine = ProcessCompletionEngine(
+        {"smollm2-135m-xdna1": FakeDecoder()}, decoder_factory=None, timeout=5
+    )
+    try:
+        generation = engine.generate("smollm2-135m-xdna1", payload()["messages"], 5)
+        assert next(generation)[0] == "Hello"
+        generation.close()
+        assert engine._process is None
+        assert not engine.ready
+        assert engine.worker_restarts == 1
+        recovered = list(engine.generate("smollm2-135m-xdna1", payload()["messages"], 5))
+        assert "".join(text for text, _ in recovered) == "Hello!"
+        assert engine.ready
+    finally:
+        engine.close()
+
 def main():
+    test_strict_request_types()
+    test_stream_usage_and_errors()
+    test_timeout_closes_generation()
+    test_body_read_timeout()
+    test_cancelled_process_generation_recovers()
     test_protocol_and_security()
     test_sampling_parameters_reach_the_decoder()
     test_backpressure_and_safe_errors()

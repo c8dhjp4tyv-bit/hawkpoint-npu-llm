@@ -255,7 +255,23 @@ curl http://localhost:8000/v1/chat/completions \
   }'
 ```
 
-For streaming output, set `"stream": true`.
+For streaming output, set `"stream": true`. Add
+`"stream_options": {"include_usage": true}` to receive a final chunk with
+`choices: []` and token counts in `usage`, immediately before `[DONE]`.
+Earlier chunks carry `usage: null` when this option is enabled. Without it,
+the existing streaming format is preserved.
+
+An inference failure after streaming headers produces a sanitized SSE `error`
+event (`server_error` or `timeout_error`) and closes the stream without a
+success `[DONE]` marker. Clients should treat a disconnected stream without
+`[DONE]` as incomplete; final usage is not guaranteed for interrupted requests.
+
+`max_tokens` must be a positive JSON integer (then capped to the hardware
+context), `n` must be integer `1`, and `stream` must be a JSON boolean.
+`stream_options` is only accepted with streaming enabled. Invalid types return
+`400` before inference admission. Header and body reads are also bounded by
+`--request-timeout`; a stalled body receives `408` when the connection remains
+writable. Inference timeouts return `504` for non-streaming requests.
 
 ### Sampling
 

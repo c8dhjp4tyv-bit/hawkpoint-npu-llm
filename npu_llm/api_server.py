@@ -3,6 +3,7 @@
 
 import argparse
 from collections import defaultdict, deque
+from contextlib import closing
 from dataclasses import dataclass
 import gc
 import hmac
@@ -44,7 +45,7 @@ def _validate_messages(value):
             raise ValueError("each message must be an object")
         role = item.get("role")
         content = item.get("content")
-        if role not in {"system", "user", "assistant"}:
+        if not isinstance(role, str) or role not in {"system", "user", "assistant"}:
             raise ValueError(f"unsupported message role: {role!r}")
         if not isinstance(content, str):
             raise ValueError("message content must be a string")
@@ -52,6 +53,42 @@ def _validate_messages(value):
             raise ValueError("message content exceeds 32768 characters")
         messages.append({"role": role, "content": content})
     return messages
+
+
+def _validate_completion_options(request):
+    """Validate protocol types before admitting any inference work."""
+    model = request.get("model")
+    if model is not None and (not isinstance(model, str) or not model):
+        raise ValueError("model must be a non-empty string")
+    requested = request.get("max_tokens", 16)
+    if type(requested) is not int or requested <= 0:
+        raise ValueError("max_tokens must be a positive integer")
+    if type(request.get("n", 1)) is not int or request.get("n", 1) != 1:
+        raise ValueError("only integer n=1 is supported")
+    stream = request.get("stream", False)
+    if type(stream) is not bool:
+        raise ValueError("stream must be a boolean")
+    options = request.get("stream_options")
+    if options is not None:
+        if not isinstance(options, dict):
+            raise ValueError("stream_options must be an object")
+        if not stream:
+            raise ValueError("stream_options requires stream=true")
+        if set(options) - {"include_usage"}:
+            raise ValueError("unsupported stream_options field")
+        if type(options.get("include_usage", False)) is not bool:
+            raise ValueError("stream_options.include_usage must be a boolean")
+    return requested, bool(options and options.get("include_usage"))
+
+
+def _usage(stats):
+    prompt = int(stats.get("prompt_tokens", 0))
+    completion = int(stats.get("generated_tokens", 0))
+    return {
+        "prompt_tokens": prompt,
+        "completion_tokens": completion,
+        "total_tokens": prompt + completion,
+    }
 
 
 @dataclass(frozen=True)
@@ -375,6 +412,11 @@ def make_handler(engine, config=None):
     class Handler(BaseHTTPRequestHandler):
         server_version = "HawkPointNPU/1.0"
 
+        def setup(self):
+            super().setup()
+            # Bound header/body reads too, before inference admission.
+            self.connection.settimeout(config.request_timeout)
+
         def log_message(self, fmt, *args):
             sys.stderr.write(
                 f"[{self.log_date_time_string()}] {self.address_string()} "
@@ -421,7 +463,7 @@ def make_handler(engine, config=None):
         def _authorized(self):
             supplied = self.headers.get("Authorization", "")
             expected = f"Bearer {config.api_key}"
-            if hmac.compare_digest(supplied, expected):
+            if hmac.compare_digest(supplied.encode("utf-8"), expected.encode("utf-8")):
                 return True
             self._error("missing or invalid bearer token", 401, "authentication_error")
             return False
@@ -486,6 +528,7 @@ def make_handler(engine, config=None):
                 request = json.loads(self.rfile.read(length))
                 if not isinstance(request, dict):
                     raise ValueError("request body must be a JSON object")
+                requested, include_usage = _validate_completion_options(request)
                 messages = _validate_messages(request.get("messages"))
                 model_id = request.get("model") or engine.default_model_id
                 if not engine.has_model(model_id):
@@ -495,18 +538,18 @@ def make_handler(engine, config=None):
                         "model_not_found",
                     )
                     return
-                requested = int(request.get("max_tokens", 16))
                 max_tokens = min(
-                    max(1, requested),
+                    requested,
                     engine.context_length(model_id) - 1,
                 )
-                if request.get("n", 1) != 1:
-                    raise ValueError("only n=1 is supported")
                 params = SamplingParams.from_request(request)
                 # A request that asks for nothing but the defaults keeps the
                 # original greedy call path, so decoders that predate sampling
                 # are still driven with their historical signature.
                 sampling = None if params == GREEDY else params.to_dict()
+            except (TimeoutError, socket.timeout):
+                self._error("request body timed out", 408, "timeout_error")
+                return
             except (ValueError, TypeError, json.JSONDecodeError) as exc:
                 self._error(exc)
                 return
@@ -518,7 +561,7 @@ def make_handler(engine, config=None):
             self._deadline = time.monotonic() + config.request_timeout
             try:
                 if request.get("stream", False):
-                    self._stream(model_id, messages, max_tokens, sampling)
+                    self._stream(model_id, messages, max_tokens, sampling, include_usage)
                 else:
                     self._complete(model_id, messages, max_tokens, sampling)
             finally:
@@ -528,18 +571,19 @@ def make_handler(engine, config=None):
             pieces = []
             stats = None
             try:
-                for text, final_stats in engine.generate(
+                with closing(engine.generate(
                     model_id,
                     messages,
                     max_tokens,
                     timeout=config.request_timeout,
                     sampling=sampling,
-                ):
-                    if time.monotonic() > self._deadline:
-                        raise TimeoutError
-                    pieces.append(text)
-                    if final_stats is not None:
-                        stats = final_stats
+                )) as generation:
+                    for text, final_stats in generation:
+                        if time.monotonic() > self._deadline:
+                            raise TimeoutError
+                        pieces.append(text)
+                        if final_stats is not None:
+                            stats = final_stats
             except (TimeoutError, socket.timeout):
                 self._error("inference request timed out", 504, "timeout_error")
                 return
@@ -548,8 +592,6 @@ def make_handler(engine, config=None):
                 self._error("internal inference error", 500, "server_error")
                 return
             stats = stats or {}
-            prompt_tokens = int(stats.get("prompt_tokens", 0))
-            completion_tokens = int(stats.get("generated_tokens", 0))
             finish_reason = stats.get("finish_reason", "stop")
             self._json(
                 {
@@ -567,21 +609,19 @@ def make_handler(engine, config=None):
                             "finish_reason": finish_reason,
                         }
                     ],
-                    "usage": {
-                        "prompt_tokens": prompt_tokens,
-                        "completion_tokens": completion_tokens,
-                        "total_tokens": prompt_tokens + completion_tokens,
-                    },
+                    "usage": _usage(stats),
                     "x_hawkpoint_stats": stats,
                 }
             )
 
-        def _stream(self, model_id, messages, max_tokens, sampling=None):
+        def _stream(self, model_id, messages, max_tokens, sampling=None, include_usage=False):
             completion_id = _completion_id()
             created = int(time.time())
             self._headers(200, "text/event-stream")
 
             def send(payload):
+                if include_usage and "choices" in payload:
+                    payload.setdefault("usage", None)
                 data = json.dumps(payload, separators=(",", ":"))
                 self.wfile.write(f"data: {data}\n\n".encode())
                 self.wfile.flush()
@@ -603,33 +643,34 @@ def make_handler(engine, config=None):
                     }
                 )
                 stats = None
-                for text, final_stats in engine.generate(
+                with closing(engine.generate(
                     model_id,
                     messages,
                     max_tokens,
                     timeout=config.request_timeout,
                     sampling=sampling,
-                ):
-                    if time.monotonic() > self._deadline:
-                        raise TimeoutError
-                    if text:
-                        send(
-                            {
-                                "id": completion_id,
-                                "object": "chat.completion.chunk",
-                                "created": created,
-                                "model": model_id,
-                                "choices": [
-                                    {
-                                        "index": 0,
-                                        "delta": {"content": text},
-                                        "finish_reason": None,
-                                    }
-                                ],
-                            }
-                        )
-                    if final_stats is not None:
-                        stats = final_stats
+                )) as generation:
+                    for text, final_stats in generation:
+                        if time.monotonic() > self._deadline:
+                            raise TimeoutError
+                        if text:
+                            send(
+                                {
+                                    "id": completion_id,
+                                    "object": "chat.completion.chunk",
+                                    "created": created,
+                                    "model": model_id,
+                                    "choices": [
+                                        {
+                                            "index": 0,
+                                            "delta": {"content": text},
+                                            "finish_reason": None,
+                                        }
+                                    ],
+                                }
+                            )
+                        if final_stats is not None:
+                            stats = final_stats
                 send(
                     {
                         "id": completion_id,
@@ -648,12 +689,29 @@ def make_handler(engine, config=None):
                         "x_hawkpoint_stats": stats or {},
                     }
                 )
+                if include_usage:
+                    send({
+                        "id": completion_id,
+                        "object": "chat.completion.chunk",
+                        "created": created,
+                        "model": model_id,
+                        "choices": [],
+                        "usage": _usage(stats or {}),
+                    })
                 self.wfile.write(b"data: [DONE]\n\n")
                 self.wfile.flush()
-            except (BrokenPipeError, ConnectionResetError, socket.timeout):
+            except (BrokenPipeError, ConnectionResetError):
                 pass
-            except Exception:
+            except Exception as exc:
                 logging.exception("streaming inference request failed")
+                timed_out = isinstance(exc, TimeoutError)
+                try:
+                    send({"error": {
+                        "message": "inference request timed out" if timed_out else "internal inference error",
+                        "type": "timeout_error" if timed_out else "server_error",
+                    }})
+                except (BrokenPipeError, ConnectionResetError, socket.timeout):
+                    pass
 
     return Handler
 

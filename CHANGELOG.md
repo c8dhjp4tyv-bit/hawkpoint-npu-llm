@@ -1,5 +1,17 @@
 # Changelog
 
+## Unreleased
+
+- Add opt-in streaming usage chunks via `stream_options.include_usage`.
+- Report sanitized SSE inference errors instead of silently ending streams.
+- Close generation iterators deterministically on timeout or failed writes.
+- Validate completion parameter types before inference admission and handle
+  non-ASCII invalid bearer tokens without crashing the request handler.
+- Apply socket deadlines before reading request headers and bodies, with a
+  structured `408` response for stalled request bodies.
+- Add offline HTTP and worker cancellation/recovery regression coverage.
+
+
 All notable changes are documented here. This project follows semantic
 versioning while its public API is experimental.
 
