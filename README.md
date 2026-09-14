@@ -279,6 +279,11 @@ Responses include a unique `X-Request-ID`, `Cache-Control: no-store`, and
 common reverse-proxy buffering with `X-Accel-Buffering: no`. Routes continue to
 work when clients append query parameters.
 
+Clients can retrieve one installed model with `GET /v1/models/{model_id}`.
+Rate-limit and full-queue `429` responses include `Retry-After`. SIGINT and
+SIGTERM trigger graceful HTTP shutdown and deterministic NPU worker cleanup,
+which is particularly important under systemd and container supervisors.
+
 ### Sampling
 
 Generation is greedy unless a request opts in. `temperature: 0` (the default)

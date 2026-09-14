@@ -13,6 +13,8 @@
 - Accept the modern `max_completion_tokens` alias, preserve routes with query
   parameters, and add request IDs plus no-cache/SSE proxy headers.
 - Periodically evict idle rate-limit buckets during long-running service.
+- Add single-model retrieval, actionable `Retry-After` headers, and graceful
+  SIGINT/SIGTERM shutdown with deterministic NPU worker cleanup.
 
 
 All notable changes are documented here. This project follows semantic

@@ -25,6 +25,7 @@ from npu_llm.api_server import (  # noqa: E402
     RateLimiter,
     ServerConfig,
     make_handler,
+    serve,
 )
 
 
@@ -227,6 +228,15 @@ def test_protocol_and_security():
         assert status == 200
         assert "Access-Control-Allow-Origin" not in headers
 
+        status, body, _ = fetch(
+            f"{base}/v1/models/smollm2-135m-xdna1?source=sdk"
+        )
+        assert status == 200
+        assert json.loads(body)["id"] == "smollm2-135m-xdna1"
+        status, body, _ = fetch(f"{base}/v1/models/not-installed")
+        assert status == 404
+        assert json.loads(body)["error"]["type"] == "model_not_found"
+
         status, body, _ = fetch(f"{base}/v1/chat/completions", payload())
         response = json.loads(body)
         assert status == 200
@@ -269,8 +279,11 @@ def test_backpressure_and_safe_errors():
             first = pool.submit(fetch, f"{base}/v1/chat/completions", payload())
             time.sleep(0.05)
             second = pool.submit(fetch, f"{base}/v1/chat/completions", payload())
-            statuses = {first.result()[0], second.result()[0]}
+            results = (first.result(), second.result())
+            statuses = {result[0] for result in results}
         assert statuses == {200, 429}
+        overloaded = next(result for result in results if result[0] == 429)
+        assert overloaded[2]["Retry-After"] == "1"
     finally:
         stop_server(server, thread)
 
@@ -550,6 +563,37 @@ def test_rate_limiter_evicts_idle_clients():
     assert "first" not in limiter._requests
 
 
+class ServeLifecycleEngine:
+    def __init__(self):
+        self.closed = False
+
+    def close(self):
+        self.closed = True
+
+
+def test_serve_closes_resources():
+    engine = ServeLifecycleEngine()
+    server = BoundedHTTPServer(
+        ("127.0.0.1", 0),
+        make_handler(
+            CompletionEngine({"smollm2-135m-xdna1": FakeDecoder()}),
+            ServerConfig(api_key=API_KEY),
+        ),
+    )
+    thread = threading.Thread(target=serve, args=(server, engine), daemon=True)
+    thread.start()
+    try:
+        status, _, _ = fetch(
+            f"http://127.0.0.1:{server.server_port}/health", api_key=None
+        )
+        assert status == 200
+    finally:
+        server.shutdown()
+        thread.join(timeout=5)
+    assert not thread.is_alive()
+    assert engine.closed
+
+
 def test_stream_usage_and_errors():
     server, thread, base = start_server({"smollm2-135m-xdna1": FakeDecoder()})
     try:
@@ -660,6 +704,7 @@ def test_cancelled_process_generation_recovers():
         engine.close()
 
 def main():
+    test_serve_closes_resources()
     test_modern_token_alias_routes_and_headers()
     test_rate_limiter_evicts_idle_clients()
     test_strict_request_types()

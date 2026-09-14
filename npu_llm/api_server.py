@@ -13,6 +13,7 @@ import logging
 import multiprocessing
 import os
 from pathlib import Path
+import signal
 import socket
 import ssl
 import sys
@@ -182,6 +183,18 @@ class CompletionEngine:
             for model_id, record in self.models.items()
         ]
 
+    def model_info(self, model_id):
+        if model_id not in self.models:
+            return None
+        record = self.models[model_id]
+        return {
+            "id": model_id,
+            "object": "model",
+            "created": 0,
+            "owned_by": "local",
+            "name": record.get("display_name", model_id),
+        }
+
     def has_model(self, model_id):
         return model_id in self.models
 
@@ -302,6 +315,9 @@ class ProcessCompletionEngine:
 
     def model_list(self):
         return CompletionEngine(self.models).model_list()
+
+    def model_info(self, model_id):
+        return CompletionEngine(self.models).model_info(model_id)
 
     def has_model(self, model_id):
         return model_id in self.models
@@ -470,17 +486,25 @@ def make_handler(engine, config=None):
             self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
             self.end_headers()
 
-        def _json(self, payload, status=200):
+        def _json(self, payload, status=200, extra_headers=None):
             body = json.dumps(payload).encode()
             self.send_response(status)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(body)))
             self._common_headers()
+            for name, value in (extra_headers or {}).items():
+                self.send_header(name, value)
             self._cors()
             self.end_headers()
             self.wfile.write(body)
 
-        def _error(self, message, status=400, error_type="invalid_request_error"):
+        def _error(
+            self,
+            message,
+            status=400,
+            error_type="invalid_request_error",
+            extra_headers=None,
+        ):
             self._json(
                 {
                     "error": {
@@ -489,6 +513,7 @@ def make_handler(engine, config=None):
                     }
                 },
                 status,
+                extra_headers,
             )
 
         def _authorized(self):
@@ -534,6 +559,20 @@ def make_handler(engine, config=None):
                     }
                 )
                 return
+            if path.startswith("/v1/models/"):
+                if not self._authorized():
+                    return
+                model_id = path.removeprefix("/v1/models/")
+                model = engine.model_info(model_id)
+                if model is None:
+                    self._error(
+                        f"model {model_id!r} is not installed",
+                        404,
+                        "model_not_found",
+                    )
+                    return
+                self._json(model)
+                return
             self._error("not found", 404)
 
         def do_POST(self):
@@ -544,7 +583,12 @@ def make_handler(engine, config=None):
                 return
             client = self.client_address[0]
             if not limiter.allow(client):
-                self._error("rate limit exceeded", 429, "rate_limit_error")
+                self._error(
+                    "rate limit exceeded",
+                    429,
+                    "rate_limit_error",
+                    {"Retry-After": "60"},
+                )
                 return
             try:
                 raw_length = self.headers.get("Content-Length")
@@ -587,7 +631,12 @@ def make_handler(engine, config=None):
                 return
 
             if not slots.acquire(blocking=False):
-                self._error("NPU request queue is full", 429, "server_overloaded")
+                self._error(
+                    "NPU request queue is full",
+                    429,
+                    "server_overloaded",
+                    {"Retry-After": "1"},
+                )
                 return
             self.connection.settimeout(config.request_timeout)
             self._deadline = time.monotonic() + config.request_timeout
@@ -753,6 +802,30 @@ class BoundedHTTPServer(ThreadingHTTPServer):
     request_queue_size = 16
 
 
+def serve(server, engine):
+    """Serve until interrupted and release HTTP plus NPU resources cleanly."""
+    previous_handlers = {}
+
+    def request_shutdown(signum, frame):
+        # shutdown() must run outside serve_forever()'s thread.
+        threading.Thread(
+            target=server.shutdown,
+            daemon=True,
+            name="hawkpoint-api-shutdown",
+        ).start()
+
+    if threading.current_thread() is threading.main_thread():
+        for signum in (signal.SIGINT, signal.SIGTERM):
+            previous_handlers[signum] = signal.signal(signum, request_shutdown)
+    try:
+        server.serve_forever()
+    finally:
+        for signum, handler in previous_handlers.items():
+            signal.signal(signum, handler)
+        server.server_close()
+        engine.close()
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Serve SmolLM2 on an AMD Hawk Point NPU"
@@ -865,13 +938,7 @@ def main():
         scheme = "https"
     print("Installed models: " + ", ".join(models), flush=True)
     print(f"OpenAI-compatible API: {scheme}://{args.host}:{args.port}/v1", flush=True)
-    try:
-        server.serve_forever()
-    except KeyboardInterrupt:
-        pass
-    finally:
-        server.server_close()
-        engine.close()
+    serve(server, engine)
 
 
 if __name__ == "__main__":
