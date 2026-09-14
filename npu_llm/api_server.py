@@ -19,6 +19,7 @@ import sys
 import threading
 import time
 import uuid
+from urllib.parse import urlsplit
 
 
 ROOT = Path(__file__).resolve().parent
@@ -60,9 +61,18 @@ def _validate_completion_options(request):
     model = request.get("model")
     if model is not None and (not isinstance(model, str) or not model):
         raise ValueError("model must be a non-empty string")
-    requested = request.get("max_tokens", 16)
+    if "max_tokens" in request and "max_completion_tokens" in request:
+        raise ValueError(
+            "max_tokens and max_completion_tokens are mutually exclusive"
+        )
+    token_field = (
+        "max_completion_tokens"
+        if "max_completion_tokens" in request
+        else "max_tokens"
+    )
+    requested = request.get(token_field, 16)
     if type(requested) is not int or requested <= 0:
-        raise ValueError("max_tokens must be a positive integer")
+        raise ValueError(f"{token_field} must be a positive integer")
     if type(request.get("n", 1)) is not int or request.get("n", 1) != 1:
         raise ValueError("only integer n=1 is supported")
     stream = request.get("stream", False)
@@ -105,16 +115,27 @@ class ServerConfig:
 
 
 class RateLimiter:
-    def __init__(self, requests_per_minute):
+    def __init__(self, requests_per_minute, clock=time.monotonic):
         self.limit = requests_per_minute
+        self._clock = clock
         self._requests = defaultdict(deque)
         self._lock = threading.Lock()
+        self._next_cleanup = 0.0
 
     def allow(self, client):
         if self.limit <= 0:
             return True
-        now = time.monotonic()
+        now = self._clock()
         with self._lock:
+            if now >= self._next_cleanup:
+                stale = [
+                    key
+                    for key, entries in self._requests.items()
+                    if not entries or now - entries[-1] >= 60
+                ]
+                for key in stale:
+                    del self._requests[key]
+                self._next_cleanup = now + 60
             history = self._requests[client]
             while history and now - history[0] >= 60:
                 history.popleft()
@@ -414,6 +435,7 @@ def make_handler(engine, config=None):
 
         def setup(self):
             super().setup()
+            self.request_id = f"req-{uuid.uuid4().hex}"
             # Bound header/body reads too, before inference admission.
             self.connection.settimeout(config.request_timeout)
 
@@ -429,9 +451,17 @@ def make_handler(engine, config=None):
                 self.send_header("Access-Control-Allow-Origin", origin)
                 self.send_header("Vary", "Origin")
 
+        def _common_headers(self):
+            self.send_header("X-Request-ID", self.request_id)
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.send_header("Cache-Control", "no-store")
+
         def _headers(self, status=200, content_type="application/json"):
             self.send_response(status)
             self.send_header("Content-Type", content_type)
+            self._common_headers()
+            if content_type == "text/event-stream":
+                self.send_header("X-Accel-Buffering", "no")
             self._cors()
             self.send_header(
                 "Access-Control-Allow-Headers",
@@ -445,6 +475,7 @@ def make_handler(engine, config=None):
             self.send_response(status)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(body)))
+            self._common_headers()
             self._cors()
             self.end_headers()
             self.wfile.write(body)
@@ -472,7 +503,8 @@ def make_handler(engine, config=None):
             self._headers(204)
 
         def do_GET(self):
-            if self.path.rstrip("/") == "/health":
+            path = urlsplit(self.path).path.rstrip("/")
+            if path == "/health":
                 self._json(
                     {
                         "status": "ok",
@@ -480,7 +512,7 @@ def make_handler(engine, config=None):
                     }
                 )
                 return
-            if self.path.rstrip("/") == "/ready":
+            if path == "/ready":
                 ready = engine.ready
                 self._json(
                     {
@@ -492,7 +524,7 @@ def make_handler(engine, config=None):
                     200 if ready else 503,
                 )
                 return
-            if self.path.rstrip("/") == "/v1/models":
+            if path == "/v1/models":
                 if not self._authorized():
                     return
                 self._json(
@@ -505,7 +537,7 @@ def make_handler(engine, config=None):
             self._error("not found", 404)
 
         def do_POST(self):
-            if self.path.rstrip("/") != "/v1/chat/completions":
+            if urlsplit(self.path).path.rstrip("/") != "/v1/chat/completions":
                 self._error("not found", 404)
                 return
             if not self._authorized():

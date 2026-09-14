@@ -22,6 +22,7 @@ from npu_llm.api_server import (  # noqa: E402
     CompletionEngine,
     InferenceTimeout,
     ProcessCompletionEngine,
+    RateLimiter,
     ServerConfig,
     make_handler,
 )
@@ -481,9 +482,13 @@ def test_strict_request_types():
         ] + [
             {"max_tokens": value} for value in (0, -1, True, 1.5, "5", None)
         ] + [
+            {"max_completion_tokens": value}
+            for value in (0, -1, True, 1.5, "5", None)
+        ] + [
             {"stream": value} for value in ("false", 1, [], None)
         ] + [
             {"n": True}, {"n": 1.0},
+            {"max_tokens": 5, "max_completion_tokens": 5},
             {"messages": [{"role": [], "content": "Hello"}]},
             {"stream_options": {"include_usage": True}},
             {"stream": True, "stream_options": []},
@@ -503,6 +508,46 @@ def test_strict_request_types():
         assert fetch(f"{base}/v1/chat/completions", payload())[0] == 200
     finally:
         stop_server(server, thread)
+
+
+def test_modern_token_alias_routes_and_headers():
+    decoder = RecordingDecoder()
+    server, thread, base = start_server({"smollm2-135m-xdna1": decoder})
+    try:
+        request = payload()
+        del request["max_tokens"]
+        request["max_completion_tokens"] = 5
+        status, _, headers = fetch(
+            f"{base}/v1/chat/completions?client=test", request
+        )
+        assert status == 200
+        assert headers["X-Request-ID"].startswith("req-")
+        assert headers["X-Content-Type-Options"] == "nosniff"
+        assert headers["Cache-Control"] == "no-store"
+
+        status, _, model_headers = fetch(f"{base}/v1/models?limit=1")
+        assert status == 200
+        assert model_headers["X-Request-ID"].startswith("req-")
+        assert model_headers["X-Request-ID"] != headers["X-Request-ID"]
+
+        request["stream"] = True
+        status, _, stream_headers = fetch(
+            f"{base}/v1/chat/completions?client=test", request
+        )
+        assert status == 200
+        assert stream_headers["X-Accel-Buffering"] == "no"
+    finally:
+        stop_server(server, thread)
+
+
+def test_rate_limiter_evicts_idle_clients():
+    now = [0.0]
+    limiter = RateLimiter(1, clock=lambda: now[0])
+    assert limiter.allow("first")
+    assert not limiter.allow("first")
+    now[0] = 61.0
+    assert limiter.allow("second")
+    assert "first" not in limiter._requests
 
 
 def test_stream_usage_and_errors():
@@ -615,6 +660,8 @@ def test_cancelled_process_generation_recovers():
         engine.close()
 
 def main():
+    test_modern_token_alias_routes_and_headers()
+    test_rate_limiter_evicts_idle_clients()
     test_strict_request_types()
     test_stream_usage_and_errors()
     test_timeout_closes_generation()

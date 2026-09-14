@@ -266,12 +266,18 @@ event (`server_error` or `timeout_error`) and closes the stream without a
 success `[DONE]` marker. Clients should treat a disconnected stream without
 `[DONE]` as incomplete; final usage is not guaranteed for interrupted requests.
 
-`max_tokens` must be a positive JSON integer (then capped to the hardware
-context), `n` must be integer `1`, and `stream` must be a JSON boolean.
+`max_tokens` or its modern alias `max_completion_tokens` must be a positive
+JSON integer (then capped to the hardware context); supplying both is rejected.
+`n` must be integer `1`, and `stream` must be a JSON boolean.
 `stream_options` is only accepted with streaming enabled. Invalid types return
 `400` before inference admission. Header and body reads are also bounded by
 `--request-timeout`; a stalled body receives `408` when the connection remains
 writable. Inference timeouts return `504` for non-streaming requests.
+
+Responses include a unique `X-Request-ID`, `Cache-Control: no-store`, and
+`X-Content-Type-Options: nosniff`. Streaming responses additionally disable
+common reverse-proxy buffering with `X-Accel-Buffering: no`. Routes continue to
+work when clients append query parameters.
 
 ### Sampling
 

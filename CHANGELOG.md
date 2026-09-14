@@ -10,6 +10,9 @@
 - Apply socket deadlines before reading request headers and bodies, with a
   structured `408` response for stalled request bodies.
 - Add offline HTTP and worker cancellation/recovery regression coverage.
+- Accept the modern `max_completion_tokens` alias, preserve routes with query
+  parameters, and add request IDs plus no-cache/SSE proxy headers.
+- Periodically evict idle rate-limit buckets during long-running service.
 
 
 All notable changes are documented here. This project follows semantic
