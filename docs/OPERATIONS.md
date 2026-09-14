@@ -93,7 +93,10 @@ A public release should not be described as validated unless all are true:
 
 1. Hosted CI passes from the exact candidate commit.
 2. The tag-triggered physical Hawk Point gate passes fresh model conversion,
-   correctness, switching, endurance, and Ollama rollback checks.
+   correctness, switching, quick acceptance, and Ollama rollback checks.
+   The quick loops use 100 native plus 4 × 25 Ollama requests. Long endurance
+   is optional via a manual `Gated release` run with `profile: endurance`;
+   do not claim long-duration stability from quick evidence.
 3. The publish job produces its SBOM, signatures, provenance, and GitHub
    Release from that same dependency chain.
 4. Compatibility changes, known limitations, and measured results are updated

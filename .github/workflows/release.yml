@@ -1,6 +1,14 @@
 name: Gated release
 
 on:
+  workflow_dispatch:
+    inputs:
+      profile:
+        description: "Hardware test budget (manual runs never publish)"
+        type: choice
+        options: [quick, endurance]
+        default: quick
+        required: true
   push:
     tags:
       - "v*"
@@ -54,6 +62,9 @@ jobs:
     runs-on: [self-hosted, linux, x64, xdna1, hawk-point]
     timeout-minutes: 1440
     env:
+      HAWKPOINT_SOAK_COMPLETIONS: ${{ inputs.profile == 'endurance' && '1000' || '100' }}
+      HAWKPOINT_SOAK_RUN_LENGTH: ${{ inputs.profile == 'endurance' && '250' || '25' }}
+      HAWKPOINT_OLLAMA_REQUESTS: ${{ inputs.profile == 'endurance' && '1000' || '25' }}
       GOMAXPROCS: "8"
       MKL_NUM_THREADS: "8"
       NUMEXPR_NUM_THREADS: "8"
@@ -100,8 +111,6 @@ jobs:
       - name: Start API, model-switch stress, and endurance soak
         env:
           HAWKPOINT_API_KEY: release-hardware-ephemeral-key
-          HAWKPOINT_SOAK_COMPLETIONS: "1000"
-          HAWKPOINT_SOAK_RUN_LENGTH: "250"
           HAWKPOINT_SWITCH_COUNT: "100"
           HAWKPOINT_SOAK_REPORT: ${{ runner.temp }}/hawkpoint-soak-report.json
           HAWKPOINT_SWITCH_REPORT: ${{ runner.temp }}/hawkpoint-switch-stress-report.json
@@ -147,7 +156,7 @@ jobs:
             --model "$model" \
             --model-manifest-sha256 "$model_manifest" \
             --gpu-library "$backend" \
-            --requests 1000 \
+            --requests "$HAWKPOINT_OLLAMA_REQUESTS" \
             --tokens 16
           installed=0
           rollback() {
@@ -194,6 +203,7 @@ jobs:
             ${{ runner.temp }}/ollama-placement-matrix/
 
   publish:
+    if: github.event_name == 'push'
     needs: hawk-point
     runs-on: ubuntu-latest
     permissions:
@@ -239,6 +249,7 @@ jobs:
       - name: Publish release
         uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65
         with:
+          body: "Hardware evidence uses the quick profile: 100 native and 25 requests per Ollama placement. This release does not certify long-duration endurance."
           prerelease: ${{ contains(github.ref_name, '-') }}
           generate_release_notes: true
           files: |

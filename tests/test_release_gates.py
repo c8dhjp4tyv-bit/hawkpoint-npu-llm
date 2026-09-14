@@ -7,6 +7,8 @@ from pathlib import Path
 import re
 import sys
 import tempfile
+import subprocess
+import os
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -141,6 +143,25 @@ def test_hardware_workflows_use_the_intended_validation_mode():
     assert "--strict-release" not in compatibility_workflow
 
 
+def test_native_quick_budget_covers_all_models():
+    # Load script defaults in a fresh process without an NPU or API server.
+    environment = dict(os.environ, HAWKPOINT_API_KEY="offline-test")
+    environment.pop("HAWKPOINT_SOAK_COMPLETIONS", None)
+    environment.pop("HAWKPOINT_SOAK_RUN_LENGTH", None)
+    code = """
+from collections import Counter
+import soak_api
+models = ['a', 'b', 'c', 'd']
+counts = Counter(soak_api.model_for(i, models)
+                 for i in range(soak_api.COMPLETIONS))
+assert counts == dict.fromkeys(models, 25), counts
+"""
+    subprocess.run(
+        [sys.executable, "-c", code], cwd=ROOT / "tests",
+        env=environment, check=True,
+    )
+
+
 def test_manifest_digest():
     manifest = {
         "schemaVersion": 2,
@@ -186,6 +207,7 @@ def test_placement_matrix_exercises_xdna_without_cuda():
 
 
 def main():
+    test_native_quick_budget_covers_all_models()
     test_release_pins()
     test_manifest_digest()
     test_cross_placement_agreement()

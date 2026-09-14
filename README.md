@@ -436,10 +436,17 @@ python npu_llm/tests/validate_chat_npu.py
 
 The tag-triggered release pipeline performs fresh pinned downloads and
 conversion, Qwen token agreement, a bounded model-switch stress test of at
-least 100 switches, a 1,000-completion endurance soak of 250 consecutive
-requests per model, and an Ollama install/inference/rollback test with
+least 100 switches, a quick soak of 100 completions (25 consecutive per
+model), and an Ollama install/inference/rollback test with
 `--jobs 8` before its publish job can start. See [SUPPORT.md](SUPPORT.md) for the gate and
 [BENCHMARKS.md](BENCHMARKS.md) for the controlled comparison protocol.
+The Ollama matrix uses 25 measured requests per placement (100 total), so the
+two quick loops total 200 measured requests. Warm-up, correctness checks,
+100 model switches, downloads, and builds are additional work.
+For optional long-duration testing, manually run **Gated release** with
+`profile: endurance` (1,000 native plus 4 × 1,000 Ollama requests).
+Manual runs never publish a release. Tags use the quick profile, whose
+success does not establish long-duration endurance.
 `release-pins.json` is the machine-readable authority for the Ollama source tag
 and commit, Ollama model manifest, and the hardware/software stack used for
 release certification. It is not an exact kernel requirement for every runtime;

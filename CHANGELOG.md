@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Default hardware acceptance to 100 native requests (25 per model) and
+  25 per Ollama placement. Keep the 1,000-request budgets available through
+  an explicit manual `endurance` profile; manual release-workflow runs never
+  publish. Reports and release notes distinguish quick from endurance evidence.
+
 - Add opt-in streaming usage chunks via `stream_options.include_usage`.
 - Report sanitized SSE inference errors instead of silently ending streams.
 - Close generation iterators deterministically on timeout or failed writes.

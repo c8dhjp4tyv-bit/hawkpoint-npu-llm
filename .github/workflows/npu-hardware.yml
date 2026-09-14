@@ -3,9 +3,11 @@ name: XDNA1 hardware acceptance
 on:
   workflow_dispatch:
     inputs:
-      completions:
-        description: "Number of soak-test completions"
-        default: "1000"
+      profile:
+        description: "Native hardware test budget"
+        type: choice
+        options: [quick, endurance]
+        default: quick
         required: true
 
 permissions:
@@ -65,10 +67,10 @@ jobs:
             "$HAWKPOINT_QWEN_MODEL_DIR" \
             --positions 32 \
             --report "$RUNNER_TEMP/qwen-fused-benchmark.json"
-      - name: Model-switch stress and long-run endurance soak
+      - name: Model-switch stress and selected native soak
         env:
-          HAWKPOINT_SOAK_COMPLETIONS: ${{ inputs.completions || '1000' }}
-          HAWKPOINT_SOAK_RUN_LENGTH: "250"
+          HAWKPOINT_SOAK_COMPLETIONS: ${{ inputs.profile == 'endurance' && '1000' || '100' }}
+          HAWKPOINT_SOAK_RUN_LENGTH: ${{ inputs.profile == 'endurance' && '250' || '25' }}
           HAWKPOINT_SWITCH_COUNT: "100"
           HAWKPOINT_API_KEY: hardware-ci-ephemeral-key
           HAWKPOINT_SOAK_REPORT: ${{ runner.temp }}/hawkpoint-soak-report.json

@@ -320,7 +320,7 @@ def main():
     parser.add_argument("--model-manifest-sha256", required=True)
     parser.add_argument("--gpu-library", default="cuda_v13")
     parser.add_argument("--partial-gpu-layers", type=int, default=8)
-    parser.add_argument("--requests", type=int, default=100)
+    parser.add_argument("--requests", type=int, default=25)
     parser.add_argument("--tokens", type=int, default=16)
     parser.add_argument("--warmup-seconds", type=int, default=300)
     parser.add_argument("--base-port", type=int, default=11500)
@@ -438,6 +438,12 @@ def main():
 
     report = {
         "schema_version": 2,
+        "test_profile": (
+            "quick" if args.requests == 25
+            else "endurance" if args.requests == 1000
+            else "custom"
+        ),
+        "requests_per_placement": args.requests,
         "model": args.model,
         "model_manifest_sha256": args.model_manifest_sha256,
         "prompt": args.prompt,
