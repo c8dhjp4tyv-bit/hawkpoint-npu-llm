@@ -47,6 +47,7 @@ def model_for(index, models):
 
 
 def main():
+    """Run the selected per-model budget and fail on request or kernel errors."""
     expected = load_expected()
     models = installed_models(expected)
 

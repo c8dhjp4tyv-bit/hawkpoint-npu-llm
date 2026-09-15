@@ -80,7 +80,10 @@ timeouts. Do not infer capacity from the component smoke benchmark.
 Send SIGTERM once. The server immediately becomes unready, rejects new
 completions with `503`, drains admitted work, closes HTTP sockets, and releases
 the worker's XRT context. Let the configured graceful timeout expire before a
-service manager sends SIGKILL.
+service manager sends SIGKILL. After the drain deadline, active inference is
+cancelled independently of its generation lock. Worker teardown can take up
+to two additional five-second terminate/kill waits, so allow that cleanup
+margin in the supervisor timeout.
 
 After a timeout or inference error, the failed worker is discarded. The next
 request starts a fresh worker; readiness stays false until a request or prewarm

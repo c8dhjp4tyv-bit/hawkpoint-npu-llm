@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Fix shutdown past the drain deadline by cancelling the worker independently
+  of the generation lock; prevent queued work from restarting a closed engine.
+- Check quick-test model coverage against the real checkpoint catalog.
+
 - Default hardware acceptance to 100 native requests (25 per model) and
   25 per Ollama placement. Keep the 1,000-request budgets available through
   an explicit manual `endurance` profile; manual release-workflow runs never

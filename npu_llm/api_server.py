@@ -35,10 +35,12 @@ from runtime.sampling import GREEDY, SamplingParams  # noqa: E402
 
 
 def _completion_id():
+    """Create an opaque identifier for one chat completion."""
     return f"chatcmpl-{uuid.uuid4().hex}"
 
 
 def _validate_messages(value):
+    """Validate supported roles and bounded text-only message content."""
     if not isinstance(value, list) or not value:
         raise ValueError("messages must be a non-empty array")
     messages = []
@@ -93,6 +95,7 @@ def _validate_completion_options(request):
 
 
 def _usage(stats):
+    """Translate decoder token counts into the OpenAI usage structure."""
     prompt = int(stats.get("prompt_tokens", 0))
     completion = int(stats.get("generated_tokens", 0))
     return {
@@ -120,21 +123,25 @@ class InferenceTracker:
     """Reject new inference during shutdown and wait for admitted work."""
 
     def __init__(self):
+        """Initialize atomic admission and drain coordination."""
         self._active = 0
         self._draining = False
         self._condition = threading.Condition()
 
     @property
     def draining(self):
+        """Return whether new inference admission has been disabled."""
         with self._condition:
             return self._draining
 
     @property
     def active(self):
+        """Return the number of admitted requests, including queued work."""
         with self._condition:
             return self._active
 
     def try_enter(self):
+        """Atomically admit a request unless shutdown has begun."""
         with self._condition:
             if self._draining:
                 return False
@@ -142,6 +149,7 @@ class InferenceTracker:
             return True
 
     def leave(self):
+        """Release one admission and notify drain waiters when all work ends."""
         with self._condition:
             if self._active <= 0:
                 raise RuntimeError("inference tracker leave without enter")
@@ -150,11 +158,13 @@ class InferenceTracker:
                 self._condition.notify_all()
 
     def begin_shutdown(self):
+        """Permanently disable new admission and notify drain waiters."""
         with self._condition:
             self._draining = True
             self._condition.notify_all()
 
     def wait(self, timeout):
+        """Wait up to timeout seconds for all admitted inference to finish."""
         deadline = time.monotonic() + timeout
         with self._condition:
             while self._active:
@@ -167,6 +177,7 @@ class InferenceTracker:
 
 class RateLimiter:
     def __init__(self, requests_per_minute, clock=time.monotonic):
+        """Initialize client histories and an injectable monotonic clock."""
         self.limit = requests_per_minute
         self._clock = clock
         self._requests = defaultdict(deque)
@@ -174,6 +185,7 @@ class RateLimiter:
         self._next_cleanup = 0.0
 
     def allow(self, client):
+        """Apply a rolling one-minute client limit and periodically prune idle clients."""
         if self.limit <= 0:
             return True
         now = self._clock()
@@ -200,6 +212,7 @@ class CompletionEngine:
     """Lazily load selected models and serialize access to one physical NPU."""
 
     def __init__(self, models, decoder_factory=None):
+        """Normalize installed model records and initialize serialized decoder ownership."""
         if not models:
             raise ValueError("no converted models were found")
         self.models = {}
@@ -222,6 +235,7 @@ class CompletionEngine:
         self.lock = threading.Lock()
 
     def model_list(self):
+        """Return OpenAI-compatible metadata for every installed model."""
         return [
             {
                 "id": model_id,
@@ -234,6 +248,7 @@ class CompletionEngine:
         ]
 
     def model_info(self, model_id):
+        """Return metadata for one installed model, or None if absent."""
         if model_id not in self.models:
             return None
         record = self.models[model_id]
@@ -246,9 +261,11 @@ class CompletionEngine:
         }
 
     def has_model(self, model_id):
+        """Check whether the requested model is present in the catalog."""
         return model_id in self.models
 
     def context_length(self, model_id):
+        """Return the configured model context length, defaulting to 64."""
         return int(self.models[model_id].get("context_length", 64))
 
     def _close_active(self):
@@ -269,6 +286,7 @@ class CompletionEngine:
         gc.collect()
 
     def _load(self, model_id):
+        """Reuse the active decoder or close it before loading and warming another."""
         record = self.models[model_id]
         if "decoder" in record:
             return record["decoder"]
@@ -292,14 +310,17 @@ class CompletionEngine:
         self._close_active()
 
     def prewarm_default(self):
+        """Load and warm the default model before admitting normal traffic."""
         with self.lock:
             self._load(self.default_model_id)
 
     @property
     def ready(self):
+        """Report readiness for the in-process test engine."""
         return True
 
     def generate(self, model_id, messages, max_tokens, timeout=None, sampling=None):
+        """Serialize model inference and yield text chunks with final statistics."""
         with self.lock:
             decoder = self._load(model_id)
             if sampling is None:
@@ -315,6 +336,7 @@ class InferenceTimeout(TimeoutError):
 
 
 def _worker_loop(models, decoder_factory, connection):
+    """Serve parent commands and release decoder resources on worker exit."""
     engine = CompletionEngine(models, decoder_factory=decoder_factory)
     try:
         while True:
@@ -351,6 +373,7 @@ class ProcessCompletionEngine:
     """Run the NPU/XRT context in a killable, restartable worker process."""
 
     def __init__(self, models, decoder_factory, timeout=120):
+        """Initialize the spawn context and independent generation/lifecycle locks."""
         catalog = CompletionEngine(models, decoder_factory=decoder_factory)
         self.models = catalog.models
         self.default_model_id = catalog.default_model_id
@@ -362,24 +385,44 @@ class ProcessCompletionEngine:
         self._lock = threading.Lock()
         self._ready = False
         self.worker_restarts = 0
+        # Worker ownership must be independent of the lock held across yields.
+        self._lifecycle_lock = threading.RLock()
+        self._closed = False
 
     def model_list(self):
+        """Return OpenAI-compatible metadata for every installed model."""
         return CompletionEngine(self.models).model_list()
 
     def model_info(self, model_id):
+        """Return metadata for one installed model, or None if absent."""
         return CompletionEngine(self.models).model_info(model_id)
 
     def has_model(self, model_id):
+        """Check whether the requested model is present in the catalog."""
         return model_id in self.models
 
     def context_length(self, model_id):
+        """Return the configured model context length, defaulting to 64."""
         return int(self.models[model_id].get("context_length", 64))
 
     @property
     def ready(self):
-        return self._ready and self._process is not None and self._process.is_alive()
+        """Return readiness without racing worker teardown."""
+        with self._lifecycle_lock:
+            return (
+                not self._closed and self._ready
+                and self._process is not None and self._process.is_alive()
+            )
 
     def _start(self):
+        """Start a worker unless shutdown has permanently closed this engine."""
+        with self._lifecycle_lock:
+            if self._closed:
+                raise RuntimeError("inference engine is closed")
+            self._start_locked()
+
+    def _start_locked(self):
+        """Create worker and pipe while holding lifecycle ownership."""
         if self._process is not None and self._process.is_alive():
             return
         parent, child = self._context.Pipe()
@@ -395,6 +438,12 @@ class ProcessCompletionEngine:
         self._ready = False
 
     def _terminate(self, count_restart=True):
+        """Serialize worker disposal against cancellation and startup."""
+        with self._lifecycle_lock:
+            self._terminate_locked(count_restart and not self._closed)
+
+    def _terminate_locked(self, count_restart):
+        """Dispose the worker with bounded terminate/kill waits."""
         self._ready = False
         if self._connection is not None:
             self._connection.close()
@@ -412,20 +461,26 @@ class ProcessCompletionEngine:
             self.worker_restarts += 1
 
     def _receive(self, deadline):
+        """Wait on a stable pipe reference and normalize cancellation errors."""
         remaining = deadline - time.monotonic()
-        if remaining <= 0 or not self._connection.poll(remaining):
-            self._terminate()
-            raise InferenceTimeout("inference worker exceeded its deadline")
+        connection = self._connection
+        if connection is None:
+            raise RuntimeError("inference engine is closed")
         try:
-            return self._connection.recv()
-        except (EOFError, BrokenPipeError) as exc:
+            if remaining <= 0 or not connection.poll(remaining):
+                self._terminate()
+                raise InferenceTimeout("inference worker exceeded its deadline")
+            return connection.recv()
+        except InferenceTimeout:
+            raise
+        except (EOFError, OSError, ValueError) as exc:
             self._terminate()
             raise RuntimeError("inference worker exited unexpectedly") from exc
 
     def prewarm_default(self):
+        """Load and warm the default model before admitting normal traffic."""
         with self._lock:
-            self._start()
-            self._connection.send({"op": "prewarm"})
+            self._send_command({"op": "prewarm"})
             kind, _ = self._receive(time.monotonic() + self.timeout)
             if kind != "done":
                 self._terminate()
@@ -433,10 +488,10 @@ class ProcessCompletionEngine:
             self._ready = True
 
     def generate(self, model_id, messages, max_tokens, timeout=None, sampling=None):
+        """Serialize model inference and yield text chunks with final statistics."""
         deadline = time.monotonic() + (timeout or self.timeout)
         with self._lock:
-            self._start()
-            self._connection.send(
+            self._send_command(
                 {
                     "op": "generate",
                     "model": model_id,
@@ -462,7 +517,14 @@ class ProcessCompletionEngine:
                 self._terminate()
                 raise
 
+    def _send_command(self, command):
+        """Start and dispatch atomically against permanent engine cancellation."""
+        with self._lifecycle_lock:
+            self._start()
+            self._connection.send(command)
+
     def close(self):
+        """Close an idle engine; use abort when the drain deadline expires."""
         with self._lock:
             if self._process is None:
                 return
@@ -474,6 +536,17 @@ class ProcessCompletionEngine:
             finally:
                 self._terminate(count_restart=False)
 
+    def abort(self):
+        """Cancel inference without waiting for its generation lock.
+
+        Closing is permanent so already queued calls cannot recreate a worker.
+        Lifecycle locking keeps pipe/process disposal single-owner; cleanup
+        uses at most the existing two five-second process waits.
+        """
+        with self._lifecycle_lock:
+            self._closed = True
+            self._terminate_locked(count_restart=False)
+
 
 @dataclass(frozen=True)
 class NPUDecoderFactory:
@@ -481,6 +554,7 @@ class NPUDecoderFactory:
     npu_percent: float | None = None
 
     def __call__(self, path):
+        """Construct an NPU decoder with the selected layer-offload configuration."""
         from runtime.generate import NPUDecoder
 
         metadata = json.loads((Path(path) / "metadata.json").read_text())
@@ -492,6 +566,7 @@ class NPUDecoderFactory:
 
 
 def make_handler(engine, config=None):
+    """Build handlers sharing authentication, admission, and drain state."""
     config = config or ServerConfig(api_key="test-only")
     slots = threading.BoundedSemaphore(config.queue_capacity + 1)
     limiter = RateLimiter(config.rate_limit_per_minute)
@@ -503,12 +578,14 @@ def make_handler(engine, config=None):
         server_config = config
 
         def setup(self):
+            """Initialize request identity and apply the socket idle timeout."""
             super().setup()
             self.request_id = f"req-{uuid.uuid4().hex}"
             # Bound header/body reads too, before inference admission.
             self.connection.settimeout(config.request_timeout)
 
         def log_message(self, fmt, *args):
+            """Write an access-log entry correlated with the response request ID."""
             sys.stderr.write(
                 f"[{self.log_date_time_string()}] {self.request_id} "
                 f"{self.address_string()} "
@@ -516,12 +593,14 @@ def make_handler(engine, config=None):
             )
 
         def _cors(self):
+            """Allow browser access only for an explicitly configured origin."""
             origin = self.headers.get("Origin")
             if origin and origin in config.cors_origins:
                 self.send_header("Access-Control-Allow-Origin", origin)
                 self.send_header("Vary", "Origin")
 
         def _common_headers(self):
+            """Attach diagnostic, cache-control, and browser-visible headers."""
             self.send_header("X-Request-ID", self.request_id)
             self.send_header("X-Content-Type-Options", "nosniff")
             self.send_header("Cache-Control", "no-store")
@@ -531,6 +610,7 @@ def make_handler(engine, config=None):
             )
 
         def _headers(self, status=200, content_type="application/json"):
+            """Start an empty or streaming response, disabling SSE proxy buffering."""
             self.send_response(status)
             self.send_header("Content-Type", content_type)
             self._common_headers()
@@ -545,6 +625,7 @@ def make_handler(engine, config=None):
             self.end_headers()
 
         def _json(self, payload, status=200, extra_headers=None):
+            """Serialize one JSON response with its length and optional extra headers."""
             body = json.dumps(payload).encode()
             self.send_response(status)
             self.send_header("Content-Type", "application/json")
@@ -563,6 +644,7 @@ def make_handler(engine, config=None):
             error_type="invalid_request_error",
             extra_headers=None,
         ):
+            """Return a structured API error with a chosen HTTP status."""
             self._json(
                 {
                     "error": {
@@ -575,6 +657,7 @@ def make_handler(engine, config=None):
             )
 
         def _authorized(self):
+            """Check the bearer token in constant time or send an authentication error."""
             supplied = self.headers.get("Authorization", "")
             expected = f"Bearer {config.api_key}"
             if hmac.compare_digest(supplied.encode("utf-8"), expected.encode("utf-8")):
@@ -583,9 +666,11 @@ def make_handler(engine, config=None):
             return False
 
         def do_OPTIONS(self):
+            """Return the supported CORS preflight methods and headers."""
             self._headers(204)
 
         def do_GET(self):
+            """Serve liveness, readiness, and authenticated model metadata routes."""
             path = urlsplit(self.path).path.rstrip("/")
             if path == "/health":
                 self._json(
@@ -636,6 +721,7 @@ def make_handler(engine, config=None):
             self._error("not found", 404)
 
         def do_POST(self):
+            """Validate and admit a chat request before driving completion generation."""
             if urlsplit(self.path).path.rstrip("/") != "/v1/chat/completions":
                 self._error("not found", 404)
                 return
@@ -727,6 +813,7 @@ def make_handler(engine, config=None):
                 slots.release()
 
         def _complete(self, model_id, messages, max_tokens, sampling=None):
+            """Collect one completion and return token usage or a sanitized error."""
             pieces = []
             stats = None
             try:
@@ -774,11 +861,13 @@ def make_handler(engine, config=None):
             )
 
         def _stream(self, model_id, messages, max_tokens, sampling=None, include_usage=False):
+            """Emit SSE chunks, optional usage, and a success or error terminator."""
             completion_id = _completion_id()
             created = int(time.time())
             self._headers(200, "text/event-stream")
 
             def send(payload):
+                """Write and flush a JSON SSE event with optional usage metadata."""
                 if include_usage and "choices" in payload:
                     payload.setdefault("usage", None)
                 data = json.dumps(payload, separators=(",", ":"))
@@ -892,6 +981,7 @@ def serve(server, engine):
     )
 
     def request_shutdown(signum, frame):
+        """Begin admission drain and stop the server from a separate thread."""
         if tracker is not None:
             tracker.begin_shutdown()
         # shutdown() must run outside serve_forever()'s thread.
@@ -916,10 +1006,17 @@ def serve(server, engine):
             logging.warning(
                 "graceful shutdown deadline expired with active inference"
             )
-        engine.close()
+            abort = getattr(engine, "abort", None)
+            if abort is not None:
+                abort()
+            else:
+                engine.close()
+        else:
+            engine.close()
 
 
 def main():
+    """Validate CLI settings, create the worker and HTTP server, and serve traffic."""
     parser = argparse.ArgumentParser(
         description="Serve SmolLM2 on an AMD Hawk Point NPU"
     )

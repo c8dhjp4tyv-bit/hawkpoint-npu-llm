@@ -35,6 +35,7 @@ def _rows(*token_ids_with_logprobs):
 def test_logit_agreement_tolerance():
     # Reference: position 0 is confident (margin 2.0); position 1 is an ambiguous
     # near-tie (margin 0.1).
+    """Reject confident logit divergence while tolerating ambiguous near-ties."""
     reference = _rows(
         [(10, -0.1), (11, -2.1), (12, -3.0)],
         [(20, -0.5), (21, -0.6), (22, -3.0)],
@@ -70,6 +71,7 @@ def test_logit_agreement_tolerance():
 
 
 def test_release_pins():
+    """Validate immutable release references and required patch/kernel artifacts."""
     pins = json.loads((ROOT / "release-pins.json").read_text())
     ollama = pins["ollama"]
     assert re.fullmatch(r"v\d+\.\d+\.\d+", ollama["source_tag"])
@@ -99,6 +101,7 @@ def test_release_pins():
 
 
 def test_hardware_gate_separates_compatibility_from_release_certification():
+    """Distinguish version drift from functional hardware capability failures."""
     pins = {
         "kernel_release": "7.2.0-certified",
         "amdxdna_version": "7.2.0-certified",
@@ -135,6 +138,7 @@ def test_hardware_gate_separates_compatibility_from_release_certification():
 
 
 def test_hardware_workflows_use_the_intended_validation_mode():
+    """Require strict certification only in the release workflow."""
     release_workflow = (ROOT / ".github/workflows/release.yml").read_text()
     compatibility_workflow = (
         ROOT / ".github/workflows/npu-hardware.yml"
@@ -144,6 +148,7 @@ def test_hardware_workflows_use_the_intended_validation_mode():
 
 
 def test_native_quick_budget_covers_all_models():
+    """Fail if the real catalog outgrows the four-model quick-test budget."""
     # Load script defaults in a fresh process without an NPU or API server.
     environment = dict(os.environ, HAWKPOINT_API_KEY="offline-test")
     environment.pop("HAWKPOINT_SOAK_COMPLETIONS", None)
@@ -151,7 +156,11 @@ def test_native_quick_budget_covers_all_models():
     code = """
 from collections import Counter
 import soak_api
-models = ['a', 'b', 'c', 'd']
+import sys
+sys.path.insert(0, '..')
+from npu_llm.model_catalog import MODEL_PRESETS
+models = list(MODEL_PRESETS)
+assert len(models) == 4, 'Update the quick budget for the supported model set'
 counts = Counter(soak_api.model_for(i, models)
                  for i in range(soak_api.COMPLETIONS))
 assert counts == dict.fromkeys(models, 25), counts
@@ -163,6 +172,7 @@ assert counts == dict.fromkeys(models, 25), counts
 
 
 def test_manifest_digest():
+    """Verify exact manifest bytes and reject a mismatched digest."""
     manifest = {
         "schemaVersion": 2,
         "config": {"digest": "sha256:" + "1" * 64},
@@ -191,6 +201,7 @@ def test_manifest_digest():
 
 
 def test_cross_placement_agreement():
+    """Compare placement response hashes without assuming numerical equivalence."""
     matching = [
         {"placement": name, "response_sha256": "a" * 64}
         for name in ("cpu_only", "gpu_only", "cpu_gpu", "cpu_gpu_npu")
@@ -203,10 +214,12 @@ def test_cross_placement_agreement():
 
 
 def test_placement_matrix_exercises_xdna_without_cuda():
+    """Ensure the XDNA-only logit placement needs no CUDA offload."""
     assert PLACEMENTS["xdna_only"] == {"ngl": 0, "xdna": True}
 
 
 def main():
+    """Run all offline regression checks in this module."""
     test_native_quick_budget_covers_all_models()
     test_release_pins()
     test_manifest_digest()
