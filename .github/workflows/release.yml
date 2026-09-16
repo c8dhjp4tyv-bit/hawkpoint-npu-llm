@@ -230,7 +230,7 @@ jobs:
             "hardware-evidence-${GITHUB_REF_NAME}.tar.gz" \
             > SHA256SUMS
       - name: Generate SPDX SBOM
-        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610
+        uses: anchore/sbom-action@3ad7283483fc7af8ff2b4ea19663c2d5ca935e26
         with:
           path: .
           format: spdx-json
