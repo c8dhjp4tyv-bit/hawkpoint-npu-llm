@@ -243,7 +243,7 @@ jobs:
             --bundle SHA256SUMS.sigstore.json \
             SHA256SUMS
       - name: Attest provenance
-        uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8
         with:
           subject-path: hawkpoint-npu-llm-${{ github.ref_name }}.tar.gz
       - name: Publish release
