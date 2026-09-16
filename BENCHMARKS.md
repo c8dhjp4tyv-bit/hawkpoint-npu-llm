@@ -8,7 +8,8 @@ Use the same prompt, model quantization, context length, generation length,
 power profile, ambient conditions, and five-minute warm-up for every row.
 Report median and p95 TTFT, steady-state token/s, peak resident RAM, peak GPU
 VRAM, wall energy, failures, and completed requests over at least 1,000
-completions.
+completions when claiming long-duration stability. This is the optional
+`endurance` profile, not the default release request budget.
 
 | Placement | TTFT | token/s | RAM | VRAM | Energy | 1,000-request stability |
 |---|---:|---:|---:|---:|---:|---:|
@@ -21,9 +22,9 @@ The smaller component measurements already obtained during development remain
 in the README, but they are not substitutes for this controlled comparison.
 Empty cells are intentional: this repository does not invent benchmark data.
 
-The release runs two hardware endurance tests that upload JSON evidence. The
-endurance soak keeps each model resident under sustained load, running the
-1,000 completions as 250 consecutive requests per model; the model-switch
+The release uploads JSON evidence using the default `quick` profile. The
+soak keeps each model resident, running 100 completions as 25 consecutive
+requests per model (optional endurance: 1,000 total, 250 per model); the model-switch
 stress test does the opposite, forcing at least 100 back-to-back model switches
 to exercise deterministic XRT/NPU context release. Each report contains
 successful and failed request counts, per-model results, median/p95 TTFT and
@@ -41,9 +42,13 @@ top-two candidate tie within the documented `0.05` logit margin and the same
 two candidates. This near-tie exception does not weaken the independent exact
 32-token generated-sequence gate. NPU/CPU speedup is evidence, not a release
 correctness condition.
-The same gated hardware job runs 1,000 requests in each of CPU-only, GPU-only,
+The same gated hardware job runs 25 requests in each of CPU-only, GPU-only,
 CPU+GPU, and CPU+GPU+NPU placement modes with one pinned Qwen model and
-the same prompt, seed, generation length, and five-minute warm-up. It measures
+the same prompt, seed, generation length, and five-minute warm-up. Optional
+endurance increases this to 1,000 per placement. Reports carry `test_profile`
+and actual counts; quick results cannot fill the 1,000-request stability
+column above. The 200 measured quick requests exclude warm-up, correctness,
+and switching tests. Build and conversion time also varies by host. It measures
 streaming time to the first emitted token and requires every placement to
 complete all requests with zero errors and a stable response hash within its
 own placement.

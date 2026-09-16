@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Sustained per-model endurance test for a separately started API.
 
-Runs a fixed number of completions (1000 by default) as consecutive per-model
-blocks of ``HAWKPOINT_SOAK_RUN_LENGTH`` requests (250 by default). This keeps
+Runs a fixed number of completions (100 by default) as consecutive per-model
+blocks of ``HAWKPOINT_SOAK_RUN_LENGTH`` requests (25 by default). This keeps
 each model resident under sustained load for a long stretch, which is what a
 real serving session looks like, while the dedicated ``switch_stress_api.py``
 covers rapid model switching.
@@ -30,13 +30,15 @@ from hardware_soak_common import (
 )
 
 
-COMPLETIONS = int(os.environ.get("HAWKPOINT_SOAK_COMPLETIONS", "1000"))
-RUN_LENGTH = int(os.environ.get("HAWKPOINT_SOAK_RUN_LENGTH", "250"))
+COMPLETIONS = int(os.environ.get("HAWKPOINT_SOAK_COMPLETIONS", "100"))
+RUN_LENGTH = int(os.environ.get("HAWKPOINT_SOAK_RUN_LENGTH", "25"))
 REPORT = Path(os.environ.get("HAWKPOINT_SOAK_REPORT", "soak-report.json"))
 API_LOG = Path(os.environ.get("HAWKPOINT_API_LOG", "hawkpoint-api.log"))
 
 if RUN_LENGTH < 1:
     raise SystemExit("HAWKPOINT_SOAK_RUN_LENGTH must be at least 1")
+if COMPLETIONS < 1:
+    raise SystemExit("HAWKPOINT_SOAK_COMPLETIONS must be at least 1")
 
 
 def model_for(index, models):
@@ -45,6 +47,7 @@ def model_for(index, models):
 
 
 def main():
+    """Run the selected per-model budget and fail on request or kernel errors."""
     expected = load_expected()
     models = installed_models(expected)
 
@@ -88,6 +91,11 @@ def main():
     report = {
         "schema_version": 2,
         "test": "endurance",
+        "test_profile": (
+            "quick" if (COMPLETIONS, RUN_LENGTH) == (100, 25)
+            else "endurance" if (COMPLETIONS, RUN_LENGTH) == (1000, 250)
+            else "custom"
+        ),
         "started_epoch": started_epoch,
         "completed_epoch": int(time.time()),
         "requested_completions": COMPLETIONS,

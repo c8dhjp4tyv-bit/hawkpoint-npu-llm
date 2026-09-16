@@ -15,7 +15,9 @@ kernels.
 
 The versioned support boundary is in [SUPPORT.md](SUPPORT.md), release changes
 are in [CHANGELOG.md](CHANGELOG.md), and responsible disclosure is described
-in [SECURITY.md](SECURITY.md). An alpha tag does not mean production-ready.
+in [SECURITY.md](SECURITY.md). Deployment, monitoring, shutdown, recovery, and
+release procedures are in the [operations guide](docs/OPERATIONS.md). An alpha
+tag does not mean production-ready.
 
 ## Choose a runtime
 
@@ -255,7 +257,41 @@ curl http://localhost:8000/v1/chat/completions \
   }'
 ```
 
-For streaming output, set `"stream": true`.
+For streaming output, set `"stream": true`. Add
+`"stream_options": {"include_usage": true}` to receive a final chunk with
+`choices: []` and token counts in `usage`, immediately before `[DONE]`.
+Earlier chunks carry `usage: null` when this option is enabled. Without it,
+the existing streaming format is preserved.
+
+An inference failure after streaming headers produces a sanitized SSE `error`
+event (`server_error` or `timeout_error`) and closes the stream without a
+success `[DONE]` marker. Clients should treat a disconnected stream without
+`[DONE]` as incomplete; final usage is not guaranteed for interrupted requests.
+
+`max_tokens` or its modern alias `max_completion_tokens` must be a positive
+JSON integer (then capped to the hardware context); supplying both is rejected.
+`n` must be integer `1`, and `stream` must be a JSON boolean.
+`stream_options` is only accepted with streaming enabled. Invalid types return
+`400` before inference admission. Header and body reads are also bounded by
+`--request-timeout`; a stalled body receives `408` when the connection remains
+writable. Inference timeouts return `504` for non-streaming requests.
+
+Responses include a unique `X-Request-ID`, `Cache-Control: no-store`, and
+`X-Content-Type-Options: nosniff`. Streaming responses additionally disable
+common reverse-proxy buffering with `X-Accel-Buffering: no`. Routes continue to
+work when clients append query parameters.
+
+Clients can retrieve one installed model with `GET /v1/models/{model_id}`.
+Rate-limit and full-queue `429` responses include `Retry-After`. SIGINT and
+SIGTERM trigger graceful HTTP shutdown and deterministic NPU worker cleanup,
+which is particularly important under systemd and container supervisors.
+During shutdown, newly arriving completions receive `503` while already
+admitted inference drains for up to `--graceful-shutdown-timeout` seconds
+(130 by default, slightly longer than the request deadline).
+`GET /ready` switches to `503` immediately and reports `draining` plus the
+active request count, allowing a reverse proxy or service manager to stop
+routing new work before process exit. Access logs include the same request ID
+returned to the client for correlation.
 
 ### Sampling
 
@@ -400,10 +436,17 @@ python npu_llm/tests/validate_chat_npu.py
 
 The tag-triggered release pipeline performs fresh pinned downloads and
 conversion, Qwen token agreement, a bounded model-switch stress test of at
-least 100 switches, a 1,000-completion endurance soak of 250 consecutive
-requests per model, and an Ollama install/inference/rollback test with
+least 100 switches, a quick soak of 100 completions (25 consecutive per
+model), and an Ollama install/inference/rollback test with
 `--jobs 8` before its publish job can start. See [SUPPORT.md](SUPPORT.md) for the gate and
 [BENCHMARKS.md](BENCHMARKS.md) for the controlled comparison protocol.
+The Ollama matrix uses 25 measured requests per placement (100 total), so the
+two quick loops total 200 measured requests. Warm-up, correctness checks,
+100 model switches, downloads, and builds are additional work.
+For optional long-duration testing, manually run **Gated release** with
+`profile: endurance` (1,000 native plus 4 × 1,000 Ollama requests).
+Manual runs never publish a release. Tags use the quick profile, whose
+success does not establish long-duration endurance.
 `release-pins.json` is the machine-readable authority for the Ollama source tag
 and commit, Ollama model manifest, and the hardware/software stack used for
 release certification. It is not an exact kernel requirement for every runtime;

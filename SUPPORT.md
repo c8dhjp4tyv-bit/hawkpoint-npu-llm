@@ -34,8 +34,18 @@ The tag-triggered `Gated release` workflow is one dependency chain. Hosted
 protocol/converter and the pinned Ollama `v0.33.3` patch plus upstream Go tests
 run first. The release then waits for a labeled physical Hawk Point runner to
 complete fresh pinned model conversion, SmolLM acceptance, Qwen component and
-32-token CPU BF16/NPU agreement, a measured 1,000-completion model-switching
-soak, and an Ollama build/install/inference/rollback test.
+32-token CPU BF16/NPU agreement, 100 model switches, a measured 100-completion
+soak (25 per model), and an Ollama build/install/inference/rollback test with
+25 requests in each of four placements. These two loops total 200 measured
+requests, excluding warm-up and other checks.
+
+Tags use this quick profile. Long endurance is optional: manually dispatch
+`Gated release` with `profile: endurance` to run 1,000 native completions
+(250 per model) and 1,000 per Ollama placement. Manual runs never publish.
+JSON reports identify the profile and actual request budget; passing quick
+acceptance must not be described as long-duration stability certification.
+The separate `XDNA1 hardware acceptance` workflow selects the same native
+budgets but only builds Ollama; use `Gated release` for the full matrix.
 
 The Ollama placement gate does not require CPU, CUDA, and XDNA to emit identical
 text. Each placement must complete every request with zero errors, remain

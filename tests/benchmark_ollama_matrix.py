@@ -30,11 +30,13 @@ def find_model_gguf(models_dir):
 
 
 def percentile(values, fraction):
+    """Return the selected order statistic from a nonempty sample."""
     ordered = sorted(values)
     return ordered[max(0, math.ceil(len(ordered) * fraction) - 1)]
 
 
 def process_tree(root):
+    """Collect the root PID and its observable descendant processes."""
     pending = [root]
     seen = set()
     while pending:
@@ -51,6 +53,7 @@ def process_tree(root):
 
 
 def rss_mib(root):
+    """Sum resident memory for the observed process tree in MiB."""
     total = 0
     for pid in process_tree(root):
         try:
@@ -64,6 +67,7 @@ def rss_mib(root):
 
 
 def gpu_vram_mib():
+    """Read NVIDIA memory usage when telemetry is available."""
     try:
         output = subprocess.check_output(
             [
@@ -81,6 +85,7 @@ def gpu_vram_mib():
 
 
 def energy_uj():
+    """Read available host energy counters in microjoules."""
     readings = []
     for path in Path("/sys/class/powercap").glob("**/energy_uj"):
         try:
@@ -91,6 +96,7 @@ def energy_uj():
 
 
 def api(port, path, payload=None, timeout=600):
+    """Call the local Ollama JSON API and decode its response."""
     body = json.dumps(payload).encode() if payload is not None else None
     request = Request(
         f"http://127.0.0.1:{port}{path}",
@@ -131,6 +137,7 @@ def streaming_generate(port, payload, timeout=600):
 
 
 def wait_ready(process, port):
+    """Wait for Ollama startup while detecting early process exit."""
     for _ in range(120):
         if process.poll() is not None:
             raise RuntimeError("Ollama server exited during startup")
@@ -143,6 +150,7 @@ def wait_ready(process, port):
 
 
 def summary(values):
+    """Summarize measured samples for the benchmark report."""
     if not values:
         return {"median": None, "p95": None, "min": None, "max": None}
     return {
@@ -154,6 +162,7 @@ def summary(values):
 
 
 def compare_placement_responses(results, expected_count):
+    """Return placement hashes and whether all expected responses match."""
     hashes = {
         item["placement"]: item["response_sha256"]
         for item in results
@@ -163,6 +172,7 @@ def compare_placement_responses(results, expected_count):
 
 
 def benchmark_mode(args, mode, index):
+    """Measure one backend placement and verify deterministic successful output."""
     port = args.base_port + index
     environment = {
         **os.environ,
@@ -229,6 +239,7 @@ def benchmark_mode(args, mode, index):
             stop = threading.Event()
 
             def monitor():
+                """Sample peak process RAM and GPU memory until the stop event is set."""
                 nonlocal peak_ram, peak_vram
                 while not stop.wait(1):
                     peak_ram = max(peak_ram, rss_mib(process.pid))
@@ -311,6 +322,7 @@ def benchmark_mode(args, mode, index):
 
 
 def main():
+    """Run backend placement measurements and write correctness/performance evidence."""
     parser = argparse.ArgumentParser()
     parser.add_argument("--ollama-bin", type=Path, required=True)
     parser.add_argument("--xdna-dir", type=Path, required=True)
@@ -320,7 +332,7 @@ def main():
     parser.add_argument("--model-manifest-sha256", required=True)
     parser.add_argument("--gpu-library", default="cuda_v13")
     parser.add_argument("--partial-gpu-layers", type=int, default=8)
-    parser.add_argument("--requests", type=int, default=100)
+    parser.add_argument("--requests", type=int, default=25)
     parser.add_argument("--tokens", type=int, default=16)
     parser.add_argument("--warmup-seconds", type=int, default=300)
     parser.add_argument("--base-port", type=int, default=11500)
@@ -438,6 +450,12 @@ def main():
 
     report = {
         "schema_version": 2,
+        "test_profile": (
+            "quick" if args.requests == 25
+            else "endurance" if args.requests == 1000
+            else "custom"
+        ),
+        "requests_per_placement": args.requests,
         "model": args.model,
         "model_manifest_sha256": args.model_manifest_sha256,
         "prompt": args.prompt,

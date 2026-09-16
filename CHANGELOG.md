@@ -1,5 +1,37 @@
 # Changelog
 
+## Unreleased
+
+- Fix shutdown past the drain deadline by cancelling the worker independently
+  of the generation lock; prevent queued work from restarting a closed engine.
+- Check quick-test model coverage against the real checkpoint catalog.
+
+- Default hardware acceptance to 100 native requests (25 per model) and
+  25 per Ollama placement. Keep the 1,000-request budgets available through
+  an explicit manual `endurance` profile; manual release-workflow runs never
+  publish. Reports and release notes distinguish quick from endurance evidence.
+
+- Add opt-in streaming usage chunks via `stream_options.include_usage`.
+- Report sanitized SSE inference errors instead of silently ending streams.
+- Close generation iterators deterministically on timeout or failed writes.
+- Validate completion parameter types before inference admission and handle
+  non-ASCII invalid bearer tokens without crashing the request handler.
+- Apply socket deadlines before reading request headers and bodies, with a
+  structured `408` response for stalled request bodies.
+- Add offline HTTP and worker cancellation/recovery regression coverage.
+- Accept the modern `max_completion_tokens` alias, preserve routes with query
+  parameters, and add request IDs plus no-cache/SSE proxy headers.
+- Periodically evict idle rate-limit buckets during long-running service.
+- Add single-model retrieval, actionable `Retry-After` headers, and graceful
+  SIGINT/SIGTERM shutdown with deterministic NPU worker cleanup.
+- Drain admitted inference during shutdown, reject new completions with `503`,
+  validate the drain timeout, and bound/cancel superseded CI runs.
+- Make readiness drain-aware, expose active request counts, and correlate
+  access logs and browser-visible response headers with `X-Request-ID`.
+- Add a deployment/monitoring/recovery runbook and weekly Dependabot coverage
+  for locked Python dependencies and commit-pinned GitHub Actions.
+
+
 All notable changes are documented here. This project follows semantic
 versioning while its public API is experimental.
 

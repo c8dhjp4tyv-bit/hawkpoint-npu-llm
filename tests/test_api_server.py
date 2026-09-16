@@ -21,9 +21,12 @@ from npu_llm.api_server import (  # noqa: E402
     BoundedHTTPServer,
     CompletionEngine,
     InferenceTimeout,
+    InferenceTracker,
     ProcessCompletionEngine,
+    RateLimiter,
     ServerConfig,
     make_handler,
+    serve,
 )
 
 
@@ -34,6 +37,7 @@ class FakeDecoder:
     context_length = 64
 
     def generate_messages(self, messages, max_new_tokens):
+        """Emit a fixed two-token response and deterministic usage for protocol tests."""
         assert messages[-1]["content"] == "Hello"
         assert max_new_tokens == 5
         yield "Hello", None
@@ -52,9 +56,11 @@ class RecordingDecoder:
     context_length = 64
 
     def __init__(self):
+        """Initialize the list of forwarded sampling parameters."""
         self.calls = []
 
     def generate_messages(self, messages, max_new_tokens, sampling=None):
+        """Record sampling options and emit a small synthetic completion."""
         self.calls.append(sampling)
         yield "ok", None
         yield "", {
@@ -69,6 +75,7 @@ class FailingDecoder:
     context_length = 64
 
     def generate_messages(self, messages, max_new_tokens):
+        """Raise a secret-bearing error to test public error sanitization."""
         raise RuntimeError("secret internal detail")
         yield
 
@@ -77,6 +84,7 @@ class SlowDecoder:
     context_length = 64
 
     def generate_messages(self, messages, max_new_tokens):
+        """Delay a response to exercise concurrent admission limits."""
         time.sleep(0.35)
         yield "done", {"generated_tokens": 1}
 
@@ -85,6 +93,19 @@ class HangingDecoder:
     context_length = 64
 
     def generate_messages(self, messages, max_new_tokens):
+        """Simulate inference that exceeds the worker deadline."""
+        time.sleep(30)
+        yield "unreachable", None
+
+
+class StartedHangingDecoder:
+    """Expose worker startup before simulating a stalled kernel."""
+
+    context_length = 64
+
+    def generate_messages(self, messages, max_new_tokens):
+        """Emit a marker, then hang well beyond the shutdown budget."""
+        yield "started", None
         time.sleep(30)
         yield "unreachable", None
 
@@ -100,9 +121,11 @@ class ToggleDecoder:
     context_length = 64
 
     def __init__(self, marker):
+        """Store the marker controlling failure across worker restarts."""
         self.marker = marker
 
     def generate_messages(self, messages, max_new_tokens):
+        """Fail while the marker exists, otherwise produce a recovery response."""
         if Path(self.marker).exists():
             raise RuntimeError("secret internal detail")
         yield "ok", None
@@ -120,11 +143,13 @@ class CloseTrackingDecoder:
     context_length = 64
 
     def __init__(self, name, events):
+        """Store model identity and the shared resource-lifecycle event log."""
         self.name = name
         self.events = events
         self.closed = False
 
     def generate_messages(self, messages, max_new_tokens):
+        """Emit model identity to verify ownership during model switching."""
         yield self.name, None
         yield "", {
             "prompt_tokens": 1,
@@ -133,16 +158,19 @@ class CloseTrackingDecoder:
         }
 
     def close(self):
+        """Record decoder disposal in the shared lifecycle log."""
         self.closed = True
         self.events.append(("close", self.name))
 
 
 class TrackingFactory:
     def __init__(self, events):
+        """Track constructed decoders and their lifecycle events."""
         self.events = events
         self.created = []
 
     def __call__(self, path):
+        """Create and record a decoder for the requested model path."""
         decoder = CloseTrackingDecoder(str(path), self.events)
         self.created.append(decoder)
         self.events.append(("create", str(path)))
@@ -150,6 +178,7 @@ class TrackingFactory:
 
 
 def fetch(url, data=None, *, api_key=API_KEY, origin=None, raw=None):
+    """Send a test HTTP request and return status, body, and headers."""
     headers = {"Content-Type": "application/json"}
     if api_key:
         headers["Authorization"] = f"Bearer {api_key}"
@@ -170,6 +199,7 @@ def fetch(url, data=None, *, api_key=API_KEY, origin=None, raw=None):
 
 
 def payload(model="smollm2-135m-xdna1"):
+    """Build the canonical small chat request used by protocol tests."""
     return {
         "model": model,
         "messages": [{"role": "user", "content": "Hello"}],
@@ -178,6 +208,7 @@ def payload(model="smollm2-135m-xdna1"):
 
 
 def start_server(models, **config):
+    """Start a loopback HTTP server backed by fake in-process decoders."""
     server = BoundedHTTPServer(
         ("127.0.0.1", 0),
         make_handler(
@@ -191,6 +222,7 @@ def start_server(models, **config):
 
 
 def stop_server(server, thread):
+    """Stop and join a test HTTP server, asserting it exits."""
     server.shutdown()
     server.server_close()
     thread.join(timeout=5)
@@ -198,6 +230,7 @@ def stop_server(server, thread):
 
 
 def test_protocol_and_security():
+    """Verify authentication, model routes, CORS, completion, and body limits."""
     server, thread, base = start_server(
         {
             "smollm2-135m-xdna1": FakeDecoder(),
@@ -211,6 +244,8 @@ def test_protocol_and_security():
         status, body, _ = fetch(f"{base}/ready", api_key=None)
         assert status == 200
         assert json.loads(body)["status"] == "ready"
+        assert json.loads(body)["draining"] is False
+        assert json.loads(body)["active_requests"] == 0
 
         status, body, headers = fetch(
             f"{base}/v1/models",
@@ -225,6 +260,15 @@ def test_protocol_and_security():
         )
         assert status == 200
         assert "Access-Control-Allow-Origin" not in headers
+
+        status, body, _ = fetch(
+            f"{base}/v1/models/smollm2-135m-xdna1?source=sdk"
+        )
+        assert status == 200
+        assert json.loads(body)["id"] == "smollm2-135m-xdna1"
+        status, body, _ = fetch(f"{base}/v1/models/not-installed")
+        assert status == 404
+        assert json.loads(body)["error"]["type"] == "model_not_found"
 
         status, body, _ = fetch(f"{base}/v1/chat/completions", payload())
         response = json.loads(body)
@@ -259,6 +303,7 @@ def test_protocol_and_security():
 
 
 def test_backpressure_and_safe_errors():
+    """Verify overload retry headers and sanitized decoder failures."""
     server, thread, base = start_server(
         {"smollm2-135m-xdna1": SlowDecoder()},
         queue_capacity=0,
@@ -268,8 +313,11 @@ def test_backpressure_and_safe_errors():
             first = pool.submit(fetch, f"{base}/v1/chat/completions", payload())
             time.sleep(0.05)
             second = pool.submit(fetch, f"{base}/v1/chat/completions", payload())
-            statuses = {first.result()[0], second.result()[0]}
+            results = (first.result(), second.result())
+            statuses = {result[0] for result in results}
         assert statuses == {200, 429}
+        overloaded = next(result for result in results if result[0] == 429)
+        assert overloaded[2]["Retry-After"] == "1"
     finally:
         stop_server(server, thread)
 
@@ -290,6 +338,7 @@ def test_backpressure_and_safe_errors():
 
 
 def test_hard_process_timeout():
+    """Ensure a hanging spawned worker is terminated within the request budget."""
     engine = ProcessCompletionEngine(
         {"smollm2-135m-xdna1": HangingDecoder()},
         decoder_factory=None,
@@ -317,6 +366,7 @@ def test_hard_process_timeout():
 
 
 def test_worker_error_forces_restart():
+    """Ensure worker failure destroys its process and clears readiness."""
     engine = ProcessCompletionEngine(
         {"smollm2-135m-xdna1": FailingDecoder()},
         decoder_factory=None,
@@ -411,6 +461,7 @@ def test_model_switch_releases_previous_decoder():
 
 
 def test_sampling_parameters_reach_the_decoder():
+    """Check sampling forwarding, greedy defaults, and rejected parameter ranges."""
     decoder = RecordingDecoder()
     server, thread, base = start_server({"smollm2-135m-xdna1": decoder})
     try:
@@ -469,7 +520,344 @@ def test_sampling_parameters_reach_the_decoder():
         stop_server(server, thread)
 
 
+
+def test_strict_request_types():
+    """Reject malformed protocol types before any decoder invocation."""
+    decoder = RecordingDecoder()
+    server, thread, base = start_server(
+        {"smollm2-135m-xdna1": decoder}, rate_limit_per_minute=0
+    )
+    try:
+        invalid = [
+            {"model": value} for value in ([], {}, 123, False, "")
+        ] + [
+            {"max_tokens": value} for value in (0, -1, True, 1.5, "5", None)
+        ] + [
+            {"max_completion_tokens": value}
+            for value in (0, -1, True, 1.5, "5", None)
+        ] + [
+            {"stream": value} for value in ("false", 1, [], None)
+        ] + [
+            {"n": True}, {"n": 1.0},
+            {"max_tokens": 5, "max_completion_tokens": 5},
+            {"messages": [{"role": [], "content": "Hello"}]},
+            {"stream_options": {"include_usage": True}},
+            {"stream": True, "stream_options": []},
+            {"stream": True, "stream_options": {"include_usage": "yes"}},
+            {"stream": True, "stream_options": {"unknown": True}},
+        ]
+        for fields in invalid:
+            status, body, _ = fetch(
+                f"{base}/v1/chat/completions", {**payload(), **fields}
+            )
+            assert status == 400, (fields, status, body)
+            assert json.loads(body)["error"]["type"] == "invalid_request_error"
+        assert decoder.calls == []
+        status, _, _ = fetch(f"{base}/v1/models", api_key="invalid-é")
+        assert status == 401
+        # Invalid clients must not leave the server unable to serve valid work.
+        assert fetch(f"{base}/v1/chat/completions", payload())[0] == 200
+    finally:
+        stop_server(server, thread)
+
+
+def test_modern_token_alias_routes_and_headers():
+    """Check token aliases, query routing, and diagnostic response headers."""
+    decoder = RecordingDecoder()
+    server, thread, base = start_server({"smollm2-135m-xdna1": decoder})
+    try:
+        request = payload()
+        del request["max_tokens"]
+        request["max_completion_tokens"] = 5
+        status, _, headers = fetch(
+            f"{base}/v1/chat/completions?client=test", request
+        )
+        assert status == 200
+        assert headers["X-Request-ID"].startswith("req-")
+        assert headers["X-Content-Type-Options"] == "nosniff"
+        assert headers["Cache-Control"] == "no-store"
+        assert "X-Request-ID" in headers["Access-Control-Expose-Headers"]
+
+        status, _, model_headers = fetch(f"{base}/v1/models?limit=1")
+        assert status == 200
+        assert model_headers["X-Request-ID"].startswith("req-")
+        assert model_headers["X-Request-ID"] != headers["X-Request-ID"]
+
+        request["stream"] = True
+        status, _, stream_headers = fetch(
+            f"{base}/v1/chat/completions?client=test", request
+        )
+        assert status == 200
+        assert stream_headers["X-Accel-Buffering"] == "no"
+    finally:
+        stop_server(server, thread)
+
+
+def test_rate_limiter_evicts_idle_clients():
+    """Check expired client state is evicted using a deterministic clock."""
+    now = [0.0]
+    limiter = RateLimiter(1, clock=lambda: now[0])
+    assert limiter.allow("first")
+    assert not limiter.allow("first")
+    now[0] = 61.0
+    assert limiter.allow("second")
+    assert "first" not in limiter._requests
+
+
+def test_inference_tracker_drains_admitted_work():
+    """Reject new work during drain and wake once admitted work finishes."""
+    tracker = InferenceTracker()
+    assert tracker.try_enter()
+    assert tracker.active == 1
+    tracker.begin_shutdown()
+    assert tracker.draining
+    assert not tracker.try_enter()
+    assert not tracker.wait(0.01)
+    tracker.leave()
+    assert tracker.active == 0
+    assert tracker.wait(0.01)
+    try:
+        tracker.leave()
+        raise AssertionError("unbalanced tracker leave was accepted")
+    except RuntimeError:
+        pass
+
+
+class ServeLifecycleEngine:
+    def __init__(self):
+        """Initialize the engine-close marker."""
+        self.closed = False
+
+    def close(self):
+        """Mark the fake engine closed for shutdown assertions."""
+        self.closed = True
+
+
+def test_serve_closes_resources():
+    """Normal server shutdown releases its engine and HTTP socket."""
+    engine = ServeLifecycleEngine()
+    server = BoundedHTTPServer(
+        ("127.0.0.1", 0),
+        make_handler(
+            CompletionEngine({"smollm2-135m-xdna1": FakeDecoder()}),
+            ServerConfig(api_key=API_KEY),
+        ),
+    )
+    thread = threading.Thread(target=serve, args=(server, engine), daemon=True)
+    thread.start()
+    try:
+        status, _, _ = fetch(
+            f"http://127.0.0.1:{server.server_port}/health", api_key=None
+        )
+        assert status == 200
+    finally:
+        server.shutdown()
+        thread.join(timeout=5)
+    assert not thread.is_alive()
+    assert engine.closed
+
+
+def test_shutdown_deadline_cancels_worker():
+    """A short drain cancels a stalled worker without waiting 120 seconds."""
+    engine = ProcessCompletionEngine(
+        {"smollm2-135m-xdna1": StartedHangingDecoder()}, None, timeout=120
+    )
+    handler = make_handler(engine, ServerConfig(
+        api_key=API_KEY, graceful_shutdown_timeout=0.05, request_timeout=120
+    ))
+    server = BoundedHTTPServer(("127.0.0.1", 0), handler)
+    serving = threading.Thread(target=serve, args=(server, engine), daemon=True)
+    started = threading.Event()
+    errors = []
+
+    def consume():
+        """Hold admission and the real engine lock during blocked inference."""
+        assert handler.tracker.try_enter()
+        try:
+            for text, _ in engine.generate(
+                "smollm2-135m-xdna1", payload()["messages"], 5
+            ):
+                if text == "started":
+                    started.set()
+        except RuntimeError as exc:
+            errors.append(str(exc))
+        finally:
+            handler.tracker.leave()
+
+    consumer = threading.Thread(target=consume, daemon=True)
+    serving.start()
+    consumer.start()
+    try:
+        assert started.wait(5), "worker never started"
+        before = time.monotonic()
+        server.shutdown()
+        serving.join(timeout=3)
+        consumer.join(timeout=3)
+        assert not serving.is_alive(), "shutdown waited on generation lock"
+        assert not consumer.is_alive(), "cancelled receiver did not wake"
+        assert time.monotonic() - before < 3
+        assert errors
+        assert engine._process is None
+        assert not engine.ready
+        try:
+            list(engine.generate("smollm2-135m-xdna1", payload()["messages"], 5))
+            raise AssertionError("closed engine restarted")
+        except RuntimeError as exc:
+            assert str(exc) == "inference engine is closed"
+    finally:
+        engine.abort()
+        server.shutdown()
+        serving.join(timeout=3)
+        consumer.join(timeout=3)
+
+
+def test_abort_does_not_wait_for_stream_consumer():
+    """Abort works even while a yielded generator holds the generation lock."""
+    engine = ProcessCompletionEngine(
+        {"smollm2-135m-xdna1": FakeDecoder()}, None, timeout=120
+    )
+    generation = engine.generate("smollm2-135m-xdna1", payload()["messages"], 5)
+    try:
+        assert next(generation)[0] == "Hello"
+        aborter = threading.Thread(target=engine.abort, daemon=True)
+        aborter.start()
+        aborter.join(timeout=3)
+        assert not aborter.is_alive(), "abort waited for suspended consumer"
+        assert not engine.ready
+        assert engine._process is None
+    finally:
+        generation.close()
+        engine.abort()
+
+
+def test_stream_usage_and_errors():
+    """Check opt-in SSE usage framing and sanitized failure events."""
+    server, thread, base = start_server({"smollm2-135m-xdna1": FakeDecoder()})
+    try:
+        for options in (None, {"include_usage": False}, {"include_usage": True}):
+            request = {**payload(), "stream": True}
+            if options is not None:
+                request["stream_options"] = options
+            status, body, _ = fetch(f"{base}/v1/chat/completions", request)
+            assert status == 200
+            frames = [line[6:] for line in body.splitlines() if line.startswith("data: ")]
+            assert frames[-1] == "[DONE]"
+            chunks = [json.loads(frame) for frame in frames[:-1]]
+            assert len({chunk["id"] for chunk in chunks}) == 1
+            if options and options["include_usage"]:
+                assert chunks[-1]["choices"] == []
+                assert chunks[-1]["usage"] == {
+                    "prompt_tokens": 4, "completion_tokens": 2, "total_tokens": 6
+                }
+                assert all(chunk["usage"] is None for chunk in chunks[:-1])
+                assert chunks[-2]["choices"][0]["finish_reason"] == "length"
+            else:
+                assert all("usage" not in chunk for chunk in chunks)
+    finally:
+        stop_server(server, thread)
+
+    server, thread, base = start_server({"smollm2-135m-xdna1": FailingDecoder()})
+    try:
+        status, body, _ = fetch(
+            f"{base}/v1/chat/completions", {**payload(), "stream": True}
+        )
+        assert status == 200  # Headers precede inference; the error is an SSE event.
+        assert '"type":"server_error"' in body
+        assert "secret internal detail" not in body
+        assert "[DONE]" not in body
+    finally:
+        stop_server(server, thread)
+
+
+class CleanupDecoder:
+    context_length = 64
+
+    def __init__(self):
+        """Initialize a signal recording iterator cleanup."""
+        self.closed = threading.Event()
+
+    def generate_messages(self, messages, max_new_tokens):
+        """Delay output and signal deterministic cleanup in the finally block."""
+        try:
+            time.sleep(0.08)
+            yield "late", None
+        finally:
+            self.closed.set()
+
+
+def test_timeout_closes_generation():
+    """Ensure timed-out HTTP generation closes its iterator in both response modes."""
+    for stream in (False, True):
+        decoder = CleanupDecoder()
+        server, thread, base = start_server(
+            {"smollm2-135m-xdna1": decoder}, request_timeout=0.04
+        )
+        try:
+            status, body, _ = fetch(
+                f"{base}/v1/chat/completions", {**payload(), "stream": stream}
+            )
+            assert status == (200 if stream else 504)
+            assert "timeout_error" in body
+            assert "late" not in body
+            assert decoder.closed.wait(1)
+            assert "[DONE]" not in body
+        finally:
+            stop_server(server, thread)
+
+
+def test_body_read_timeout():
+    """Ensure an incomplete request body times out before inference admission."""
+    decoder = RecordingDecoder()
+    server, thread, base = start_server(
+        {"smollm2-135m-xdna1": decoder}, request_timeout=0.1
+    )
+    connection = HTTPConnection("127.0.0.1", server.server_port, timeout=2)
+    try:
+        connection.putrequest("POST", "/v1/chat/completions")
+        connection.putheader("Authorization", f"Bearer {API_KEY}")
+        connection.putheader("Content-Length", "100")
+        connection.endheaders()
+        connection.send(b"{")
+        response = connection.getresponse()
+        assert response.status == 408
+        assert json.loads(response.read())["error"]["type"] == "timeout_error"
+        assert decoder.calls == []
+    finally:
+        connection.close()
+        stop_server(server, thread)
+
+
+def test_cancelled_process_generation_recovers():
+    """Ensure cancelled generation releases its worker and later inference recovers."""
+    engine = ProcessCompletionEngine(
+        {"smollm2-135m-xdna1": FakeDecoder()}, decoder_factory=None, timeout=5
+    )
+    try:
+        generation = engine.generate("smollm2-135m-xdna1", payload()["messages"], 5)
+        assert next(generation)[0] == "Hello"
+        generation.close()
+        assert engine._process is None
+        assert not engine.ready
+        assert engine.worker_restarts == 1
+        recovered = list(engine.generate("smollm2-135m-xdna1", payload()["messages"], 5))
+        assert "".join(text for text, _ in recovered) == "Hello!"
+        assert engine.ready
+    finally:
+        engine.close()
+
 def main():
+    """Validate CLI settings, create the worker and HTTP server, and serve traffic."""
+    test_shutdown_deadline_cancels_worker()
+    test_abort_does_not_wait_for_stream_consumer()
+    test_inference_tracker_drains_admitted_work()
+    test_serve_closes_resources()
+    test_modern_token_alias_routes_and_headers()
+    test_rate_limiter_evicts_idle_clients()
+    test_strict_request_types()
+    test_stream_usage_and_errors()
+    test_timeout_closes_generation()
+    test_body_read_timeout()
+    test_cancelled_process_generation_recovers()
     test_protocol_and_security()
     test_sampling_parameters_reach_the_decoder()
     test_backpressure_and_safe_errors()
