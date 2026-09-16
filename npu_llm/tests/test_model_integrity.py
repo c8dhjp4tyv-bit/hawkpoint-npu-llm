@@ -70,14 +70,20 @@ def main():
         except RuntimeError as exc:
             assert "no integrity manifest" in str(exc)
 
-        outside = root.parent / "hawkpoint-integrity-outside.bin"
-        outside.write_bytes(b"outside")
+        with tempfile.NamedTemporaryFile(
+            dir=root.parent,
+            prefix="hawkpoint-integrity-outside-",
+            suffix=".bin",
+            delete=False,
+        ) as outside_file:
+            outside_file.write(b"outside")
+            outside = Path(outside_file.name)
         try:
             write_metadata(
                 {
                     "tensors": {},
                     "files": {
-                        "../hawkpoint-integrity-outside.bin": {
+                        f"../{outside.name}": {
                             "size": outside.stat().st_size,
                             "sha256": hashlib.sha256(
                                 outside.read_bytes()
@@ -92,7 +98,7 @@ def main():
             except RuntimeError as exc:
                 assert "escapes package root" in str(exc)
         finally:
-            outside.unlink()
+            outside.unlink(missing_ok=True)
 
     with tempfile.TemporaryDirectory() as temporary:
         models = Path(temporary)
