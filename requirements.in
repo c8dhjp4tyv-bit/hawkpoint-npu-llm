@@ -1,4 +1,4 @@
-huggingface-hub==1.19.0
+huggingface-hub==1.31.0
 ml-dtypes==0.5.4
 numpy==2.4.6
 safetensors==0.8.0
