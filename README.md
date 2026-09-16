@@ -514,6 +514,10 @@ controlled comparison protocol.
 
 Apache License 2.0 with LLVM exception. See `LICENSE`.
 
+
+Model files are downloaded separately and remain subject to their respective
+upstream licenses and terms.
+
 ## Star History
 
 <a href="https://www.star-history.com/?repos=c8dhjp4tyv-bit%2Fhawkpoint-npu-llm&type=date&legend=top-left">
@@ -524,5 +528,3 @@ Apache License 2.0 with LLVM exception. See `LICENSE`.
  </picture>
 </a>
 
-Model files are downloaded separately and remain subject to their respective
-upstream licenses and terms.
