@@ -514,5 +514,15 @@ controlled comparison protocol.
 
 Apache License 2.0 with LLVM exception. See `LICENSE`.
 
+## Star History
+
+<a href="https://www.star-history.com/?repos=c8dhjp4tyv-bit%2Fhawkpoint-npu-llm&type=date&legend=top-left">
+ <picture>
+   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/chart?repos=c8dhjp4tyv-bit/hawkpoint-npu-llm&type=date&theme=dark&legend=top-left" />
+   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/chart?repos=c8dhjp4tyv-bit/hawkpoint-npu-llm&type=date&legend=top-left" />
+   <img alt="Star History Chart" src="https://api.star-history.com/chart?repos=c8dhjp4tyv-bit/hawkpoint-npu-llm&type=date&legend=top-left" />
+ </picture>
+</a>
+
 Model files are downloaded separately and remain subject to their respective
 upstream licenses and terms.
