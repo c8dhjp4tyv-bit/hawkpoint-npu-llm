@@ -21,12 +21,13 @@ tag does not mean production-ready.
 
 ## Choose a runtime
 
-This repository now contains two independent XDNA1 paths:
+This repository now contains three independent XDNA1 paths:
 
 | Runtime | Best use |
 |---|---|
 | Native MLIR-AIE runtime below | Small supported checkpoints with a custom OpenAI-compatible server |
 | [Ollama XDNA1 patch](ollama-xdna/README.md) | Existing Ollama Qwen models shared across CPU, GPU, and NPU |
+| [Colibri direct C/XDNA backend](colibri-xdna/README.md) | Colibri routed-expert and decode matmul calls made directly from its C engine |
 
 For the Ollama path, install distro-specific build dependencies first:
 
@@ -46,6 +47,18 @@ Use `--backend cpu`, `cuda_v12`, `cuda_v13`, `rocm_v7_2`, or `vulkan` to match
 the machine. The complete driver/XRT prerequisites, distro commands, safe
 dry-run, model test, update, API/Open WebUI, and rollback instructions are in
 the [Ollama XDNA1 guide](ollama-xdna/README.md).
+
+For Colibri, the repository provides a pinned source patch and a native C++/XRT
+implementation of Colibri's C backend ABI. Build it and exercise the NPU path
+without a proxy using:
+
+```bash
+./colibri-xdna/scripts/build.sh --build-root work/colibri-build --test-npu
+```
+
+Supported operations, environment variables, CPU fallback behavior, and the
+current full-model validation boundary are documented in the
+[Colibri direct C/XDNA guide](colibri-xdna/README.md).
 
 ## Demonstrated hardware result
 
@@ -455,8 +468,9 @@ python npu_llm/tests/validate_chat_npu.py
 The tag-triggered release pipeline performs fresh pinned downloads and
 conversion, Qwen token agreement, a bounded model-switch stress test of at
 least 100 switches, a quick soak of 100 completions (25 consecutive per
-model), and an Ollama install/inference/rollback test with
-`--jobs 8` before its publish job can start. See [SUPPORT.md](SUPPORT.md) for the gate and
+model), an Ollama install/inference/rollback test, and a direct Colibri C/XDNA
+build plus NPU ABI test with `--jobs 8` before its publish job can start. See
+[SUPPORT.md](SUPPORT.md) for the gate and
 [BENCHMARKS.md](BENCHMARKS.md) for the controlled comparison protocol.
 The Ollama matrix uses 25 measured requests per placement (100 total), so the
 two quick loops total 200 measured requests. Warm-up, correctness checks,
@@ -466,8 +480,9 @@ For optional long-duration testing, manually run **Gated release** with
 Manual runs never publish a release. Tags use the quick profile, whose
 success does not establish long-duration endurance.
 `release-pins.json` is the machine-readable authority for the Ollama source tag
-and commit, Ollama model manifest, and the hardware/software stack used for
-release certification. It is not an exact kernel requirement for every runtime;
+and commit, the Colibri source commit, Ollama model manifest, and the
+hardware/software stack used for release certification. It is not an exact
+kernel requirement for every runtime;
 the compatibility validator checks capabilities and preserves observed version
 differences in its report.
 

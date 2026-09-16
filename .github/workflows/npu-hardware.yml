@@ -39,6 +39,12 @@ jobs:
         run: |
           cd ollama-xdna/backend/artifacts
           sha256sum --check SHA256SUMS
+      - name: Build Colibri and verify its direct C/XDNA path
+        run: |
+          ./colibri-xdna/scripts/build.sh \
+            --build-root "$RUNNER_TEMP/colibri-hardware-build" \
+            --jobs 8 \
+            --test-npu
       - name: Verify compatible hardware capabilities
         run: |
           python scripts/verify_hardware_versions.py \
