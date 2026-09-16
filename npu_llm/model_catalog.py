@@ -50,11 +50,28 @@ def discover_models(models_dir):
             metadata = json.loads(metadata_path.read_text())
         except (OSError, json.JSONDecodeError):
             continue
+        if not isinstance(metadata, dict):
+            continue
         model_dir = metadata_path.parent
         model_id = metadata.get("model_id") or directory_to_id.get(model_dir.name)
-        if not model_id:
+        # The runtime graphs are architecture-specific.  Do not expose an
+        # arbitrary metadata file as an installed model merely because it
+        # supplies a model_id string.
+        if model_id not in MODEL_PRESETS:
             continue
         preset = MODEL_PRESETS.get(model_id, {})
+        model_format = metadata.get("format", "")
+        if not isinstance(model_format, str) or not model_format.startswith("xdna1-"):
+            continue
+        context_length = metadata.get("context_length", 64)
+        if (
+            isinstance(context_length, bool)
+            or not isinstance(context_length, int)
+            or not 1 < context_length <= 64
+        ):
+            continue
+        if model_id in discovered:
+            raise RuntimeError(f"duplicate installed model id: {model_id}")
         discovered[model_id] = {
             "path": model_dir,
             "display_name": metadata.get(
@@ -65,6 +82,6 @@ def discover_models(models_dir):
                 "source_model",
                 preset.get("repo_id"),
             ),
-            "context_length": int(metadata.get("context_length", 64)),
+            "context_length": context_length,
         }
     return discovered

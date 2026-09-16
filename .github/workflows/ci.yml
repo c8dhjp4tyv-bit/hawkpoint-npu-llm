@@ -33,6 +33,7 @@ jobs:
         run: |
           python npu_llm/tests/test_sampling.py
           python npu_llm/tests/test_decode_loop.py
+          python npu_llm/tests/test_cpu_backend.py
       - name: Test OpenAI-compatible protocol
         run: |
           python tests/test_api_server.py

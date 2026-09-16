@@ -29,8 +29,29 @@ def main():
                 }
             },
         }
-        (root / "metadata.json").write_text(json.dumps(metadata))
+        def write_metadata(payload):
+            payload = dict(payload)
+            payload.pop("metadata_sha256", None)
+            payload["metadata_sha256"] = hashlib.sha256(
+                json.dumps(
+                    payload, separators=(",", ":"), sort_keys=True
+                ).encode()
+            ).hexdigest()
+            (root / "metadata.json").write_text(json.dumps(payload))
+            return payload
+
+        write_metadata(metadata)
         XDNA1Model(root)
+
+        canonical = write_metadata(metadata)
+        XDNA1Model(root)
+        canonical["tensors"] = {"tampered": {}}
+        (root / "metadata.json").write_text(json.dumps(canonical))
+        try:
+            XDNA1Model(root)
+            raise AssertionError("tampered metadata unexpectedly loaded")
+        except RuntimeError as exc:
+            assert "metadata checksum mismatch" in str(exc)
 
         weights.write_bytes(b"tampered model bytes")
         try:
@@ -41,12 +62,36 @@ def main():
 
         metadata.pop("files")
         weights.write_bytes(data)
-        (root / "metadata.json").write_text(json.dumps(metadata))
+        write_metadata(metadata)
         try:
             XDNA1Model(root)
             raise AssertionError("package without integrity manifest loaded")
         except RuntimeError as exc:
             assert "no integrity manifest" in str(exc)
+
+        outside = root.parent / "hawkpoint-integrity-outside.bin"
+        outside.write_bytes(b"outside")
+        try:
+            write_metadata(
+                {
+                    "tensors": {},
+                    "files": {
+                        "../hawkpoint-integrity-outside.bin": {
+                            "size": outside.stat().st_size,
+                            "sha256": hashlib.sha256(
+                                outside.read_bytes()
+                            ).hexdigest(),
+                        }
+                    },
+                }
+            )
+            try:
+                XDNA1Model(root)
+                raise AssertionError("path traversal package unexpectedly loaded")
+            except RuntimeError as exc:
+                assert "escapes package root" in str(exc)
+        finally:
+            outside.unlink()
     print("PASS model package integrity")
 
 
