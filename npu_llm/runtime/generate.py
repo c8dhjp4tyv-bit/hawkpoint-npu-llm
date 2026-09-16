@@ -53,7 +53,7 @@ class NPUDecoder:
         self.head_dim = self.model.metadata["head_dim"]
         self.q_per_kv = self.q_heads // self.kv_heads
         self._rope_inv_freq = 1.0 / (
-            float(self.model.metadata.get("rope_theta", 100000.0))
+            float(self.model.metadata.get("rope_theta", 10000.0))
             ** (
                 np.arange(0, self.head_dim, 2, dtype=np.float32)
                 / np.float32(self.head_dim)

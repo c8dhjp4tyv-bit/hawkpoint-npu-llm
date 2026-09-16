@@ -12,6 +12,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from runtime.model import XDNA1Model
+from model_catalog import discover_models
 
 
 def main():
@@ -92,6 +93,25 @@ def main():
                 assert "escapes package root" in str(exc)
         finally:
             outside.unlink()
+
+    with tempfile.TemporaryDirectory() as temporary:
+        models = Path(temporary)
+        malformed = models / "00-malformed"
+        malformed.mkdir()
+        (malformed / "metadata.json").write_text(json.dumps({
+            "model_id": ["not", "hashable"],
+            "format": "xdna1-w8a16-v1",
+            "context_length": 64,
+        }))
+        valid = models / "SmolLM2-135M-Instruct-xdna1-w8a16"
+        valid.mkdir()
+        (valid / "metadata.json").write_text(json.dumps({
+            "model_id": "smollm2-135m-xdna1",
+            "format": "xdna1-w8a16-v1",
+            "context_length": 64,
+        }))
+        discovered = discover_models(models)
+        assert list(discovered) == ["smollm2-135m-xdna1"]
     print("PASS model package integrity")
 
 

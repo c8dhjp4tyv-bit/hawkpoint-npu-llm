@@ -57,7 +57,7 @@ def discover_models(models_dir):
         # The runtime graphs are architecture-specific.  Do not expose an
         # arbitrary metadata file as an installed model merely because it
         # supplies a model_id string.
-        if model_id not in MODEL_PRESETS:
+        if not isinstance(model_id, str) or model_id not in MODEL_PRESETS:
             continue
         preset = MODEL_PRESETS.get(model_id, {})
         model_format = metadata.get("format", "")

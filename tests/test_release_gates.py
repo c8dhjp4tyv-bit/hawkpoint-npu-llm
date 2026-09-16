@@ -109,6 +109,13 @@ def test_release_pins():
         assert (ROOT / "npu_llm" / "kernels" / kernel).is_file()
 
 
+def test_bf16_decoder_uses_32_row_projection_blocks():
+    """Keep BF16 object-FIFO dimensions aligned with the selected AIE kernel."""
+    design = (ROOT / "npu_llm" / "designs" / "decoder_layer.py").read_text()
+    assert '"layer_project32_k576_bf16"' in design
+    assert '"layer_project64_k576_pair_bf16"' not in design
+
+
 def test_hardware_gate_separates_compatibility_from_release_certification():
     """Distinguish version drift from functional hardware capability failures."""
     pins = {

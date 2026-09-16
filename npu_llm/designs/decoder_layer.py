@@ -125,7 +125,7 @@ def decoder_layer(
         )
     else:
         proj576 = Kernel(
-            "layer_project64_k576_pair_bf16",
+            "layer_project32_k576_bf16",
             obj, [block576, hidden_ty, row64, np.int32]
         )
         proj1536 = Kernel(

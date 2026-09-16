@@ -96,6 +96,9 @@ struct Runtime {
         scales = scales_bo.map<float *>();
         input = input_bo.map<uint16_t *>();
         output = output_bo.map<const uint16_t *>();
+        std::memset(weights, 0, static_cast<size_t>(kSlots) * kTile * kTile);
+        std::fill(scales, scales + kSlots * kTile, 0.0f);
+        std::fill(input, input + kSlots * kTile, uint16_t{0});
         std::memcpy(instruction_bo.map<void *>(), instructions.data(), instructions.size() * 4);
         instruction_bo.sync(XCL_BO_SYNC_BO_TO_DEVICE);
     }
@@ -173,20 +176,24 @@ bool project_segment(ColiCudaTensor *const *items, const float *const *inputs,
 
     for (int input_base = 0; input_base < input_size; input_base += kTile) {
         const int columns = std::min(kTile, input_size - input_base);
-        std::memset(runtime->weights, 0, static_cast<size_t>(kSlots) * kTile * kTile);
-        std::fill(runtime->scales, runtime->scales + kSlots * kTile, 0.0f);
-        std::fill(runtime->input, runtime->input + kSlots * kTile, uint16_t{0});
         for (int slot = 0; slot < count; ++slot) {
+            int8_t *slot_weights = runtime->weights +
+                static_cast<size_t>(slot) * kTile * kTile;
+            float *slot_scales = runtime->scales + slot * kTile;
+            uint16_t *slot_input = runtime->input + slot * kTile;
+            std::memset(slot_weights, 0, static_cast<size_t>(rows) * kTile);
+            std::fill(slot_scales, slot_scales + kTile, 0.0f);
+            std::fill(slot_input, slot_input + kTile, uint16_t{0});
             for (int row = 0; row < rows; ++row) {
                 const int source_row = output_base + row;
                 std::memcpy(
-                    runtime->weights + (static_cast<size_t>(slot) * kTile + row) * kTile,
+                    slot_weights + static_cast<size_t>(row) * kTile,
                     items[slot]->weights.data() + static_cast<size_t>(source_row) * input_size + input_base,
                     columns);
-                runtime->scales[slot * kTile + row] = items[slot]->scales[source_row];
+                slot_scales[row] = items[slot]->scales[source_row];
             }
             for (int col = 0; col < columns; ++col)
-                runtime->input[slot * kTile + col] = to_bf16(inputs[slot][input_base + col]);
+                slot_input[col] = to_bf16(inputs[slot][input_base + col]);
         }
         if (!runtime->run()) return false;
         for (int slot = 0; slot < count; ++slot)
