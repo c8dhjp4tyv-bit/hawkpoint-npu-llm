@@ -32,6 +32,24 @@ def _rows(*token_ids_with_logprobs):
     ]
 
 
+def _logical_workflow_lines(workflow_text):
+    """Join shell continuations while retaining the first physical line."""
+    logical_line = ""
+    start_line = None
+    for line_number, physical_line in enumerate(workflow_text.splitlines(), 1):
+        if start_line is None:
+            start_line = line_number
+        logical_line += physical_line.lstrip() if logical_line else physical_line
+        if re.search(r"\\[ \t]*$", logical_line):
+            logical_line = re.sub(r"\\[ \t]*$", " ", logical_line)
+            continue
+        yield start_line, logical_line
+        logical_line = ""
+        start_line = None
+    if logical_line:
+        yield start_line, logical_line
+
+
 def test_logit_agreement_tolerance():
     # Reference: position 0 is confident (margin 2.0); position 1 is an ambiguous
     # near-tie (margin 0.1).
@@ -165,6 +183,99 @@ def test_hardware_workflows_use_the_intended_validation_mode():
     assert colibri_command in release_workflow
     assert colibri_command in compatibility_workflow
     assert "hosted-colibri" in release_workflow
+    runner_setup = (
+        ROOT / "scripts" / "configure-hardware-runner.sh"
+    ).read_text()
+    assert 'minimum_actions_runner_version="2.327.1"' in runner_setup
+    assert "Runner.Listener" in runner_setup
+
+
+def _run_hardware_runner_version_gate(version):
+    """Run the hardware setup with a controlled Runner.Listener version."""
+    with tempfile.TemporaryDirectory() as directory:
+        temporary_root = Path(directory)
+        listener = temporary_root / "Runner.Listener"
+        listener.write_text(
+            "#!/usr/bin/env bash\n"
+            f"printf '%s\\n' '{version}'\n"
+        )
+        listener.chmod(0o755)
+        environment = dict(
+            os.environ,
+            GITHUB_ENV=str(temporary_root / "github-env"),
+            GITHUB_PATH=str(temporary_root / "github-path"),
+            RUNNER_TEMP=str(temporary_root / "_work" / "_temp"),
+            HAWKPOINT_RUNNER_LISTENER=str(listener),
+            HAWKPOINT_MLIR_AIE_DIR=str(temporary_root / "missing-mlir-aie"),
+        )
+        return subprocess.run(
+            [str(ROOT / "scripts" / "configure-hardware-runner.sh")],
+            env=environment,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+
+def test_hardware_runner_enforces_node24_minimum():
+    """Reject pre-Node-24 runners and accept the documented boundary."""
+    outdated = _run_hardware_runner_version_gate("2.326.0")
+    assert outdated.returncode != 0
+    assert "is too old; version 2.327.1 or newer is required" in outdated.stderr
+
+    minimum = _run_hardware_runner_version_gate("2.327.1")
+    assert minimum.returncode != 0
+    assert "is too old" not in minimum.stderr
+    assert "MLIR-AIE checkout not found" in minimum.stderr
+
+
+def test_python_dependency_files_are_in_sync():
+    """Prevent dependency updates from bypassing hashed workflow installs."""
+    requirements_in = (ROOT / "requirements.in").read_text()
+    requirements_txt = (ROOT / "requirements.txt").read_text()
+    requirements_lock = (ROOT / "requirements.lock").read_text()
+
+    assert requirements_txt == requirements_in
+    direct_pins = re.findall(
+        r"^([A-Za-z0-9_.-]+)==([^\s#]+)$", requirements_in, re.MULTILINE
+    )
+    assert direct_pins
+    for package, version in direct_pins:
+        locked_pin = rf"^{re.escape(package)}=={re.escape(version)}(?:\s|$)"
+        assert re.search(locked_pin, requirements_lock, re.MULTILINE), (
+            f"requirements.lock is missing {package}=={version}; regenerate it"
+        )
+
+    install_commands = []
+    workflow_directory = ROOT / ".github/workflows"
+    workflows = sorted(
+        path
+        for path in workflow_directory.iterdir()
+        if path.is_file() and path.suffix in {".yml", ".yaml"}
+    )
+    for workflow in workflows:
+        for line_number, line in _logical_workflow_lines(workflow.read_text()):
+            if re.search(r"\bpip\s+install\b", line):
+                install_commands.append((workflow, line_number, line.strip()))
+
+    assert install_commands
+    required_arguments = "--require-hashes -r requirements.lock"
+    for workflow, line_number, command in install_commands:
+        assert required_arguments in command, (
+            f"{workflow.relative_to(ROOT)}:{line_number} must install the "
+            "hashed requirements.lock"
+        )
+
+    continued_install = """run: |
+  python -m pip \\
+    install --require-hashes \\
+    -r requirements.lock
+"""
+    continued_lines = list(_logical_workflow_lines(continued_install))
+    assert continued_lines[1] == (
+        2,
+        "  python -m pip  install --require-hashes  -r requirements.lock",
+    )
 
 
 def test_native_quick_budget_covers_all_models():
@@ -248,6 +359,8 @@ def main():
     test_logit_agreement_tolerance()
     test_hardware_gate_separates_compatibility_from_release_certification()
     test_hardware_workflows_use_the_intended_validation_mode()
+    test_hardware_runner_enforces_node24_minimum()
+    test_python_dependency_files_are_in_sync()
     print("PASS immutable release gates")
 
 

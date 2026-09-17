@@ -70,7 +70,8 @@ publish releases.
 
 The self-hosted runner must keep the pinned MLIR-AIE checkout at
 `$HOME/mlir-aie`, or set `HAWKPOINT_MLIR_AIE_DIR`. Before any hardware work,
-`scripts/configure-hardware-runner.sh` verifies the full source commit, the
+`scripts/configure-hardware-runner.sh` requires GitHub Actions runner 2.327.1
+or newer for Node 24 Actions, then verifies the full source commit, the
 dedicated Python environment, XRT libraries, Python bindings, and access to
 device 0. A mismatched or incomplete runner fails closed.
 `scripts/verify_hardware_versions.py` then writes both expected and observed
