@@ -32,6 +32,24 @@ def _rows(*token_ids_with_logprobs):
     ]
 
 
+def _logical_workflow_lines(workflow_text):
+    """Join shell continuations while retaining the first physical line."""
+    logical_line = ""
+    start_line = None
+    for line_number, physical_line in enumerate(workflow_text.splitlines(), 1):
+        if start_line is None:
+            start_line = line_number
+        logical_line += physical_line.lstrip() if logical_line else physical_line
+        if re.search(r"\\[ \t]*$", logical_line):
+            logical_line = re.sub(r"\\[ \t]*$", " ", logical_line)
+            continue
+        yield start_line, logical_line
+        logical_line = ""
+        start_line = None
+    if logical_line:
+        yield start_line, logical_line
+
+
 def test_logit_agreement_tolerance():
     # Reference: position 0 is confident (margin 2.0); position 1 is an ambiguous
     # near-tie (margin 0.1).
@@ -236,8 +254,8 @@ def test_python_dependency_files_are_in_sync():
         if path.is_file() and path.suffix in {".yml", ".yaml"}
     )
     for workflow in workflows:
-        for line_number, line in enumerate(workflow.read_text().splitlines(), 1):
-            if "pip install" in line:
+        for line_number, line in _logical_workflow_lines(workflow.read_text()):
+            if re.search(r"\bpip\s+install\b", line):
                 install_commands.append((workflow, line_number, line.strip()))
 
     assert install_commands
@@ -247,6 +265,17 @@ def test_python_dependency_files_are_in_sync():
             f"{workflow.relative_to(ROOT)}:{line_number} must install the "
             "hashed requirements.lock"
         )
+
+    continued_install = """run: |
+  python -m pip \\
+    install --require-hashes \\
+    -r requirements.lock
+"""
+    continued_lines = list(_logical_workflow_lines(continued_install))
+    assert continued_lines[1] == (
+        2,
+        "  python -m pip  install --require-hashes  -r requirements.lock",
+    )
 
 
 def test_native_quick_budget_covers_all_models():
