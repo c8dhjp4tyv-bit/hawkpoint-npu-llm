@@ -167,6 +167,27 @@ def test_hardware_workflows_use_the_intended_validation_mode():
     assert "hosted-colibri" in release_workflow
 
 
+def test_python_dependency_files_are_in_sync():
+    """Prevent dependency updates from bypassing the hashed CI lockfile."""
+    requirements_in = (ROOT / "requirements.in").read_text()
+    requirements_txt = (ROOT / "requirements.txt").read_text()
+    requirements_lock = (ROOT / "requirements.lock").read_text()
+
+    assert requirements_txt == requirements_in
+    direct_pins = re.findall(
+        r"^([A-Za-z0-9_.-]+)==([^\s#]+)$", requirements_in, re.MULTILINE
+    )
+    assert direct_pins
+    for package, version in direct_pins:
+        locked_pin = rf"^{re.escape(package)}=={re.escape(version)}(?:\s|$)"
+        assert re.search(locked_pin, requirements_lock, re.MULTILINE), (
+            f"requirements.lock is missing {package}=={version}; regenerate it"
+        )
+
+    ci_workflow = (ROOT / ".github/workflows/ci.yml").read_text()
+    assert "--require-hashes -r requirements.lock" in ci_workflow
+
+
 def test_native_quick_budget_covers_all_models():
     """Fail if the real catalog outgrows the four-model quick-test budget."""
     # Load script defaults in a fresh process without an NPU or API server.
@@ -248,6 +269,7 @@ def main():
     test_logit_agreement_tolerance()
     test_hardware_gate_separates_compatibility_from_release_certification()
     test_hardware_workflows_use_the_intended_validation_mode()
+    test_python_dependency_files_are_in_sync()
     print("PASS immutable release gates")
 
 
