@@ -173,7 +173,7 @@ def test_hardware_workflows_use_the_intended_validation_mode():
 
 
 def test_python_dependency_files_are_in_sync():
-    """Prevent dependency updates from bypassing the hashed CI lockfile."""
+    """Prevent dependency updates from bypassing hashed workflow installs."""
     requirements_in = (ROOT / "requirements.in").read_text()
     requirements_txt = (ROOT / "requirements.txt").read_text()
     requirements_lock = (ROOT / "requirements.lock").read_text()
@@ -189,8 +189,19 @@ def test_python_dependency_files_are_in_sync():
             f"requirements.lock is missing {package}=={version}; regenerate it"
         )
 
-    ci_workflow = (ROOT / ".github/workflows/ci.yml").read_text()
-    assert "--require-hashes -r requirements.lock" in ci_workflow
+    install_commands = []
+    for workflow in sorted((ROOT / ".github/workflows").glob("*.yml")):
+        for line_number, line in enumerate(workflow.read_text().splitlines(), 1):
+            if "pip install" in line:
+                install_commands.append((workflow, line_number, line.strip()))
+
+    assert install_commands
+    required_arguments = "--require-hashes -r requirements.lock"
+    for workflow, line_number, command in install_commands:
+        assert required_arguments in command, (
+            f"{workflow.relative_to(ROOT)}:{line_number} must install the "
+            "hashed requirements.lock"
+        )
 
 
 def test_native_quick_budget_covers_all_models():
