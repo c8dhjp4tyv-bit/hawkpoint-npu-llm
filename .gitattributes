@@ -1,1 +1,2 @@
 ollama-xdna/patches/*.patch -whitespace
+colibri-xdna/patches/*.patch -whitespace

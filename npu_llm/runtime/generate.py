@@ -1,7 +1,9 @@
 """Host orchestration for the supported NPU-only decode graphs."""
 
+from collections import OrderedDict
 import gc
 import logging
+import os
 import resource
 import time
 
@@ -50,6 +52,18 @@ class NPUDecoder:
         self.kv_heads = self.model.metadata["kv_heads"]
         self.head_dim = self.model.metadata["head_dim"]
         self.q_per_kv = self.q_heads // self.kv_heads
+        self._rope_inv_freq = 1.0 / (
+            float(self.model.metadata.get("rope_theta", 10000.0))
+            ** (
+                np.arange(0, self.head_dim, 2, dtype=np.float32)
+                / np.float32(self.head_dim)
+            )
+        )
+        self._rope_lut_cache = {}
+        self._qwen_embedding_cache = OrderedDict()
+        self._qwen_embedding_cache_limit = 128
+        self._profile_enabled = os.environ.get("HAWKPOINT_PROFILE") == "1"
+        self._phase_totals = {}
         self.rms_norm_eps = float(
             self.model.metadata.get("rms_norm_eps", 1e-5)
         )
@@ -61,25 +75,80 @@ class NPUDecoder:
             raise ValueError(
                 f"npu_layers must be between 0 and {self.layers}"
             )
+        # The SmolLM graph is parameterised by the number of layers; the host
+        # uses firmware-safe two-layer chunks. Keep Qwen's graph path separate
+        # because it uses a different packed layout and cache contract.
+        self._fused_smollm = (
+            self.npu_layers > 0 and self.model_family != "qwen2"
+        )
+        self._use_quantized_decoder = (
+            self._fused_smollm
+            and os.environ.get("HAWKPOINT_DECODER_W8") == "1"
+        )
+        # The NPU matmul is convenient for Qwen's BF16 head, but on Phoenix
+        # the host BLAS path is faster for SmolLM's 49k x 576 output matrix.
+        # Keep an escape hatch for hardware where the NPU head wins.
+        self._use_cpu_lm_head = (
+            self.model_family != "qwen2"
+            and os.environ.get("HAWKPOINT_NPU_LM_HEAD") != "1"
+        )
+        self._use_cpu_final_norm = (
+            self._use_cpu_lm_head
+            and self.model_family != "qwen2"
+            and os.environ.get("HAWKPOINT_CPU_FINAL_NORM") == "1"
+        )
+        # Phoenix's command watchdog reliably completes the shipped graph for
+        # one or two layers, while larger compile-time values may deadlock in
+        # current firmware.  Keep two as the safe default, but allow a
+        # hardware-specific override for benchmarking newer runtimes.
+        try:
+            requested_chunk = int(os.environ.get("HAWKPOINT_SMOLLM_CHUNK", "2"))
+        except ValueError:
+            requested_chunk = 2
+        self._smollm_chunk_size = max(1, min(self.layers, requested_chunk))
+        self._smollm_chunks = (
+            [
+                (first, min(self._smollm_chunk_size, self.npu_layers - first))
+                for first in range(0, self.npu_layers, self._smollm_chunk_size)
+            ]
+            if self._fused_smollm
+            else []
+        )
         if self.npu_layers:
             set_current_device(from_name("npu", n_cols=4))
+        self._final_norm_buffer = (
+            iron.zeros(self.hidden_size, dtype=bfloat16, device="npu")
+            if self.npu_layers
+            else None
+        )
+        self._lm_head_buffer = (
+            iron.zeros(
+                self.model.metadata["vocab_size"],
+                dtype=bfloat16,
+                device="npu",
+            )
+            if self.npu_layers and not self._use_cpu_lm_head
+            else None
+        )
         self._device_weights = {}
         self._bf16_weights = {}
         self._raw_weights = {}
         self._packed_layer_weights = {}
         self._packed_layer_gammas = {}
-        self._decoder_weights = None
-        self._decoder_gammas = None
+        self._decoder_weights = {}
+        self._decoder_gammas = {}
+        self._cpu_lm_head_f32 = None
+        self._cpu_final_norm_f32 = None
         self._qwen_chunks = {}
         self._qwen_host_buffers = {}
-        self._embedding = (
-            self._raw_bf16("token_embedding")
-            if self.npu_layers and self.model_family != "qwen2"
-            else None
-        )
+        # Upload only the selected row for each token.  The previous SmolLM
+        # path kept the complete embedding table on the NPU and launched a
+        # slice kernel per token; that dispatch dominated the measured decode
+        # latency despite the row being only a few KiB.
+        self._embedding = None
         self._host_embedding = (
             self.model.raw("token_embedding")
-            if self.npu_layers and self.model_family == "qwen2"
+            if self.npu_layers
             else None
         )
         self.cpu_stage = (
@@ -102,18 +171,17 @@ class NPUDecoder:
             if self.npu_layers == 0
             else None
         )
-        self.kv_cache = (
-            []
-            if self.model_family == "qwen2"
-            else [
-                iron.zeros(
-                    (1, self.kv_heads, 2 * self.context_length * self.head_dim),
-                    dtype=bfloat16,
-                    device="npu",
-                )
-                for _ in range(self.npu_layers)
-            ]
-        )
+        self.kv_cache = {}
+        for first, count in self._smollm_chunks:
+            self.kv_cache[first] = iron.zeros(
+                (
+                    count,
+                    self.kv_heads,
+                    2 * self.context_length * self.head_dim,
+                ),
+                dtype=bfloat16,
+                device="npu",
+            )
         self._qwen_cache = {}
         if self.model_family == "qwen2":
             for first in range(0, self.npu_layers, 2):
@@ -155,10 +223,11 @@ class NPUDecoder:
             )
         return self._bf16_weights[name]
 
-    def _project(self, activation, name):
+    def _project(self, activation, name, output=None):
         weight, scale, shape = self._quantized(name)
         rows, cols = shape
-        output = iron.zeros(rows, dtype=bfloat16, device="npu")
+        if output is None:
+            output = iron.zeros(rows, dtype=bfloat16, device="npu")
         project(
             weight,
             scale,
@@ -170,10 +239,11 @@ class NPUDecoder:
         )
         return output
 
-    def _project_bf16(self, activation, name):
+    def _project_bf16(self, activation, name, output=None):
         shape = self.model.tensors[name]["shape"]
         rows, cols = shape
-        output = iron.zeros(rows, dtype=bfloat16, device="npu")
+        if output is None:
+            output = iron.zeros(rows, dtype=bfloat16, device="npu")
         project_bf16(
             self._bf16_projection(name),
             activation,
@@ -251,35 +321,44 @@ class NPUDecoder:
         return output
 
     def _embedding_for(self, token_id):
-        if self.model_family == "qwen2":
-            return iron.tensor(
-                np.asarray(
+        if self.npu_layers:
+            cached = self._qwen_embedding_cache.get(token_id)
+            if cached is None:
+                cached = np.asarray(
                     self._host_embedding[token_id], dtype=np.float32
-                ).astype(bfloat16),
+                ).astype(bfloat16)
+                self._qwen_embedding_cache[token_id] = cached
+            else:
+                self._qwen_embedding_cache.move_to_end(token_id)
+            while len(self._qwen_embedding_cache) > self._qwen_embedding_cache_limit:
+                self._qwen_embedding_cache.popitem(last=False)
+            return iron.tensor(
+                cached,
                 dtype=bfloat16,
                 device="npu",
             )
-        return self._slice(
-            self._embedding,
-            self.model.metadata["vocab_size"] * self.hidden_size,
-            token_id * self.hidden_size,
-            self.hidden_size,
-        )
+        raise RuntimeError("NPU embedding requested on a CPU-only decoder")
 
     def _rope_lut(self, position):
-        rope_theta = float(self.model.metadata.get("rope_theta", 100000.0))
-        inv_freq = 1.0 / (
-            rope_theta
-            ** (np.arange(0, self.head_dim, 2) / self.head_dim)
-        )
-        angle = position * inv_freq
+        cached = self._rope_lut_cache.get(position)
+        if cached is not None:
+            return cached
+        angle = np.float32(position) * self._rope_inv_freq
         parts = [
             np.cos(angle),
             np.sin(angle),
             np.array([position, 0.0], np.float32),
         ]
         lut = np.concatenate(parts).astype(np.float32)
-        return iron.tensor(lut.astype(bfloat16), dtype=bfloat16, device="npu")
+        cached = iron.tensor(lut.astype(bfloat16), dtype=bfloat16, device="npu")
+        self._rope_lut_cache[position] = cached
+        return cached
+
+    def _record_phase(self, name, started):
+        if self._profile_enabled:
+            self._phase_totals[name] = self._phase_totals.get(name, 0.0) + (
+                time.perf_counter() - started
+            )
 
     def _packed_layer(self, layer):
         if layer not in self._packed_layer_weights:
@@ -318,8 +397,9 @@ class NPUDecoder:
             self._packed_layer_gammas[layer],
         )
 
-    def _packed_decoder(self):
-        if self._decoder_weights is None:
+    def _packed_decoder(self, first, count):
+        key = (first, count)
+        if key not in self._decoder_weights:
             projection_weights = {
                 "qkv": [],
                 "o_proj": [],
@@ -327,21 +407,64 @@ class NPUDecoder:
                 "down_proj": [],
             }
             gammas = []
-            for layer in range(self.layers):
+            for layer in range(first, first + count):
                 prefix = f"layer{layer:02d}"
                 for name in projection_weights:
-                    projection_weights[name].append(
-                        np.asarray(
+                    if self._use_quantized_decoder:
+                        tensor = self.model.quantized(f"{prefix}.{name}")
+                        rows_per_block = 32 if name == "down_proj" else 64
+                        weight = np.asarray(tensor.weight, dtype=np.int8)
+                        scale = np.asarray(tensor.scale, dtype=np.float32)
+                        if weight.shape[0] % rows_per_block:
+                            raise RuntimeError(
+                                f"{prefix}.{name} cannot be packed into "
+                                f"{rows_per_block}-row decoder blocks"
+                            )
+                        blocks = []
+                        for start in range(0, weight.shape[0], rows_per_block):
+                            block_weight = np.ascontiguousarray(
+                                weight[start : start + rows_per_block]
+                            ).view(np.uint8).reshape(-1)
+                            block_scale = np.ascontiguousarray(
+                                scale[start : start + rows_per_block]
+                            ).view(np.uint8).reshape(-1)
+                            blocks.append(
+                                np.concatenate((block_weight, block_scale))
+                            )
+                        projection_weights[name].append(
+                            np.concatenate(blocks).astype(np.uint8, copy=False)
+                        )
+                    else:
+                        weight = np.asarray(
                             self.model.bf16_projection(f"{prefix}.{name}")
                         ).reshape(-1)
-                    )
+                        if name == "gate_up":
+                            # The parallel gate graph receives one physical
+                            # block per split endpoint. Reorder each group of
+                            # worker pairs from [w0a,w0b,w1a,w1b,...] to
+                            # [w0a,w1a,...,w0b,w1b,...] so each worker gets a
+                            # complete pair while the merge restores model
+                            # row order. Other projections retain model order.
+                            block = 32 * self.hidden_size
+                            workers = 3
+                            group = 2 * workers * block
+                            if weight.size % group:
+                                raise RuntimeError(
+                                    f"{prefix}.{name} has an invalid block layout"
+                                )
+                            blocks = weight.reshape(-1, block)
+                            groups = blocks.reshape(-1, workers, 2, block)
+                            groups = groups.transpose(0, 2, 1, 3)
+                            weight = np.ascontiguousarray(groups).reshape(-1)
+                        projection_weights[name].append(weight)
                 gammas.extend(
                     [
                         np.asarray(self.model.raw(f"{prefix}.input_norm")),
                         np.asarray(self.model.raw(f"{prefix}.post_attn_norm")),
                     ]
                 )
-            self._decoder_weights = iron.tensor(
+            packed_dtype = np.uint8 if self._use_quantized_decoder else bfloat16
+            self._decoder_weights[key] = iron.tensor(
                 np.concatenate(
                     [
                         *projection_weights["qkv"],
@@ -349,16 +472,30 @@ class NPUDecoder:
                         *projection_weights["gate_up"],
                         *projection_weights["down_proj"],
                     ]
-                ).astype(bfloat16),
-                dtype=bfloat16,
+                ).astype(packed_dtype, copy=False),
+                dtype=packed_dtype,
                 device="npu",
             )
-            self._decoder_gammas = iron.tensor(
+            self._decoder_gammas[key] = iron.tensor(
                 np.concatenate(gammas).astype(bfloat16),
                 dtype=bfloat16,
                 device="npu",
             )
-        return self._decoder_weights, self._decoder_gammas
+        return self._decoder_weights[key], self._decoder_gammas[key]
+
+    def _cpu_lm_head_logits_values(self, values):
+        if self._cpu_lm_head_f32 is None:
+            self._cpu_lm_head_f32 = np.asarray(
+                self.model.bf16_projection("lm_head"), dtype=np.float32
+            )
+        return self._cpu_lm_head_f32 @ np.asarray(
+            values, dtype=np.float32
+        )
+
+    def _cpu_lm_head_logits(self, normalized):
+        return self._cpu_lm_head_logits_values(
+            np.asarray(normalized.numpy(), dtype=np.float32)
+        )
 
     def _packed_qwen_chunk(self, first, count):
         key = (first, count)
@@ -543,19 +680,35 @@ class NPUDecoder:
             ),
         }
 
-    def decode_token(self, token_id, position, *, diagnostics=False, select=None):
+    def decode_token(
+        self,
+        token_id,
+        position,
+        *,
+        diagnostics=False,
+        select=None,
+        compute_logits=True,
+    ):
         """Run one decode step and return ``(next_token, elapsed_seconds)``.
 
         ``select`` overrides token selection with a callable taking the float32
         logit vector and returning a token id. It defaults to ``argmax`` so the
         greedy reference path and the exact-token release gates are unchanged.
+        ``compute_logits=False`` is used for non-final prefill positions: the
+        decoder and KV cache still advance, but the otherwise discarded final
+        normalization and 49k-row LM head are skipped.
         """
         if not 0 <= position < self.context_length:
             raise ValueError("position outside the 64-token context")
         start = time.perf_counter()
         if self.npu_layers:
+            phase = time.perf_counter()
             hidden = self._embedding_for(token_id)
+            self._record_phase("embedding", phase)
+            phase = time.perf_counter()
             rope_lut = self._rope_lut(position)
+            self._record_phase("rope_lut", phase)
+            phase = time.perf_counter()
             if self.model_family == "qwen2":
                 for first in range(0, self.npu_layers, 2):
                     count = min(2, self.npu_layers - first)
@@ -570,21 +723,66 @@ class NPUDecoder:
                         self._qwen_cache[first],
                         layers=count,
                     )
+            elif self._fused_smollm:
+                for first, count in self._smollm_chunks:
+                    weights, gammas = self._packed_decoder(first, count)
+                    decoder_layer(
+                        weights,
+                        gammas,
+                        rope_lut,
+                        hidden,
+                        self.kv_cache[first],
+                        layers=count,
+                        quantized=self._use_quantized_decoder,
+                    )
             else:
                 for layer in range(self.npu_layers):
                     hidden = self._layer(
                         hidden, layer, position, rope_lut
                     )
+            self._record_phase("npu_decoder", phase)
         else:
+            phase = time.perf_counter()
             hidden = _bf16_cpu(self._cpu_embedding[token_id])
+            self._record_phase("cpu_embedding", phase)
         if self.cpu_stage is not None:
+            phase = time.perf_counter()
             if self.npu_layers:
                 hidden = hidden.numpy().astype(bfloat16)
             for layer in range(self.npu_layers, self.layers):
                 hidden = self.cpu_stage.layer(hidden, layer, position)
+            self._record_phase("cpu_decoder", phase)
+            if not compute_logits:
+                return None, time.perf_counter() - start
+            phase = time.perf_counter()
             logits = self.cpu_stage.logits(hidden)
+            self._record_phase("cpu_lm_head", phase)
             return self._decode_result(logits, start, diagnostics, select)
-        normalized = iron.zeros(self.hidden_size, dtype=bfloat16, device="npu")
+        if not compute_logits:
+            return None, time.perf_counter() - start
+        phase = time.perf_counter()
+        normalized = self._final_norm_buffer
+        if self._use_cpu_final_norm:
+            values = np.asarray(hidden.numpy(), dtype=np.float32)
+            if self._cpu_final_norm_f32 is None:
+                self._cpu_final_norm_f32 = np.asarray(
+                    self.model.raw("final_norm"), dtype=np.float32
+                )
+            inv = np.float32(
+                1.0
+                / np.sqrt(
+                    np.mean(values * values, dtype=np.float32)
+                    + np.float32(self.rms_norm_eps)
+                )
+            )
+            normalized_values = values * inv * self._cpu_final_norm_f32
+            logits = self._cpu_lm_head_logits_values(normalized_values)
+            self._record_phase("cpu_lm_head", phase)
+            return self._decode_result(logits, start, diagnostics, select)
+        if normalized is None:
+            normalized = iron.zeros(
+                self.hidden_size, dtype=bfloat16, device="npu"
+            )
         rmsnorm(
             hidden,
             self._raw_bf16("final_norm"),
@@ -592,11 +790,20 @@ class NPUDecoder:
             size=self.hidden_size,
             epsilon=self.rms_norm_eps,
         )
+        if self._use_cpu_lm_head:
+            logits = self._cpu_lm_head_logits(normalized)
+            self._record_phase("cpu_lm_head", phase)
+            return self._decode_result(logits, start, diagnostics, select)
         logits = (
-            self._project_bf16(normalized, "lm_head")
+            self._project_bf16(
+                normalized, "lm_head", output=self._lm_head_buffer
+            )
             if self.model_family == "qwen2"
-            else self._project(normalized, "lm_head")
+            else self._project(
+                normalized, "lm_head", output=self._lm_head_buffer
+            )
         )
+        self._record_phase("npu_lm_head", phase)
         return self._decode_result(logits.numpy(), start, diagnostics, select)
 
     def warmup(self):
@@ -617,18 +824,32 @@ class NPUDecoder:
                     device="npu",
                 )
         else:
-            self.kv_cache = [
-                iron.zeros(
-                    (
-                        1,
-                        self.kv_heads,
-                        2 * self.context_length * self.head_dim,
-                    ),
-                    dtype=bfloat16,
-                    device="npu",
-                )
-                for _ in range(self.npu_layers)
-            ]
+            if self._fused_smollm:
+                self.kv_cache = {
+                    first: iron.zeros(
+                        (
+                            count,
+                            self.kv_heads,
+                            2 * self.context_length * self.head_dim,
+                        ),
+                        dtype=bfloat16,
+                        device="npu",
+                    )
+                    for first, count in self._smollm_chunks
+                }
+            else:
+                self.kv_cache = [
+                    iron.zeros(
+                        (
+                            1,
+                            self.kv_heads,
+                            2 * self.context_length * self.head_dim,
+                        ),
+                        dtype=bfloat16,
+                        device="npu",
+                    )
+                    for _ in range(self.npu_layers)
+                ]
         if self.cpu_stage is not None:
             for cache in self.cpu_stage.key_cache.values():
                 cache.fill(0)
@@ -655,6 +876,8 @@ class NPUDecoder:
         else:
             params = SamplingParams.from_dict(sampling)
         sampler = Sampler(params)
+        if getattr(self, "_profile_enabled", False):
+            self._phase_totals = {}
         prompt_ids = self.tokenizer.encode_chat(messages)
         if len(prompt_ids) + max_new_tokens > self.context_length:
             prompt_ids = prompt_ids[-(self.context_length - max_new_tokens) :]
@@ -678,6 +901,7 @@ class NPUDecoder:
                 token,
                 position,
                 select=select if index == last_prompt_index else None,
+                compute_logits=index == last_prompt_index,
             )
             timings.append(elapsed)
             position += 1
@@ -686,9 +910,17 @@ class NPUDecoder:
             generated.append(next_token)
             history.append(next_token)
             yield self.tokenizer.decode([next_token]), None
+            # The caller requested exactly this many tokens. Do not run one
+            # more full decoder/LM-head step merely to compute a discarded
+            # successor token.
+            if len(generated) >= max_new_tokens:
+                break
             next_token, elapsed = self.decode_token(next_token, position, select=select)
             timings.append(elapsed)
             position += 1
+        prefill_seconds = sum(timings[: len(prompt_ids)])
+        decode_seconds = sum(timings[len(prompt_ids) :])
+        decode_steps = max(0, len(timings) - len(prompt_ids))
         stats = {
             "prompt_tokens": len(prompt_ids),
             "generated_tokens": len(generated),
@@ -698,14 +930,23 @@ class NPUDecoder:
             "finish_reason": (
                 "stop" if next_token == self.tokenizer.eos_id else "length"
             ),
-            "ttft_seconds": sum(timings[: len(prompt_ids)]),
+            "ttft_seconds": prefill_seconds,
+            "prefill_tokens_per_second": (
+                len(prompt_ids) / max(1e-9, prefill_seconds)
+            ),
+            "decode_steps": decode_steps,
+            "decode_seconds": decode_seconds,
             "decode_tokens_per_second": (
-                max(0, len(timings) - len(prompt_ids))
-                / max(1e-9, sum(timings[len(prompt_ids) :]))
+                decode_steps / max(1e-9, decode_seconds)
             ),
             "peak_ram_mib": resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024,
             "sampling": sampler.stats(),
         }
+        if getattr(self, "_profile_enabled", False):
+            stats["phase_ms"] = {
+                name: round(seconds * 1000.0, 3)
+                for name, seconds in self._phase_totals.items()
+            }
         yield "", stats
 
     def generate(self, prompt, max_new_tokens=32, sampling=None):
@@ -737,17 +978,25 @@ class NPUDecoder:
             "_raw_weights",
             "_packed_layer_weights",
             "_packed_layer_gammas",
+            "_decoder_weights",
+            "_decoder_gammas",
             "_qwen_chunks",
             "_qwen_host_buffers",
+            "_qwen_embedding_cache",
+            "_rope_lut_cache",
             "_qwen_cache",
         ):
             container = getattr(self, attr, None)
             if isinstance(container, dict):
                 container.clear()
         self.kv_cache = []
-        self._decoder_weights = None
-        self._decoder_gammas = None
+        self._decoder_weights = {}
+        self._decoder_gammas = {}
+        self._cpu_lm_head_f32 = None
+        self._cpu_final_norm_f32 = None
         self._embedding = None
+        self._final_norm_buffer = None
+        self._lm_head_buffer = None
         # Release the cached, driver-level hardware contexts before another
         # model loads. Only meaningful when this decoder actually touched the
         # NPU; the CPU-only path (npu_layers == 0) never created a context.

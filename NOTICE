@@ -11,6 +11,12 @@ Ollama is distributed under the MIT License. The patch is maintained by this
 project and is not supported by the Ollama project. The GGML interfaces used by
 the dynamic backend come from the llama.cpp version bundled with Ollama.
 
+The optional direct C/XDNA integration contains a patch for Colibri:
+https://github.com/JustVugg/colibri
+
+Colibri is distributed under the Apache License 2.0. The XDNA backend and
+patch are maintained by this project and are not supported by Colibri.
+
 AMD, Xilinx, Ryzen, XDNA, Hugging Face, SmolLM, Docker, and Open WebUI names
 and marks belong to their respective owners. Their use here is descriptive
 and does not imply endorsement.

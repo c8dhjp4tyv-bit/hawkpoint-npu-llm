@@ -74,6 +74,15 @@ def test_release_pins():
     """Validate immutable release references and required patch/kernel artifacts."""
     pins = json.loads((ROOT / "release-pins.json").read_text())
     ollama = pins["ollama"]
+    colibri = pins["colibri"]
+    assert colibri["source_repository"] == "https://github.com/JustVugg/colibri.git"
+    assert re.fullmatch(r"[0-9a-f]{40}", colibri["source_commit"])
+    colibri_patch = ROOT / "colibri-xdna" / "patches" / "colibri-a8f2ca6-xdna.patch"
+    assert colibri_patch.is_file()
+    assert colibri["source_commit"][:7] in colibri_patch.name
+    assert (ROOT / "colibri-xdna" / "backend" / "backend_xdna.cpp").is_file()
+    assert (ROOT / "colibri-xdna" / "backend" / "test_backend_xdna.cpp").is_file()
+    assert (ROOT / "colibri-xdna" / "scripts" / "build.sh").is_file()
     assert re.fullmatch(r"v\d+\.\d+\.\d+", ollama["source_tag"])
     assert re.fullmatch(r"[0-9a-f]{40}", ollama["source_commit"])
     assert re.fullmatch(r"[0-9a-f]{64}", ollama["model_manifest_sha256"])
@@ -98,6 +107,13 @@ def test_release_pins():
     ).is_file()
     for kernel in ("project_q4k_bf16.cc", "project_q6k_bf16.cc"):
         assert (ROOT / "npu_llm" / "kernels" / kernel).is_file()
+
+
+def test_bf16_decoder_uses_32_row_projection_blocks():
+    """Keep BF16 object-FIFO dimensions aligned with the selected AIE kernel."""
+    design = (ROOT / "npu_llm" / "designs" / "decoder_layer.py").read_text()
+    assert '"layer_project32_k576_bf16"' in design
+    assert '"layer_project64_k576_pair_bf16"' not in design
 
 
 def test_hardware_gate_separates_compatibility_from_release_certification():
@@ -145,6 +161,10 @@ def test_hardware_workflows_use_the_intended_validation_mode():
     ).read_text()
     assert "--strict-release" in release_workflow
     assert "--strict-release" not in compatibility_workflow
+    colibri_command = "./colibri-xdna/scripts/build.sh"
+    assert colibri_command in release_workflow
+    assert colibri_command in compatibility_workflow
+    assert "hosted-colibri" in release_workflow
 
 
 def test_native_quick_budget_covers_all_models():

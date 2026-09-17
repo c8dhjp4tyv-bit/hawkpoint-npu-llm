@@ -33,6 +33,7 @@ def main():
     smoke = NPUDecoder(model_dir)
     first_token, cold_seconds = smoke.decode_token(2, 0)
     second_token, warm_seconds = smoke.decode_token(2, 1)
+    smoke.close()
     assert first_token == 198, (
         f"reference-logit argmax mismatch: expected 198, got {first_token}"
     )
@@ -71,6 +72,7 @@ def main():
         "a seeded sampled run was not reproducible"
     )
     assert len(first_sampled) == 32
+    decoder.close()
 
     print("PASS NPU end-to-end")
     print(f"argmax={first_token}")

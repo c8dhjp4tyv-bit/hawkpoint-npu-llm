@@ -13,6 +13,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <filesystem>
 #include <list>
 #include <memory>
 #include <mutex>
@@ -115,10 +116,45 @@ size_t weight_cache_limit_bytes() {
     if (value == nullptr || *value == '\0') {
         return kDefaultWeightCacheMiB * 1024U * 1024U;
     }
+    if (*value < '0' || *value > '9') {
+        return kDefaultWeightCacheMiB * 1024U * 1024U;
+    }
     char * end = nullptr;
     const unsigned long long mib = std::strtoull(value, &end, 10);
     if (end == value || *end != '\0') {
         return kDefaultWeightCacheMiB * 1024U * 1024U;
+    }
+    constexpr unsigned long long kMaxMiB = 64ULL * 1024ULL;
+    return static_cast<size_t>(std::min(mib, kMaxMiB) * 1024ULL * 1024ULL);
+}
+
+bool configured_file(const char * value) {
+    if (value == nullptr || *value == '\0') {
+        return false;
+    }
+    std::error_code error;
+    if (!std::filesystem::is_regular_file(value, error)) {
+        return false;
+    }
+    std::ifstream probe(value, std::ios::binary);
+    return probe.good();
+}
+
+size_t configured_device_memory_bytes() {
+    const char * value = std::getenv("GGML_XDNA_DEVICE_MEMORY_MB");
+    if (value == nullptr || *value == '\0') {
+        // XRT does not expose a stable byte-count API for the XDNA NPU across
+        // the supported driver versions.  Zero means "unknown" to ggml;
+        // never fabricate a capacity that could make the scheduler overcommit.
+        return 0;
+    }
+    if (*value < '0' || *value > '9') {
+        return 0;
+    }
+    char * end = nullptr;
+    const unsigned long long mib = std::strtoull(value, &end, 10);
+    if (end == value || *end != '\0' || mib == 0) {
+        return 0;
     }
     constexpr unsigned long long kMaxMiB = 64ULL * 1024ULL;
     return static_cast<size_t>(std::min(mib, kMaxMiB) * 1024ULL * 1024ULL);
@@ -369,6 +405,7 @@ struct ggml_backend_xdna_context {
     enum ggml_type uploaded_native_type = GGML_TYPE_COUNT;
     int64_t uploaded_native_input_dimension = 0;
     int64_t uploaded_native_output_dimension = 0;
+    size_t cache_eviction_cursor = 0;
 
     ggml_backend_xdna_context(const std::string & xclbin_path, const std::string & inst_path)
         : device(0),
@@ -496,6 +533,31 @@ struct ggml_backend_xdna_context {
         return static_cast<size_t>(kExpertDimension) * sizeof(float);
     }
 
+    static void fill_dense_input(
+        uint16_t * destination,
+        const float * source,
+        int64_t input_base,
+        int64_t input_count) {
+        auto * first = destination;
+        std::fill(
+            first,
+            first + kExpertDimension,
+            static_cast<uint16_t>(0));
+        for (int64_t index = 0; index < input_count; ++index) {
+            first[index] = float_to_bf16(source[input_base + index]);
+        }
+        // Dense tiles use the batch dimension to cover independent output
+        // rows, so every slot consumes the same activation vector. Convert
+        // once and copy the packed BF16 row instead of repeating the scalar
+        // conversion eight times per tile.
+        for (int64_t slot = 1; slot < kExpertBatch; ++slot) {
+            std::memcpy(
+                destination + slot * kExpertDimension,
+                first,
+                static_cast<size_t>(kExpertDimension) * sizeof(uint16_t));
+        }
+    }
+
     void touch_expert(const expert_cache_key & key) {
         const auto found = std::find(expert_lru.begin(), expert_lru.end(), key);
         if (found != expert_lru.end()) {
@@ -520,46 +582,111 @@ struct ggml_backend_xdna_context {
         dense_lru.push_back(key);
     }
 
-    void evict_experts(size_t required) {
-        while (expert_cache_bytes + required > weight_cache_limit &&
-               !expert_lru.empty()) {
-            const expert_cache_key key = expert_lru.front();
-            expert_lru.pop_front();
-            const auto found = expert_cache.find(key);
-            if (found == expert_cache.end()) {
-                continue;
-            }
-            expert_cache_bytes -= found->second->bytes;
-            expert_cache.erase(found);
+    enum class cache_kind { expert, dense, native_expert, native_dense };
+
+    size_t cache_bytes_total() const {
+        return expert_cache_bytes + dense_cache_bytes +
+               native_cache_bytes + native_dense_cache_bytes;
+    }
+
+    bool evict_one(cache_kind kind) {
+        switch (kind) {
+            case cache_kind::expert:
+                while (!expert_lru.empty()) {
+                    const expert_cache_key key = expert_lru.front();
+                    expert_lru.pop_front();
+                    const auto found = expert_cache.find(key);
+                    if (found == expert_cache.end()) {
+                        continue;
+                    }
+                    expert_cache_bytes -= found->second->bytes;
+                    expert_cache.erase(found);
+                    return true;
+                }
+                break;
+            case cache_kind::dense:
+                while (!dense_lru.empty()) {
+                    const dense_cache_key key = dense_lru.front();
+                    dense_lru.pop_front();
+                    const auto found = dense_cache.find(key);
+                    if (found == dense_cache.end()) {
+                        continue;
+                    }
+                    dense_cache_bytes -= found->second->bytes;
+                    dense_cache.erase(found);
+                    return true;
+                }
+                break;
+            case cache_kind::native_expert:
+                while (!native_lru.empty()) {
+                    const expert_cache_key key = native_lru.front();
+                    native_lru.pop_front();
+                    const auto found = native_cache.find(key);
+                    if (found == native_cache.end()) {
+                        continue;
+                    }
+                    native_cache_bytes -= found->second->bytes;
+                    native_cache.erase(found);
+                    return true;
+                }
+                break;
+            case cache_kind::native_dense:
+                while (!native_dense_lru.empty()) {
+                    const dense_cache_key key = native_dense_lru.front();
+                    native_dense_lru.pop_front();
+                    const auto found = native_dense_cache.find(key);
+                    if (found == native_dense_cache.end()) {
+                        continue;
+                    }
+                    native_dense_cache_bytes -= found->second->bytes;
+                    native_dense_cache.erase(found);
+                    return true;
+                }
+                break;
         }
+        return false;
+    }
+
+    void evict_for(size_t required) {
+        if (weight_cache_limit == 0) {
+            return;
+        }
+        // All four cache classes share one process-wide budget.  A new tile
+        // may evict an entry from a different class instead of allowing each
+        // class to consume the full configured limit independently.
+        const std::array<cache_kind, 4> order = {
+            cache_kind::expert,
+            cache_kind::dense,
+            cache_kind::native_expert,
+            cache_kind::native_dense};
+        while (cache_bytes_total() + required > weight_cache_limit) {
+            bool removed = false;
+            for (size_t attempt = 0; attempt < order.size(); ++attempt) {
+                const cache_kind kind = order[
+                    (cache_eviction_cursor + attempt) % order.size()];
+                if (evict_one(kind)) {
+                    cache_eviction_cursor =
+                        (cache_eviction_cursor + attempt + 1) % order.size();
+                    removed = true;
+                    break;
+                }
+            }
+            if (!removed) {
+                break;
+            }
+        }
+    }
+
+    void evict_experts(size_t required) {
+        evict_for(required);
     }
 
     void evict_dense(size_t required) {
-        while (dense_cache_bytes + required > weight_cache_limit &&
-               !dense_lru.empty()) {
-            const dense_cache_key key = dense_lru.front();
-            dense_lru.pop_front();
-            const auto found = dense_cache.find(key);
-            if (found == dense_cache.end()) {
-                continue;
-            }
-            dense_cache_bytes -= found->second->bytes;
-            dense_cache.erase(found);
-        }
+        evict_for(required);
     }
 
     void evict_native_experts(size_t required) {
-        while (native_cache_bytes + required > weight_cache_limit &&
-               !native_lru.empty()) {
-            const expert_cache_key key = native_lru.front();
-            native_lru.pop_front();
-            const auto found = native_cache.find(key);
-            if (found == native_cache.end()) {
-                continue;
-            }
-            native_cache_bytes -= found->second->bytes;
-            native_cache.erase(found);
-        }
+        evict_for(required);
     }
 
     std::shared_ptr<packed_expert> pack_expert(
@@ -828,7 +955,7 @@ struct ggml_backend_xdna_context {
             return packed;
         }
         evict_native_experts(packed->bytes);
-        if (native_cache_bytes + packed->bytes > weight_cache_limit) {
+        if (cache_bytes_total() + packed->bytes > weight_cache_limit) {
             return packed;
         }
         native_cache.emplace(key, packed);
@@ -874,17 +1001,7 @@ struct ggml_backend_xdna_context {
     }
 
     void evict_native_dense(size_t required) {
-        while (native_dense_cache_bytes + required > weight_cache_limit &&
-               !native_dense_lru.empty()) {
-            const dense_cache_key key = native_dense_lru.front();
-            native_dense_lru.pop_front();
-            const auto found = native_dense_cache.find(key);
-            if (found == native_dense_cache.end()) {
-                continue;
-            }
-            native_dense_cache_bytes -= found->second->bytes;
-            native_dense_cache.erase(found);
-        }
+        evict_for(required);
     }
 
     std::shared_ptr<native_persistent_dense_tile> pack_native_dense_tile(
@@ -972,6 +1089,9 @@ struct ggml_backend_xdna_context {
         if (!tile) {
             return nullptr;
         }
+        if (cache_bytes_total() + tile->bytes > weight_cache_limit) {
+            return tile;
+        }
         native_dense_cache.emplace(key, tile);
         native_dense_cache_bytes += tile->bytes;
         native_dense_lru.push_back(key);
@@ -1017,17 +1137,8 @@ struct ggml_backend_xdna_context {
                 if (!tile) {
                     return compute_dense_streaming_locked(destination);
                 }
-                for (int64_t slot = 0; slot < kExpertBatch; ++slot) {
-                    auto * slot_input = input_bf16 + slot * kExpertDimension;
-                    for (int64_t index = 0; index < input_count; ++index) {
-                        slot_input[index] = float_to_bf16(
-                            input_f32[input_base + index]);
-                    }
-                    std::fill(
-                        slot_input + input_count,
-                        slot_input + kExpertDimension,
-                        static_cast<uint16_t>(0));
-                }
+                fill_dense_input(
+                    input_bf16, input_f32, input_base, input_count);
                 native_quant->input_bo.sync(XCL_BO_SYNC_BO_TO_DEVICE);
                 auto run = native_quant->kernel(
                     3,
@@ -1382,17 +1493,8 @@ struct ggml_backend_xdna_context {
                     return compute_dense_streaming_locked(destination);
                 }
 
-                for (int64_t slot = 0; slot < kExpertBatch; ++slot) {
-                    auto * slot_input = input_bf16 + slot * kExpertDimension;
-                    std::fill(
-                        slot_input,
-                        slot_input + kExpertDimension,
-                        static_cast<uint16_t>(0));
-                    for (int64_t index = 0; index < input_count; ++index) {
-                        slot_input[index] = float_to_bf16(
-                            input_f32[input_base + index]);
-                    }
-                }
+                fill_dense_input(
+                    input_bf16, input_f32, input_base, input_count);
                 input_bo.sync(XCL_BO_SYNC_BO_TO_DEVICE);
                 auto run = kernel(
                     3,
@@ -1472,6 +1574,8 @@ struct ggml_backend_xdna_context {
                 const int64_t input_count = std::min<int64_t>(
                     input_dimension - input_base, kExpertDimension);
 
+                fill_dense_input(
+                    input_bf16, input_f32, input_base, input_count);
                 for (int64_t slot = 0; slot < kExpertBatch; ++slot) {
                     const int64_t row_base =
                         output_base + slot * kExpertDimension;
@@ -1483,17 +1587,6 @@ struct ggml_backend_xdna_context {
                     auto * slot_weights =
                         quantized + slot * kExpertDimension * kExpertDimension;
                     auto * slot_scales = scales + slot * kExpertDimension;
-                    auto * slot_input = input_bf16 + slot * kExpertDimension;
-
-                    for (int64_t index = 0; index < input_count; ++index) {
-                        slot_input[index] =
-                            float_to_bf16(input_f32[input_base + index]);
-                    }
-                    std::fill(
-                        slot_input + input_count,
-                        slot_input + kExpertDimension,
-                        static_cast<uint16_t>(0));
-
                     for (int64_t row = 0; row < row_count; ++row) {
                         traits->to_float(
                             static_cast<const char *>(weights->data) +
@@ -1616,7 +1709,9 @@ bool supports_experts(const ggml_tensor * op) {
            op->ne[0] == weights->ne[1] &&
            op->ne[1] == ids->ne[0] &&
            op->ne[2] == 1 &&
-           ggml_is_contiguous(weights);
+           ggml_is_contiguous(weights) &&
+           ggml_is_contiguous(input) &&
+           ggml_is_contiguous(ids);
     return supported;
 }
 
@@ -1689,8 +1784,11 @@ ggml_status graph_compute(ggml_backend_t backend, ggml_cgraph * graph) {
                 case GGML_OP_TRANSPOSE:
                     break;
                 default:
-                    GGML_ABORT(
-                        "%s: unsupported operation %s\n", __func__, ggml_op_desc(node));
+                    GGML_LOG_WARN(
+                        "%s: unsupported operation %s; returning to scheduler\n",
+                        __func__,
+                        ggml_op_desc(node));
+                    return GGML_STATUS_FAILED;
             }
         }
         return GGML_STATUS_SUCCESS;
@@ -1736,8 +1834,9 @@ const char * device_description(ggml_backend_dev_t device) {
 
 void device_memory(ggml_backend_dev_t device, size_t * free, size_t * total) {
     GGML_UNUSED(device);
-    *free = 0;
-    *total = 0;
+    const size_t capacity = configured_device_memory_bytes();
+    *free = capacity;
+    *total = capacity;
 }
 
 enum ggml_backend_dev_type device_type(ggml_backend_dev_t device) {
@@ -1756,6 +1855,7 @@ void device_properties(
         /* .host_buffer          = */ false,
         /* .buffer_from_host_ptr = */ true,
         /* .events               = */ false,
+        /* .mmap_support         = */ false,
     };
 }
 
@@ -1828,8 +1928,8 @@ size_t registry_device_count(ggml_backend_reg_t registry) {
     // advertising a device whose init fails aborts context creation for every
     // model -- even pure CPU/GPU inference that never asked for XDNA. Report
     // zero devices so ggml transparently falls back when XDNA is unconfigured.
-    if (std::getenv("GGML_XDNA_XCLBIN") == nullptr ||
-        std::getenv("GGML_XDNA_INSTS") == nullptr) {
+    if (!configured_file(std::getenv("GGML_XDNA_XCLBIN")) ||
+        !configured_file(std::getenv("GGML_XDNA_INSTS"))) {
         return 0;
     }
     return 1;
@@ -1871,9 +1971,10 @@ ggml_backend_t device_init(ggml_backend_dev_t device, const char * parameters) {
     GGML_UNUSED(parameters);
     const char * xclbin_path = std::getenv("GGML_XDNA_XCLBIN");
     const char * inst_path = std::getenv("GGML_XDNA_INSTS");
-    if (xclbin_path == nullptr || inst_path == nullptr) {
+    if (!configured_file(xclbin_path) || !configured_file(inst_path)) {
         GGML_LOG_ERROR(
-            "XDNA backend requires GGML_XDNA_XCLBIN and GGML_XDNA_INSTS\n");
+            "XDNA backend requires readable GGML_XDNA_XCLBIN and "
+            "GGML_XDNA_INSTS files\n");
         return nullptr;
     }
     try {

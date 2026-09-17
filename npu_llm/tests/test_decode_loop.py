@@ -78,9 +78,20 @@ def build_decoder(prompt_ids, logits_for, *, context_length=64):
     decoder.layers = 0
     decoder.calls = []
 
-    def decode_token(token_id, position, *, diagnostics=False, select=None):
+    def decode_token(
+        token_id,
+        position,
+        *,
+        diagnostics=False,
+        select=None,
+        compute_logits=True,
+    ):
         logits = np.asarray(logits_for(token_id), dtype=np.float32)
-        decoder.calls.append((token_id, position, select is not None))
+        decoder.calls.append(
+            (token_id, position, select is not None, compute_logits)
+        )
+        if not compute_logits:
+            return None, 0.001
         chosen = int(np.argmax(logits)) if select is None else int(select(logits))
         return chosen, 0.001
 
@@ -114,16 +125,26 @@ def test_greedy_default_is_unchanged():
     assert text == "<4><5><6><7>"
     assert stats["finish_reason"] == "length"
     assert stats["sampling"]["mode"] == "greedy"
+    assert stats["decode_steps"] == 3
+    assert stats["decode_seconds"] == 0.003
     # No prompt position engaged a sampler.
-    assert [engaged for _, _, engaged in decoder.calls] == [False] * 7
+    assert [engaged for _, _, engaged, _ in decoder.calls] == [False] * 6
+    assert [enabled for _, _, _, enabled in decoder.calls] == [
+        False,
+        False,
+        True,
+        True,
+        True,
+        True,
+    ]
 
 
 def test_sampler_runs_once_per_emitted_token():
     decoder = build_decoder([1, 2, 3], _ramp)
     _, stats = run(decoder, sampling=SamplingParams.build(temperature=1.0, seed=5))
-    engaged = [engaged for _, _, engaged in decoder.calls]
+    engaged = [engaged for _, _, engaged, _ in decoder.calls]
     # Three prompt positions, but only the last one produces a used token.
-    assert engaged == [False, False, True, True, True, True, True]
+    assert engaged == [False, False, True, True, True, True]
     assert stats["sampling"]["mode"] == "sampled"
     assert stats["sampling"]["seed"] == 5
 

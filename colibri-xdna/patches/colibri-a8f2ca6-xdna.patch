@@ -1,0 +1,58 @@
+diff --git a/c/Makefile b/c/Makefile
+index d12c661..b5faeb8 100644
+--- a/c/Makefile
++++ b/c/Makefile
+@@ -219,6 +219,8 @@ INSTALL    ?= install
+ #                   clean. See backend_loader.c and README "cuda-dll" below.
+ CUDA      ?= 0
+ CUDA_DLL  ?= 0
++XDNA      ?= 0
++XRT_ROOT  ?= /opt/xilinx/xrt
+ COLI_ANS  ?= 0
+ DIETGPU_ROOT ?=
+ DEEPGEMM  ?= 0
+@@ -439,6 +441,24 @@ PYTHON    ?= python3
+ endif
+ CUDA_OBJ  =
+ 
++# XDNA=1 reuses the stable resident-tensor ABI exposed in backend_cuda.h while
++# linking a native C++/XRT implementation. Unsupported operations return zero,
++# which is the ABI's documented signal for the C engine to use its CPU path.
++ifeq ($(XDNA),1)
++ifeq (,$(LINUX))
++$(error XDNA=1 is supported only on Linux)
++endif
++ifneq ($(filter 1,$(CUDA) $(HIP) $(CUDA_DLL) $(HIP_DLL)),)
++$(error choose XDNA=1 or a CUDA/HIP backend, not both)
++endif
++ifneq ($(COLI_ANS),0)
++$(error XDNA=1 does not support COLI_ANS)
++endif
++CFLAGS   += -DCOLI_CUDA -DCOLI_XDNA
++LDFLAGS  += -L$(XRT_ROOT)/lib64 -Wl,-rpath,$(XRT_ROOT)/lib64 -lxrt_coreutil -lstdc++
++CUDA_OBJ  = backend_xdna.o
++endif
++
+ # DeepSeek V4 is a separate x86-64/aarch64 runtime. Portable infrastructure
+ # tests run everywhere; the engine and token-exact fixture run on x86-64
+ # Linux/Windows, aarch64 Linux, and arm64 macOS. SIMD fast paths are gated
+@@ -713,7 +733,7 @@ glm: colibri$(EXE)
+ # rewrite it ONLY when they change (evaluated here at parse time, so the file's
+ # timestamp moves exactly when the config moves). The binary and CUDA/loader objects depend
+ # on it, so they relink on a config change and stay put otherwise. (#306)
+-BUILD_CONFIG     := $(CC)|$(CFLAGS)|$(LDFLAGS)|CUDA=$(CUDA)|CUDA_DLL=$(CUDA_DLL)|ARCH=$(ARCH)|CUDA_ARCH=$(CUDA_ARCH)|METAL=$(METAL)|HIP=$(HIP)|HIP_DLL=$(HIP_DLL)|HIP_ARCH=$(HIP_ARCH)|VK=$(VK)
++BUILD_CONFIG     := $(CC)|$(CFLAGS)|$(LDFLAGS)|CUDA=$(CUDA)|CUDA_DLL=$(CUDA_DLL)|XDNA=$(XDNA)|XRT_ROOT=$(XRT_ROOT)|ARCH=$(ARCH)|CUDA_ARCH=$(CUDA_ARCH)|METAL=$(METAL)|HIP=$(HIP)|HIP_DLL=$(HIP_DLL)|HIP_ARCH=$(HIP_ARCH)|VK=$(VK)
+ BUILD_CONFIG_OLD := $(shell cat .build-config 2>/dev/null)
+ ifneq "$(BUILD_CONFIG)" "$(BUILD_CONFIG_OLD)"
+ # $(file ...) writes via make's own primitive (GNU Make >= 4.0, 2013), NOT by
+@@ -740,6 +760,10 @@ shaders/%.spv: shaders/%.comp
+ backend_loader.o: backend_loader.c backend_cuda.h compat.h .build-config
+ 	$(CC) $(CFLAGS) -c backend_loader.c -o $@
+ 
++backend_xdna.o: backend_xdna.cpp backend_cuda.h .build-config
++	$(CXX) -std=c++17 -O3 -Wall -Wextra -Wno-ignored-qualifiers \
++		-I$(XRT_ROOT)/include -c backend_xdna.cpp -o $@
++
+ # Windows CUDA DLL: compile backend_cuda.cu with nvcc (+MSVC cl.exe as host
+ # compiler, required by nvcc on Windows) into coli_cuda.dll. Run this from a
+ # shell that has the MSVC environment set (e.g. after vcvars64.bat, or from a

@@ -16,6 +16,13 @@ static inline float layer_rsqrt(float value) {
   return estimate;
 }
 
+// Query heads are packed in three groups of 3x64 values.  Keeping the
+// offsets as a compile-time table avoids a signed head/3 division in the hot
+// per-head RoPE worker (which otherwise lowers to the slow __divsi3 helper).
+static constexpr int layer_q_offsets[9] = {
+    0, 64, 128, 336, 400, 464, 672, 736, 800};
+static constexpr float layer_inv_576 = 0.001736111111111111f;
+
 extern "C" {
 
 void layer_copy576(const bfloat16 *__restrict input,
@@ -24,18 +31,34 @@ void layer_copy576(const bfloat16 *__restrict input,
     aie::store_v(output + i, aie::load_v<16>(input + i));
 }
 
+void layer_copy64(const bfloat16 *__restrict input,
+                  bfloat16 *__restrict output) {
+  for (int i = 0; i < 64; i += 16)
+    aie::store_v(output + i, aie::load_v<16>(input + i));
+}
+
 void layer_rmsnorm576(const bfloat16 *__restrict input,
                       const bfloat16 *__restrict gamma,
                       bfloat16 *__restrict output) {
-  float sum_sq = 0.0f;
-  for (int i = 0; i < 576; ++i) {
-    const float x = static_cast<float>(input[i]);
-    sum_sq += x * x;
+  aie::accum<accfloat, 32> sum_acc = aie::zeros<accfloat, 32>();
+  chess_prepare_for_pipelining chess_loop_range(18, )
+  for (int i = 0; i < 576; i += 32) {
+    const auto x = aie::load_v<32>(input + i);
+    sum_acc = aie::add(sum_acc, aie::mul(x, x));
   }
-  const float inv = layer_rsqrt(sum_sq / 576.0f + 1e-5f);
-  for (int i = 0; i < 576; ++i)
-    output[i] = static_cast<bfloat16>(
-        static_cast<float>(input[i]) * inv * static_cast<float>(gamma[i]));
+  const float sum_sq = aie::reduce_add<float>(sum_acc);
+  const float inv = layer_rsqrt(sum_sq * layer_inv_576 + 1e-5f);
+  const auto inv_v = aie::broadcast<bfloat16, 16>(inv);
+  chess_prepare_for_pipelining chess_loop_range(36, )
+  for (int i = 0; i < 576; i += 16) {
+    const auto x = aie::load_v<16>(input + i);
+    const auto g = aie::load_v<16>(gamma + i);
+    const auto x_scaled =
+        aie::mul(x, inv_v).template to_vector<bfloat16>();
+    const auto scaled =
+        aie::mul(x_scaled, g).template to_vector<bfloat16>();
+    aie::store_v(output + i, scaled);
+  }
 }
 
 void layer_project64_k576(const uint8_t *__restrict packed,
@@ -51,10 +74,7 @@ void layer_project64_k576(const uint8_t *__restrict packed,
       const auto x = aie::load_v<32>(activation + col);
       total = aie::add(total, aie::mul(w, x));
     }
-    const auto lanes = total.template to_vector<float>();
-    float sum = 0.0f;
-    for (int lane = 0; lane < 32; ++lane)
-      sum += lanes[lane];
+    const float sum = aie::reduce_add<float>(total);
     output[row] = static_cast<bfloat16>(sum * scales[row]);
   }
 }
@@ -72,10 +92,7 @@ void layer_project32_k1536(const uint8_t *__restrict packed,
       const auto x = aie::load_v<32>(activation + col);
       total = aie::add(total, aie::mul(w, x));
     }
-    const auto lanes = total.template to_vector<float>();
-    float sum = 0.0f;
-    for (int lane = 0; lane < 32; ++lane)
-      sum += lanes[lane];
+    const float sum = aie::reduce_add<float>(total);
     output[row] = static_cast<bfloat16>(sum * scales[row]);
   }
 }
@@ -83,36 +100,73 @@ void layer_project32_k1536(const uint8_t *__restrict packed,
 void layer_project32_k576_bf16(const bfloat16 *__restrict weights,
                                const bfloat16 *__restrict activation,
                                bfloat16 *__restrict output, int32_t offset) {
+  chess_prepare_for_pipelining chess_loop_range(32, )
   for (int row = 0; row < 32; ++row) {
     aie::accum<accfloat, 32> total = aie::zeros<accfloat, 32>();
+    chess_prepare_for_pipelining chess_loop_range(18, )
     for (int col = 0; col < 576; col += 32) {
       const auto w = aie::load_v<32>(weights + row * 576 + col);
       const auto x = aie::load_v<32>(activation + col);
       total = aie::add(total, aie::mul(w, x));
     }
-    const auto lanes = total.template to_vector<float>();
-    float sum = 0.0f;
-    for (int lane = 0; lane < 32; ++lane)
-      sum += lanes[lane];
+    const float sum = aie::reduce_add<float>(total);
     output[offset + row] = static_cast<bfloat16>(sum);
+  }
+}
+
+// The BF16 decoder stores projection rows in 32-row DMA blocks.  The graph
+// consumes two adjacent blocks per output object, so keep both pointers in a
+// single kernel invocation.  This halves kernel/queue transactions without
+// increasing the ObjectFifo buffer size (a 64-row temporary would exceed the
+// tile-local memory budget on some XDNA1 placements).
+void layer_project64_k576_pair_bf16(
+    const bfloat16 *__restrict weights,
+    const bfloat16 *__restrict activation,
+    bfloat16 *__restrict output, int32_t offset) {
+  for (int row = 0; row < 64; ++row) {
+    aie::accum<accfloat, 32> total = aie::zeros<accfloat, 32>();
+    chess_prepare_for_pipelining chess_loop_range(18, )
+    for (int col = 0; col < 576; col += 32) {
+      const auto w = aie::load_v<32>(weights + row * 576 + col);
+      const auto x = aie::load_v<32>(activation + col);
+      total = aie::add(total, aie::mul(w, x));
+    }
+    output[offset + row] =
+        static_cast<bfloat16>(aie::reduce_add<float>(total));
   }
 }
 
 void layer_project16_k1536_bf16(const bfloat16 *__restrict weights,
                                 const bfloat16 *__restrict activation,
                                 bfloat16 *__restrict output, int32_t offset) {
+  chess_prepare_for_pipelining chess_loop_range(16, )
   for (int row = 0; row < 16; ++row) {
     aie::accum<accfloat, 32> total = aie::zeros<accfloat, 32>();
+    chess_prepare_for_pipelining chess_loop_range(48, )
     for (int col = 0; col < 1536; col += 32) {
       const auto w = aie::load_v<32>(weights + row * 1536 + col);
       const auto x = aie::load_v<32>(activation + col);
       total = aie::add(total, aie::mul(w, x));
     }
-    const auto lanes = total.template to_vector<float>();
-    float sum = 0.0f;
-    for (int lane = 0; lane < 32; ++lane)
-      sum += lanes[lane];
+    const float sum = aie::reduce_add<float>(total);
     output[offset + row] = static_cast<bfloat16>(sum);
+  }
+}
+
+void layer_project32_k1536_pair_bf16(
+    const bfloat16 *__restrict weights,
+    const bfloat16 *__restrict activation,
+    bfloat16 *__restrict output, int32_t offset) {
+  for (int row = 0; row < 32; ++row) {
+    aie::accum<accfloat, 32> total = aie::zeros<accfloat, 32>();
+    chess_prepare_for_pipelining chess_loop_range(48, )
+    for (int col = 0; col < 1536; col += 32) {
+      const auto w = aie::load_v<32>(weights + row * 1536 + col);
+      const auto x = aie::load_v<32>(activation + col);
+      total = aie::add(total, aie::mul(w, x));
+    }
+    output[offset + row] =
+        static_cast<bfloat16>(aie::reduce_add<float>(total));
   }
 }
 
@@ -123,7 +177,7 @@ void layer_pack_rope32(const bfloat16 *__restrict first_half,
                        int32_t kind) {
   int offset;
   if (kind == 0)
-    offset = (head / 3) * 336 + (head % 3) * 64;
+    offset = layer_q_offsets[head];
   else
     offset = head * 336 + (kind == 1 ? 192 : 256);
   bfloat16 *dst = packed + offset;
@@ -156,7 +210,7 @@ void layer_pack_rope64(const bfloat16 *__restrict row,
                        int32_t kind) {
   int offset;
   if (kind == 0)
-    offset = (head / 3) * 336 + (head % 3) * 64;
+    offset = layer_q_offsets[head];
   else
     offset = head * 336 + (kind == 1 ? 192 : 256);
   bfloat16 *dst = packed + offset;
@@ -193,6 +247,17 @@ static inline float layer_exp(float x) {
   return value.f;
 }
 
+static inline float layer_dot64(const bfloat16 *__restrict lhs,
+                                const bfloat16 *__restrict rhs) {
+  aie::accum<accfloat, 32> total = aie::zeros<accfloat, 32>();
+  for (int dim = 0; dim < 64; dim += 32) {
+    const auto a = aie::load_v<32>(lhs + dim);
+    const auto b = aie::load_v<32>(rhs + dim);
+    total = aie::add(total, aie::mul(a, b));
+  }
+  return aie::reduce_add<float>(total);
+}
+
 void layer_attention(const bfloat16 *__restrict packed_qkv,
                      const bfloat16 *__restrict cache_in,
                      bfloat16 *__restrict cache_out,
@@ -206,7 +271,11 @@ void layer_attention(const bfloat16 *__restrict packed_qkv,
   const bfloat16 *value_in = cache_in + 4096;
   bfloat16 *keys = cache_out;
   bfloat16 *values = cache_out + 4096;
-  for (int i = 0; i < 4096; i += 16) {
+  // Only positions before the current token are consumed by attention.  The
+  // host drains the complete cache buffer, but values beyond the current
+  // prefix are never read before being overwritten on a later invocation.
+  const int prefix_values = position * 64;
+  for (int i = 0; i < prefix_values; i += 16) {
     aie::store_v(keys + i, aie::load_v<16>(key_in + i));
     aie::store_v(values + i, aie::load_v<16>(value_in + i));
   }
@@ -220,10 +289,7 @@ void layer_attention(const bfloat16 *__restrict packed_qkv,
     float maximum = -3.4e38f;
     const bfloat16 *q = queries + head * 64;
     for (int token = 0; token <= position; ++token) {
-      float dot = 0.0f;
-      for (int dim = 0; dim < 64; ++dim)
-        dot += static_cast<float>(q[dim]) *
-               static_cast<float>(keys[token * 64 + dim]);
+      const float dot = layer_dot64(q, keys + token * 64);
       score[token] = dot * 0.125f;
       if (score[token] > maximum)
         maximum = score[token];
@@ -233,13 +299,19 @@ void layer_attention(const bfloat16 *__restrict packed_qkv,
       score[token] = layer_exp(score[token] - maximum);
       sum += score[token];
     }
-    const float inv = 1.0f / sum;
-    for (int dim = 0; dim < 64; ++dim) {
-      float result = 0.0f;
-      for (int token = 0; token <= position; ++token)
-        result += score[token] * inv *
-                  static_cast<float>(values[token * 64 + dim]);
-      output[head * 64 + dim] = static_cast<bfloat16>(result);
+    // The score sum is strictly positive.  The same two-step reciprocal
+    // Newton refinement used by RMSNorm avoids a scalar __divsf3 call here.
+    const float inv = layer_rsqrt(sum * sum);
+    for (int dim = 0; dim < 64; dim += 16) {
+      aie::accum<accfloat, 16> result = aie::zeros<accfloat, 16>();
+      for (int token = 0; token <= position; ++token) {
+        const auto value = aie::load_v<16>(values + token * 64 + dim);
+        const auto weight = aie::broadcast<bfloat16, 16>(
+            static_cast<bfloat16>(score[token] * inv));
+        result = aie::add(result, aie::mul(value, weight));
+      }
+      aie::store_v(output + head * 64 + dim,
+                   result.template to_vector<bfloat16>());
     }
   }
 }
@@ -248,6 +320,15 @@ void layer_residual64(const bfloat16 *__restrict projection,
                       const bfloat16 *__restrict residual,
                       bfloat16 *__restrict output, int32_t offset) {
   for (int i = 0; i < 64; i += 16)
+    aie::store_v(output + offset + i,
+                 aie::add(aie::load_v<16>(projection + i),
+                          aie::load_v<16>(residual + offset + i)));
+}
+
+void layer_residual32(const bfloat16 *__restrict projection,
+                      const bfloat16 *__restrict residual,
+                      bfloat16 *__restrict output, int32_t offset) {
+  for (int i = 0; i < 32; i += 16)
     aie::store_v(output + offset + i,
                  aie::add(aie::load_v<16>(projection + i),
                           aie::load_v<16>(residual + offset + i)));
@@ -297,15 +378,6 @@ void layer_swiglu_up32(const bfloat16 *__restrict up,
     const aie::vector<bfloat16, 16> result = aie::mul(silu, u);
     aie::store_v(output + offset + i, result);
   }
-}
-
-void layer_residual32(const bfloat16 *__restrict projection,
-                      const bfloat16 *__restrict residual,
-                      bfloat16 *__restrict output, int32_t offset) {
-  for (int i = 0; i < 32; i += 16)
-    aie::store_v(output + offset + i,
-                 aie::add(aie::load_v<16>(projection + i),
-                          aie::load_v<16>(residual + offset + i)));
 }
 
 void layer_residual16(const bfloat16 *__restrict projection,

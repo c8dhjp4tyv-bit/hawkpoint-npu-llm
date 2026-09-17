@@ -39,15 +39,30 @@ EXPECTED_ARCHITECTURE = SMOLLM_ARCHITECTURE
 
 
 def _tensor_files(model_dir: Path):
+    model_dir = model_dir.resolve()
+
+    def checked(path):
+        path = Path(path)
+        if path.is_absolute():
+            raise ValueError(f"source tensor path must be relative: {path}")
+        resolved = (model_dir / path).resolve()
+        try:
+            resolved.relative_to(model_dir)
+        except ValueError as exc:
+            raise ValueError(f"source tensor path escapes model directory: {path}") from exc
+        if not resolved.is_file():
+            raise FileNotFoundError(f"missing source tensor file: {resolved}")
+        return resolved
+
     index = model_dir / "model.safetensors.index.json"
     if index.exists():
         mapping = json.loads(index.read_text())["weight_map"]
-        return {name: model_dir / file for name, file in mapping.items()}
+        return {name: checked(file) for name, file in mapping.items()}
     single = model_dir / "model.safetensors"
     if not single.exists():
         raise FileNotFoundError(f"no safetensors weights in {model_dir}")
     with safe_open(single, framework="np") as f:
-        return {name: single for name in f.keys()}
+        return {name: checked(single.name) for name in f.keys()}
 
 
 class TensorReader:
@@ -102,6 +117,14 @@ def write_raw(out_dir, name, array, dtype, manifest):
         "shape": list(array.shape),
         "dtype": np.dtype(dtype).name,
     }
+
+
+def _metadata_digest(manifest):
+    canonical = dict(manifest)
+    canonical.pop("metadata_sha256", None)
+    return hashlib.sha256(
+        json.dumps(canonical, separators=(",", ":"), sort_keys=True).encode()
+    ).hexdigest()
 
 
 def _validate_architecture(config):
@@ -195,7 +218,10 @@ def _convert_into(
         manifest["display_name"] = display_name
 
     embed = reader.get("model.embed_tokens.weight")
-    write_raw(out_dir, "token_embedding", embed, np.float16, manifest)
+    # Preserve BF16 source tensors when available.  Casting them through FP16
+    # before the NPU conversion needlessly discards mantissa bits.
+    embed_dtype = bfloat16 if str(np.asarray(embed).dtype) == "bfloat16" else np.float16
+    write_raw(out_dir, "token_embedding", embed, embed_dtype, manifest)
 
     for layer in range(layers):
         prefix = f"model.layers.{layer}"
@@ -234,7 +260,7 @@ def _convert_into(
             out_dir,
             f"layer{layer:02d}.qkv_bias",
             qkv_bias,
-            np.float16,
+            np.float32,
             manifest,
         )
         write_quantized(
@@ -254,19 +280,31 @@ def _convert_into(
             out_dir,
             f"layer{layer:02d}.input_norm",
             reader.get(f"{prefix}.input_layernorm.weight"),
-            np.float16,
+            bfloat16
+            if str(reader.get(f"{prefix}.input_layernorm.weight").dtype)
+            == "bfloat16"
+            else np.float16,
             manifest,
         )
         write_raw(
             out_dir,
             f"layer{layer:02d}.post_attn_norm",
             reader.get(f"{prefix}.post_attention_layernorm.weight"),
-            np.float16,
+            bfloat16
+            if str(reader.get(f"{prefix}.post_attention_layernorm.weight").dtype)
+            == "bfloat16"
+            else np.float16,
             manifest,
         )
 
     write_raw(
-        out_dir, "final_norm", reader.get("model.norm.weight"), np.float16, manifest
+        out_dir,
+        "final_norm",
+        reader.get("model.norm.weight"),
+        bfloat16
+        if str(reader.get("model.norm.weight").dtype) == "bfloat16"
+        else np.float16,
+        manifest,
     )
     lm_name = "lm_head.weight"
     lm_head = reader.get(lm_name) if reader.has(lm_name) else embed
@@ -291,6 +329,7 @@ def _convert_into(
         for path in sorted(out_dir.iterdir())
         if path.is_file() and path.name != "metadata.json"
     }
+    manifest["metadata_sha256"] = _metadata_digest(manifest)
     metadata = out_dir / "metadata.json"
     metadata.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
     with metadata.open("rb") as stream:

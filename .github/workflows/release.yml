@@ -57,8 +57,29 @@ jobs:
           cd /tmp/ollama
           GOMAXPROCS=8 go test -p 8 ./api ./cmd ./discover ./llm ./server
 
+  hosted-colibri:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - run: sudo apt-get update && sudo apt-get install -y shellcheck
+      - run: |
+          bash -n colibri-xdna/scripts/*.sh
+          shellcheck colibri-xdna/scripts/*.sh
+      - name: Apply patch to pinned Colibri source
+        run: |
+          commit="$(jq -er '.colibri.source_commit' release-pins.json)"
+          repository="$(jq -er '.colibri.source_repository' release-pins.json)"
+          git clone --quiet --filter=blob:none "$repository" /tmp/colibri
+          git -C /tmp/colibri checkout --quiet "$commit"
+          git -C /tmp/colibri apply --check \
+            "$GITHUB_WORKSPACE/colibri-xdna/patches/colibri-a8f2ca6-xdna.patch"
+          git -C /tmp/colibri apply \
+            "$GITHUB_WORKSPACE/colibri-xdna/patches/colibri-a8f2ca6-xdna.patch"
+          cp colibri-xdna/backend/backend_xdna.cpp /tmp/colibri/c/backend_xdna.cpp
+          make -C /tmp/colibri/c -n colibri XDNA=1 | grep -q backend_xdna.cpp
+
   hawk-point:
-    needs: [hosted-protocol, hosted-ollama]
+    needs: [hosted-protocol, hosted-ollama, hosted-colibri]
     runs-on: [self-hosted, linux, x64, xdna1, hawk-point]
     timeout-minutes: 1440
     env:
@@ -80,6 +101,12 @@ jobs:
         run: |
           cd ollama-xdna/backend/artifacts
           sha256sum --check SHA256SUMS
+      - name: Build Colibri and verify its direct C/XDNA path
+        run: |
+          ./colibri-xdna/scripts/build.sh \
+            --build-root "$RUNNER_TEMP/colibri-release-build" \
+            --jobs 8 \
+            --test-npu
       - name: Certify release hardware stack and capture compatibility report
         run: |
           python scripts/verify_hardware_versions.py \

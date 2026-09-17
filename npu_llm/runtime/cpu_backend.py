@@ -23,6 +23,13 @@ class CPUDecoderStage:
         self.head_dim = self.metadata["head_dim"]
         self.q_per_kv = self.q_heads // self.kv_heads
         self.rope_theta = float(self.metadata.get("rope_theta", 10000.0))
+        self._rope_inv_frequency = 1.0 / (
+            self.rope_theta
+            ** (
+                np.arange(self.head_dim // 2, dtype=np.float32)
+                / np.float32(self.head_dim // 2)
+            )
+        )
         self.epsilon = float(self.metadata.get("rms_norm_eps", 1e-5))
         self._weights = {}
         self._raw = {}
@@ -71,11 +78,7 @@ class CPUDecoderStage:
     def _rotate(self, heads, position):
         heads = np.asarray(heads, dtype=np.float32)
         half = self.head_dim // 2
-        inverse_frequency = 1.0 / (
-            self.rope_theta
-            ** (np.arange(half, dtype=np.float32) / half)
-        )
-        angle = position * inverse_frequency
+        angle = np.float32(position) * self._rope_inv_frequency
         cosine = np.cos(angle)
         sine = np.sin(angle)
         first, second = heads[..., :half], heads[..., half:]
@@ -104,28 +107,26 @@ class CPUDecoderStage:
         self.key_cache[layer][:, position] = key
         self.value_cache[layer][:, position] = value
 
-        output = np.empty((self.q_heads, self.head_dim), dtype=bfloat16)
         scale = self.head_dim**-0.5
-        for kv_head in range(self.kv_heads):
-            keys = np.asarray(
-                self.key_cache[layer][kv_head, : position + 1],
-                dtype=np.float32,
-            )
-            values = np.asarray(
-                self.value_cache[layer][kv_head, : position + 1],
-                dtype=np.float32,
-            )
-            for group_head in range(self.q_per_kv):
-                q_head = kv_head * self.q_per_kv + group_head
-                scores = (
-                    keys
-                    @ np.asarray(query[q_head], dtype=np.float32)
-                ) * scale
-                scores -= np.max(scores)
-                probabilities = np.exp(scores)
-                probabilities /= np.sum(probabilities)
-                output[q_head] = _bf16(probabilities @ values)
-        return output.reshape(-1)
+        keys = np.asarray(
+            self.key_cache[layer][:, : position + 1], dtype=np.float32
+        )
+        values = np.asarray(
+            self.value_cache[layer][:, : position + 1], dtype=np.float32
+        )
+        grouped_query = np.asarray(query, dtype=np.float32).reshape(
+            self.kv_heads, self.q_per_kv, self.head_dim
+        )
+        scores = np.einsum(
+            "kqd,ksd->kqs", grouped_query, keys, optimize=True
+        ) * scale
+        scores -= np.max(scores, axis=-1, keepdims=True)
+        probabilities = np.exp(scores)
+        probabilities /= np.sum(probabilities, axis=-1, keepdims=True)
+        output = np.einsum(
+            "kqs,ksd->kqd", probabilities, values, optimize=True
+        )
+        return _bf16(output.reshape(-1))
 
     def layer(self, hidden, layer, position):
         prefix = f"layer{layer:02d}"

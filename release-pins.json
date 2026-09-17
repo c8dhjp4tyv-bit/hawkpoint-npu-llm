@@ -10,6 +10,10 @@
     "xrt_hash": "8bf2fc4c090540dcf7872243ab67779ae74ef5e3",
     "xrt_version": "2.26.0"
   },
+  "colibri": {
+    "source_commit": "a8f2ca623ffe9de9df11d56f34d11d2d501493d3",
+    "source_repository": "https://github.com/JustVugg/colibri.git"
+  },
   "ollama": {
     "model": "qwen2.5:0.5b",
     "model_manifest_sha256": "a8b0c51577010a279d933d14c2a8ab4b268079d44c5c8830c0a93900f1827c67",

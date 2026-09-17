@@ -33,6 +33,7 @@ jobs:
         run: |
           python npu_llm/tests/test_sampling.py
           python npu_llm/tests/test_decode_loop.py
+          python npu_llm/tests/test_cpu_backend.py
       - name: Test OpenAI-compatible protocol
         run: |
           python tests/test_api_server.py
@@ -68,3 +69,27 @@ jobs:
             "$patch_file"
           cd /tmp/ollama
           go test ./api ./cmd ./discover ./llm ./server
+
+  colibri-patch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - name: Install static-analysis tools
+        run: sudo apt-get update && sudo apt-get install -y shellcheck
+      - name: Check integration scripts
+        run: |
+          bash -n colibri-xdna/scripts/*.sh
+          shellcheck colibri-xdna/scripts/*.sh
+      - name: Verify patch against pinned Colibri
+        run: |
+          commit="$(jq -er '.colibri.source_commit' release-pins.json)"
+          repository="$(jq -er '.colibri.source_repository' release-pins.json)"
+          git clone --quiet --filter=blob:none "$repository" /tmp/colibri
+          git -C /tmp/colibri checkout --quiet "$commit"
+          git -C /tmp/colibri apply --check \
+            "$GITHUB_WORKSPACE/colibri-xdna/patches/colibri-a8f2ca6-xdna.patch"
+          git -C /tmp/colibri apply \
+            "$GITHUB_WORKSPACE/colibri-xdna/patches/colibri-a8f2ca6-xdna.patch"
+          cp colibri-xdna/backend/backend_xdna.cpp /tmp/colibri/c/backend_xdna.cpp
+          make -C /tmp/colibri/c -n colibri XDNA=1 | grep -q backend_xdna.cpp

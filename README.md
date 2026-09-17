@@ -21,12 +21,13 @@ tag does not mean production-ready.
 
 ## Choose a runtime
 
-This repository now contains two independent XDNA1 paths:
+This repository now contains three independent XDNA1 paths:
 
 | Runtime | Best use |
 |---|---|
 | Native MLIR-AIE runtime below | Small supported checkpoints with a custom OpenAI-compatible server |
 | [Ollama XDNA1 patch](ollama-xdna/README.md) | Existing Ollama Qwen models shared across CPU, GPU, and NPU |
+| [Colibri direct C/XDNA backend](colibri-xdna/README.md) | Colibri routed-expert and decode matmul calls made directly from its C engine |
 
 For the Ollama path, install distro-specific build dependencies first:
 
@@ -47,6 +48,18 @@ the machine. The complete driver/XRT prerequisites, distro commands, safe
 dry-run, model test, update, API/Open WebUI, and rollback instructions are in
 the [Ollama XDNA1 guide](ollama-xdna/README.md).
 
+For Colibri, the repository provides a pinned source patch and a native C++/XRT
+implementation of Colibri's C backend ABI. Build it and exercise the NPU path
+without a proxy using:
+
+```bash
+./colibri-xdna/scripts/build.sh --build-root work/colibri-build --test-npu
+```
+
+Supported operations, environment variables, CPU fallback behavior, and the
+current full-model validation boundary are documented in the
+[Colibri direct C/XDNA guide](colibri-xdna/README.md).
+
 ## Demonstrated hardware result
 
 Validated on a Hawk Point XDNA1 NPU (`RyzenAI-npu1`, AIE2, 4 columns):
@@ -55,19 +68,22 @@ Validated on a Hawk Point XDNA1 NPU (`RyzenAI-npu1`, AIE2, 4 columns):
 |---|---:|
 | CPU/BF16 reference first-token argmax | 198 |
 | NPU first-token argmax | 198 |
-| Cold compile/load | 7.03 s |
-| Warm `decode_token` smoke test | 10.72 token/s |
-| 32-token streaming chat | 3.65 token/s |
-| End-to-end TTFT for the 32-token acceptance prompt | 8.80 s |
-| Peak host RAM during acceptance | 833.6 MiB |
+| Cold compile/load | 7.82 s |
+| Warm `decode_token` smoke test | 13.25 token/s (0.0755 s/token) |
+| 32-token streaming chat | 15.93 token/s |
+| Native 16-token W8 decode, latest 3-run median | 14.42 token/s |
+| Corrected-loop session medians / best individual run | 14.42–19.99 / 20.20 token/s |
+| Native W8 TTFT, 35-token prompt | 1.47–1.62 s session medians |
+| End-to-end TTFT for the 32-token acceptance prompt | 2.56 s |
+| Peak host RAM during acceptance | 349.5 MiB |
 | Fixed hardware context | 64 tokens |
 
 The acceptance prompt generated:
 
 ```text
-The sky looks blue during the day because the Earth's atmosphere scatters
-the sunlight in all directions, including blue light. When sunlight enters
-the Earth's atmosphere,
+The sky appears blue during the day because our eyes are sensitive to the
+color of the sky. When sunlight enters the Earth's atmosphere, it encounters
+tiny particles called
 ```
 
 The fused Qwen2.5 0.5B path is checked against both the NumPy BF16 runtime and
@@ -77,11 +93,24 @@ the top-five logits, BF16 near-ties, and CPU/NPU latency without treating a
 performance regression as a correctness pass or claiming an unmeasured
 speedup.
 
-The API prewarms the default model, moving the roughly 4.2-second compile/load
-cost to server startup. A real four-token `Hello` response produced
-`Hello! How can` at 1.47 decode tokens/s after prompt ingestion, using about
-2.4 GiB peak host RAM. Results are from the same Hawk Point system and vary
-with memory pressure and CPU BLAS configuration.
+The API prewarms the default model, moving the compile/load cost to server
+startup. Results are from the same Hawk Point system and vary with temperature,
+memory pressure, concurrent NPU activity, and CPU BLAS configuration. The
+current loop skips the discarded LM-head work at non-final prefill positions
+and does not execute an unused successor step after reaching `max_tokens`.
+Consequently, the corrected measurements use 15 timed decode intervals for 16
+emitted tokens after TTFT. Repeated three- and five-run sessions produced
+14.42–19.99 token/s medians (20.20 token/s best individual run), demonstrating
+the device's temperature/load sensitivity. The older 18.42 token/s result timed an
+additional discarded successor step and is historical decoder-step evidence,
+not a directly comparable current end-to-end rate.
+
+The current controlled benchmark remains below the requested 50–75 token/s
+range: the full 30-layer SmolLM decoder is the dominant measured phase on this
+XDNA1 device. The best measured configuration is opt-in W8 projection plus
+CPU final RMSNorm/LM-head (`HAWKPOINT_DECODER_W8=1
+HAWKPOINT_CPU_FINAL_NORM=1`); it reports the miss rather than extrapolating an
+unmeasured kernel rate.
 
 ## What is included
 
@@ -418,9 +447,11 @@ Tests are directly executable and do not require pytest:
 
 ```bash
 python npu_llm/tests/test_converter.py
+python npu_llm/tests/test_model_integrity.py
 python npu_llm/tests/test_model_runtime.py
 python npu_llm/tests/test_sampling.py
 python npu_llm/tests/test_decode_loop.py
+python npu_llm/tests/test_cpu_backend.py
 python tests/test_api_server.py
 ```
 
@@ -437,8 +468,9 @@ python npu_llm/tests/validate_chat_npu.py
 The tag-triggered release pipeline performs fresh pinned downloads and
 conversion, Qwen token agreement, a bounded model-switch stress test of at
 least 100 switches, a quick soak of 100 completions (25 consecutive per
-model), and an Ollama install/inference/rollback test with
-`--jobs 8` before its publish job can start. See [SUPPORT.md](SUPPORT.md) for the gate and
+model), an Ollama install/inference/rollback test, and a direct Colibri C/XDNA
+build plus NPU ABI test with `--jobs 8` before its publish job can start. See
+[SUPPORT.md](SUPPORT.md) for the gate and
 [BENCHMARKS.md](BENCHMARKS.md) for the controlled comparison protocol.
 The Ollama matrix uses 25 measured requests per placement (100 total), so the
 two quick loops total 200 measured requests. Warm-up, correctness checks,
@@ -448,8 +480,9 @@ For optional long-duration testing, manually run **Gated release** with
 Manual runs never publish a release. Tags use the quick profile, whose
 success does not establish long-duration endurance.
 `release-pins.json` is the machine-readable authority for the Ollama source tag
-and commit, Ollama model manifest, and the hardware/software stack used for
-release certification. It is not an exact kernel requirement for every runtime;
+and commit, the Colibri source commit, Ollama model manifest, and the
+hardware/software stack used for release certification. It is not an exact
+kernel requirement for every runtime;
 the compatibility validator checks capabilities and preserves observed version
 differences in its report.
 
@@ -459,6 +492,11 @@ Component examples:
 python npu_llm/tests/test_elementwise_npu.py
 python npu_llm/tests/test_qwen_components_npu.py
 python npu_llm/tests/benchmark_qwen_fused.py /path/to/converted-qwen
+HAWKPOINT_DECODER_W8=1 HAWKPOINT_CPU_FINAL_NORM=1 HAWKPOINT_PROFILE=1 \
+  python scripts/benchmark_native.py /path/to/converted-smollm \
+  --tokens 16 --runs 3 --report benchmark.json
+HAWKPOINT_PROFILE=1 python scripts/benchmark_native.py \
+  /path/to/converted-qwen --tokens 32 --runs 3 --report benchmark.json
 python npu_llm/designs/rmsnorm.py --dev npu --size 576 -w 2 -i 5
 python npu_llm/designs/rope.py --dev npu --heads 12 --position 7 -w 2 -i 5
 ```
@@ -467,16 +505,31 @@ python npu_llm/designs/rope.py --dev npu --heads 12 --position 7 -w 2 -i 5
 
 Each generated token follows this path:
 
-1. Fetch the token embedding into an XRT buffer.
-2. Run the decoder layers using the fused SmolLM graph or persistent two-layer
-   Qwen BF16 programs.
+1. Fetch the token embedding row into an XRT buffer.
+2. Run SmolLM decoder layers in persistent two-layer graph chunks (the Phoenix
+   firmware reliably completes this chunk size); Qwen uses its own two-layer
+   BF16 program.
 3. Keep the 64-token K/V cache in NPU-addressable XRT buffers.
-4. Apply final RMSNorm and the model-specific LM head. Qwen uses a cached CPU
-   LM-head matrix while its 24 decoder layers remain on XDNA1.
+4. Apply final RMSNorm and the model-specific LM head. SmolLM keeps the
+   49k-vocabulary projection on host BLAS by default because it is faster on
+   Hawk Point; set `HAWKPOINT_NPU_LM_HEAD=1` to force the NPU path.
 5. Select the next token and decode it on the host.
 
-The decoder xclbin is compiled once and reused for every two-layer Qwen chunk
-and token position. Layer weights and K/V caches remain in XRT buffer objects.
+The decoder xclbin is compiled once and reused for every two-layer chunk and
+token position. Layer weights and K/V caches remain in XRT buffer objects. The
+largest gate/up projection is split across three compute workers, and the
+attention kernel copies only the cache prefix needed for the current position.
+The optional `HAWKPOINT_DECODER_W8=1` mode uses the bundled int8 projection
+kernels. On the validated Phoenix stack it is the fastest measured path; the
+default BF16 decoder remains available as the numerical baseline. For SmolLM,
+`HAWKPOINT_CPU_FINAL_NORM=1` moves only the final 576-element RMSNorm to the
+host and is valid together with the CPU LM-head path.
+W8 is an accuracy/performance trade-off: the release acceptance gate remains
+on the default BF16 path, while the W8 benchmark is reported separately.
+Set `HAWKPOINT_PROFILE=1` (or pass `--profile` to `benchmark_native.py`) to
+include embedding, RoPE, decoder, LM-head, and CPU phase timings in the final
+statistics. The benchmark reports whether the measured median reaches the
+50 token/s target; it never fabricates a result when no NPU is available.
 
 ## Limitations
 
@@ -549,6 +602,10 @@ generation.
   or multi-worker pipelining. Between-token gaps include XRT command submission
   overhead, but the current benchmark tooling does not instrument that phase
   separately.
+- The Ollama backend enforces one global persistent-weight cache budget across
+  dense, expert, and native Q4/Q6 caches. Set
+  `GGML_XDNA_DEVICE_MEMORY_MB` only when the platform exposes a known capacity;
+  otherwise device memory is reported as unknown rather than guessed.
 
 See [ROADMAP.md](ROADMAP.md) for planned improvements and [BENCHMARKS.md](BENCHMARKS.md) for the
 controlled comparison protocol.
