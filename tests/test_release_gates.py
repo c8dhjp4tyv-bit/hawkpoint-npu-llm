@@ -172,6 +172,45 @@ def test_hardware_workflows_use_the_intended_validation_mode():
     assert "Runner.Listener" in runner_setup
 
 
+def _run_hardware_runner_version_gate(version):
+    """Run the hardware setup with a controlled Runner.Listener version."""
+    with tempfile.TemporaryDirectory() as directory:
+        temporary_root = Path(directory)
+        listener = temporary_root / "Runner.Listener"
+        listener.write_text(
+            "#!/usr/bin/env bash\n"
+            f"printf '%s\\n' '{version}'\n"
+        )
+        listener.chmod(0o755)
+        environment = dict(
+            os.environ,
+            GITHUB_ENV=str(temporary_root / "github-env"),
+            GITHUB_PATH=str(temporary_root / "github-path"),
+            RUNNER_TEMP=str(temporary_root / "_work" / "_temp"),
+            HAWKPOINT_RUNNER_LISTENER=str(listener),
+            HAWKPOINT_MLIR_AIE_DIR=str(temporary_root / "missing-mlir-aie"),
+        )
+        return subprocess.run(
+            [str(ROOT / "scripts" / "configure-hardware-runner.sh")],
+            env=environment,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+
+def test_hardware_runner_enforces_node24_minimum():
+    """Reject pre-Node-24 runners and accept the documented boundary."""
+    outdated = _run_hardware_runner_version_gate("2.326.0")
+    assert outdated.returncode != 0
+    assert "is too old; version 2.327.1 or newer is required" in outdated.stderr
+
+    minimum = _run_hardware_runner_version_gate("2.327.1")
+    assert minimum.returncode != 0
+    assert "is too old" not in minimum.stderr
+    assert "MLIR-AIE checkout not found" in minimum.stderr
+
+
 def test_python_dependency_files_are_in_sync():
     """Prevent dependency updates from bypassing hashed workflow installs."""
     requirements_in = (ROOT / "requirements.in").read_text()
@@ -291,6 +330,7 @@ def main():
     test_logit_agreement_tolerance()
     test_hardware_gate_separates_compatibility_from_release_certification()
     test_hardware_workflows_use_the_intended_validation_mode()
+    test_hardware_runner_enforces_node24_minimum()
     test_python_dependency_files_are_in_sync()
     print("PASS immutable release gates")
 
