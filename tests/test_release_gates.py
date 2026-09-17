@@ -165,6 +165,11 @@ def test_hardware_workflows_use_the_intended_validation_mode():
     assert colibri_command in release_workflow
     assert colibri_command in compatibility_workflow
     assert "hosted-colibri" in release_workflow
+    runner_setup = (
+        ROOT / "scripts" / "configure-hardware-runner.sh"
+    ).read_text()
+    assert 'minimum_actions_runner_version="2.327.1"' in runner_setup
+    assert "Runner.Listener" in runner_setup
 
 
 def test_python_dependency_files_are_in_sync():
