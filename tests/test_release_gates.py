@@ -190,7 +190,13 @@ def test_python_dependency_files_are_in_sync():
         )
 
     install_commands = []
-    for workflow in sorted((ROOT / ".github/workflows").glob("*.yml")):
+    workflow_directory = ROOT / ".github/workflows"
+    workflows = sorted(
+        path
+        for path in workflow_directory.iterdir()
+        if path.is_file() and path.suffix in {".yml", ".yaml"}
+    )
+    for workflow in workflows:
         for line_number, line in enumerate(workflow.read_text().splitlines(), 1):
             if "pip install" in line:
                 install_commands.append((workflow, line_number, line.strip()))
