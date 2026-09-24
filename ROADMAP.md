@@ -35,20 +35,29 @@ reproducible `seed` are supported by the runtime, the terminal chat, and the
 OpenAI-compatible API. Greedy decoding remains the default so the exact-token
 release gates are unaffected.
 
-Still missing from the completion API: `n > 1`, beam search, `logprobs`, and
-stop sequences.
+### Stop sequences and log probabilities
+`stop` (up to four strings, never emitted) and OpenAI-style `logprobs` /
+`top_logprobs` are supported by the runtime and the API.
+
+Still missing from the completion API: `n > 1` and beam search.
+
+### Prompt-prefix reuse
+A prompt that starts with the tokens already in the K/V cache resumes prefill
+after them, so a multi-turn chat only prefills its newest message. Long
+conversations are shortened at turn boundaries, keeping the newest message
+whole for as long as possible, instead of cutting raw tokens from the front.
 
 ## XDNA2 / NPU4 Compatibility
 
 ### Current state
-XDNA2 (Strix Point, Strix Halo) uses AIE4 tiles with 8 columns (vs XDNA1's 4),
-new shared L2 buffer, and next-gen DMA. The current IRON graphs hardcode a
+XDNA2 (`npu2`: Strix Point, Strix Halo) uses AIE2P tiles with 8 columns (vs
+XDNA1's 4), new shared L2 buffer, and next-gen DMA. The current IRON graphs hardcode a
 4-column array.
 
 ### Required for proof-of-concept
 1. **Re-parameterize IRON layouts** — column count and ObjectFifo depths as
    configurable in `qwen_decoder.py`
-2. **AIE2→AIE4 kernel rewrite** — wider vectors (512-bit), FP8 tensor blocks
+2. **AIE2→AIE2P kernel port** — wider vectors (512-bit), FP8 tensor blocks
 3. **Auto-detect device column count** at runtime instead of fixed `n_cols=4`
 4. Validate token-acceptance parity with existing CPU BF16 reference sequences
 

@@ -65,18 +65,39 @@ class FakeTokenizer:
     def encode_chat(self, messages):
         return list(self.prompt_ids)
 
+    def encode_chat_window(self, messages, budget):
+        return list(self.prompt_ids), {"dropped_messages": 0}
+
     def decode(self, ids):
         return "".join(f"<{token}>" for token in ids)
 
+    def token_bytes(self, token_id):
+        return self.decode([token_id]).encode()
 
-def build_decoder(prompt_ids, logits_for, *, context_length=64):
+
+class SplitCharacterTokenizer(FakeTokenizer):
+    """Token 7 carries the first byte of "ç" and token 8 the second."""
+
+    PIECES = {7: b"\xc3", 8: b"\xa7"}
+
+    def decode(self, ids):
+        data = b"".join(self.PIECES.get(token, b"<%d>" % token) for token in ids)
+        return data.decode("utf-8", errors="replace")
+
+    def token_bytes(self, token_id):
+        return self.PIECES.get(token_id, b"<%d>" % token_id)
+
+
+def build_decoder(prompt_ids, logits_for, *, context_length=64, tokenizer=None):
     """An NPUDecoder whose decode step is a pure function of the input token."""
     decoder = object.__new__(NPUDecoder)
     decoder.context_length = context_length
-    decoder.tokenizer = FakeTokenizer(prompt_ids)
+    decoder.tokenizer = (tokenizer or FakeTokenizer)(prompt_ids)
     decoder.npu_layers = 0
     decoder.layers = 0
     decoder.calls = []
+    decoder._cached_prefix = []
+    decoder._prefix_cache_enabled = True
 
     def decode_token(
         token_id,
@@ -99,11 +120,14 @@ def build_decoder(prompt_ids, logits_for, *, context_length=64):
     return decoder
 
 
-def run(decoder, max_new_tokens=4, sampling=None):
+def run(decoder, max_new_tokens=4, sampling=None, **options):
     text = []
     stats = None
-    for piece, final_stats in decoder.generate_messages(
-        [{"role": "user", "content": "hi"}], max_new_tokens, sampling=sampling
+    for piece, final_stats, *_ in decoder.generate_messages(
+        [{"role": "user", "content": "hi"}],
+        max_new_tokens,
+        sampling=sampling,
+        **options,
     ):
         text.append(piece)
         if final_stats is not None:
@@ -213,6 +237,140 @@ def test_invalid_sampling_is_rejected_by_the_decoder():
         except ValueError:
             continue
         raise AssertionError(f"{bad} was accepted by generate_messages")
+
+
+def test_shared_prompt_prefix_is_not_recomputed():
+    decoder = build_decoder([1, 2, 3], _ramp)
+    _, first = run(decoder)
+    assert first["cached_prompt_tokens"] == 0
+    # The generated tokens were written to the cache after the prompt.
+    assert decoder._cached_prefix == [1, 2, 3, 4, 5, 6]
+
+    # A follow-up prompt extends the first conversation.
+    decoder.tokenizer.prompt_ids = [1, 2, 3, 4, 5, 2]
+    decoder.calls.clear()
+    _, second = run(decoder)
+    assert second["cached_prompt_tokens"] == 5
+    assert second["prompt_tokens"] == 6
+    assert [position for _, position, _, _ in decoder.calls][:1] == [5]
+    assert second["generated_token_ids"] == [3, 4, 5, 6]
+
+    # An identical prompt still recomputes its last position for the logits.
+    decoder.calls.clear()
+    _, repeat = run(decoder)
+    assert repeat["cached_prompt_tokens"] == 5
+    assert repeat["generated_token_ids"] == second["generated_token_ids"]
+
+    # A prompt that diverges early reuses only the common prefix.
+    decoder.tokenizer.prompt_ids = [1, 7, 3]
+    decoder.calls.clear()
+    _, diverged = run(decoder)
+    assert diverged["cached_prompt_tokens"] == 1
+    assert decoder.calls[0][:2] == (7, 1)
+
+
+def test_prefix_cache_can_be_disabled_and_reset():
+    decoder = build_decoder([1, 2, 3], _ramp)
+    run(decoder)
+    decoder.reset_prefix_cache()
+    decoder.calls.clear()
+    _, stats = run(decoder)
+    assert stats["cached_prompt_tokens"] == 0
+    assert decoder.calls[0][:2] == (1, 0)
+
+    decoder._prefix_cache_enabled = False
+    decoder.calls.clear()
+    _, stats = run(decoder)
+    assert stats["cached_prompt_tokens"] == 0
+    assert len(decoder.calls) == 6
+
+
+def test_failed_step_invalidates_its_position():
+    decoder = build_decoder([1, 2, 3], _ramp)
+    run(decoder)
+    original = decoder.decode_token
+
+    def failing(token_id, position, **kwargs):
+        if position == 1:
+            raise RuntimeError("kernel failure")
+        return original(token_id, position, **kwargs)
+
+    decoder.decode_token = failing
+    decoder.tokenizer.prompt_ids = [1, 9, 9, 9]
+    try:
+        run(decoder)
+    except RuntimeError:
+        pass
+    else:
+        raise AssertionError("the failing step did not raise")
+    assert decoder._cached_prefix == [1]
+
+
+def test_stop_sequence_ends_generation_without_emitting_it():
+    decoder = build_decoder([1], _ramp)
+    text, stats = run(decoder, max_new_tokens=8, stop=["<4><"])
+    assert text == "<2><3>"
+    assert stats["finish_reason"] == "stop"
+    assert stats["stop_sequence"] == "<4><"
+    # Generation stopped at the token that completed the sequence.
+    assert stats["generated_token_ids"] == [2, 3, 4, 5]
+
+    # A partial match that is ruled out is released unchanged.
+    text, stats = run(build_decoder([1], _ramp), max_new_tokens=3, stop="<3>x")
+    assert text == "<2><3><4>"
+    assert stats["finish_reason"] == "length"
+    assert stats["stop_sequence"] is None
+
+
+def test_split_utf8_character_is_emitted_whole():
+    def spell(token_id):
+        logits = np.zeros(VOCAB, dtype=np.float32)
+        logits[{1: 7, 7: 8}.get(token_id, EOS)] = 5.0
+        return logits
+
+    decoder = build_decoder([1], spell, tokenizer=SplitCharacterTokenizer)
+    pieces = [
+        piece
+        for piece, stats in decoder.generate_messages(
+            [{"role": "user", "content": "hi"}], 4
+        )
+        if stats is None
+    ]
+    assert pieces == ["ç"]
+
+
+def test_logprobs_follow_the_emitted_text():
+    def spell(token_id):
+        logits = np.full(VOCAB, -1.0, dtype=np.float32)
+        logits[{1: 7, 7: 8, 8: 3}.get(token_id, EOS)] = 5.0
+        return logits
+
+    decoder = build_decoder([1], spell, tokenizer=SplitCharacterTokenizer)
+    chunks = list(
+        decoder.generate_messages(
+            [{"role": "user", "content": "hi"}], 8, logprobs=2
+        )
+    )
+    assert all(len(chunk) == 3 for chunk in chunks)
+    text_chunks = [(text, entries) for text, stats, entries in chunks if stats is None]
+    # The first byte's entry waits for the chunk that completes the character.
+    assert [text for text, _ in text_chunks] == ["ç", "<3>"]
+    assert [len(entries) for _, entries in text_chunks] == [2, 1]
+    entry = text_chunks[0][1][0]
+    assert entry["bytes"] == [0xC3]
+    assert entry["logprob"] < 0 and entry["logprob"] > -0.1
+    assert len(entry["top_logprobs"]) == 2
+    assert entry["top_logprobs"][0]["logprob"] == entry["logprob"]
+    stats = chunks[-1][1]
+    # The end-of-turn token is not reported.
+    assert stats["finish_reason"] == "stop"
+    assert stats["generated_token_ids"] == [7, 8, 3]
+
+
+def test_logprobs_do_not_change_greedy_tokens():
+    plain = run(build_decoder([1, 2], _ramp), max_new_tokens=5)[1]
+    scored = run(build_decoder([1, 2], _ramp), max_new_tokens=5, logprobs=0)[1]
+    assert scored["generated_token_ids"] == plain["generated_token_ids"]
 
 
 def main():

@@ -34,6 +34,14 @@ def main():
     parser.add_argument("--min-tps", type=float, default=50.0)
     parser.add_argument("--stretch-tps", type=float, default=75.0)
     parser.add_argument("--profile", action="store_true")
+    parser.add_argument(
+        "--prefix-cache",
+        action="store_true",
+        help=(
+            "let repeated runs reuse the cached prompt prefix; by default every "
+            "run prefills the whole prompt so TTFT stays comparable"
+        ),
+    )
     parser.add_argument("--report", type=Path)
     parser.add_argument(
         "--require-target",
@@ -69,6 +77,8 @@ def main():
 
         results = []
         for run in range(args.runs):
+            if not args.prefix_cache:
+                decoder.reset_prefix_cache()
             started = time.perf_counter()
             final_stats = None
             for _, stats in decoder.generate_messages(messages, args.tokens):
@@ -100,6 +110,7 @@ def main():
                     os.environ.get("HAWKPOINT_CPU_FINAL_NORM") == "1"
                 ),
                 "smollm_chunk": os.environ.get("HAWKPOINT_SMOLLM_CHUNK", "2"),
+                "prefix_cache": args.prefix_cache,
             },
             "tokens": args.tokens,
             "runs": results,
