@@ -81,10 +81,16 @@ Validated on a Hawk Point XDNA1 NPU (`RyzenAI-npu1`, AIE2, 4 columns):
 The acceptance prompt generated:
 
 ```text
-The sky appears blue during the day because our eyes are sensitive to the
-color of the sky. When sunlight enters the Earth's atmosphere, it encounters
-tiny particles called
+The sky looks blue during the day because the Earth's atmosphere scatters the
+sunlight in all directions, including blue light. When sunlight enters our
+atmosphere, it encounters
 ```
+
+With the default system prompt this prompt does not fit the 32-token prompt
+budget, so the system prompt is dropped and the question is kept whole. Before
+turn-boundary truncation, the prompt kept only the newest 32 tokens (the tail
+of the system prompt) and generated "The sky appears blue during the day
+because our eyes are sensitive to the color of the sky…".
 
 The fused Qwen2.5 0.5B path is checked against both the NumPy BF16 runtime and
 the upstream BF16 checkpoint. Release candidates require an exact checked-in
@@ -121,12 +127,20 @@ unmeasured kernel rate.
 - OpenAI-compatible `POST /v1/chat/completions`
 - Streaming chat completions over server-sent events
 - Temperature, top-k, top-p, penalty, and seed sampling (greedy by default)
+- Stop sequences and per-token log probabilities
+- Prompt-prefix reuse across turns, so a follow-up message only prefills its
+  new tokens
 - One-command API or API + Open WebUI launcher
 - Weight converter and hardware component/acceptance tests
 - AIE2 C++ kernels and IRON graph definitions
 
-Conversation history is retained by the client and automatically trimmed to
-the newest tokens that fit the current 64-token hardware context.
+Conversation history is retained by the client. When it no longer fits the
+64-token hardware context, the host keeps the newest message whole for as long
+as possible: it drops whole older turns first, then shortens the system prompt
+from its end (dropping it if not even its first word fits), and only then
+removes the oldest characters of the newest message. The chat template's
+control tokens are always kept intact. Message text is encoded as plain text, so a
+literal `<|im_end|>` in a message cannot close the turn or forge another role.
 
 ## Supported models
 
@@ -363,7 +377,47 @@ sampled request draws a seed and reports it, so a run can be replayed:
 `x_hawkpoint_stats.sampling` carries the effective mode, seed, and every
 resolved parameter.
 
-The terminal chat exposes the same options:
+### Stop sequences and log probabilities
+
+`stop` accepts a string or up to four strings. Generation ends as soon as the
+generated text contains one of them; the stop sequence itself is not returned
+and `finish_reason` is `stop`. Streaming holds back only text that could still
+become a stop sequence.
+
+`logprobs: true` returns OpenAI-style `choices[].logprobs.content` entries
+(`token`, `logprob`, `bytes`, `top_logprobs`); `top_logprobs` (`0`–`20`) sets
+how many alternatives each entry lists. Values come from the model's raw
+distribution, before penalties, temperature, and top-k/top-p filtering.
+Requesting log probabilities never changes which tokens are selected.
+
+```bash
+curl http://localhost:8000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $HAWKPOINT_API_KEY" \
+  -d '{
+    "model": "smollm2-135m-xdna1",
+    "messages": [{"role": "user", "content": "Count to five."}],
+    "max_tokens": 24,
+    "stop": ["4"],
+    "logprobs": true,
+    "top_logprobs": 3
+  }'
+```
+
+Text is streamed only at UTF-8 character boundaries, so characters split across
+byte-level BPE tokens (for example `ç` or emoji) are never emitted as `�`.
+
+### Prompt-prefix reuse
+
+The decoder remembers which tokens produced its current K/V cache. When the
+next prompt for the same model starts with those tokens, as a multi-turn chat
+does, prefill resumes after the shared prefix. `usage.prompt_tokens_details.cached_tokens`
+and `x_hawkpoint_stats.cached_prompt_tokens` report how many positions were
+reused, and `ttft_seconds` covers only the positions actually computed. Reused
+positions hold exactly the values a full prefill would compute, so outputs are
+unchanged. Set `HAWKPOINT_PREFIX_CACHE=0` to always prefill the whole prompt.
+
+The terminal chat exposes the sampling options:
 
 ```bash
 python npu_llm/chat.py \
@@ -450,14 +504,17 @@ python npu_llm/tests/test_converter.py
 python npu_llm/tests/test_model_integrity.py
 python npu_llm/tests/test_model_runtime.py
 python npu_llm/tests/test_sampling.py
+python npu_llm/tests/test_stopping.py
+python npu_llm/tests/test_tokenizer.py
 python npu_llm/tests/test_decode_loop.py
 python npu_llm/tests/test_cpu_backend.py
 python tests/test_api_server.py
 ```
 
-`test_sampling.py` and `test_decode_loop.py` need no NPU: token selection is a
-host operation, so the sampler and the decode loop's use of it are covered with
-canned logits.
+`test_sampling.py`, `test_stopping.py`, `test_tokenizer.py`, and
+`test_decode_loop.py` need no NPU: token selection, stop sequences, the chat
+template, and prefix reuse are host operations, covered with canned logits and
+a small tokenizer trained inside the test.
 
 Run the complete hardware acceptance test:
 
@@ -505,7 +562,7 @@ python npu_llm/designs/rope.py --dev npu --heads 12 --position 7 -w 2 -i 5
 
 Each generated token follows this path:
 
-1. Fetch the token embedding row into an XRT buffer.
+1. Copy the token embedding row into a persistent XRT buffer.
 2. Run SmolLM decoder layers in persistent two-layer graph chunks (the Phoenix
    firmware reliably completes this chunk size); Qwen uses its own two-layer
    BF16 program.
@@ -541,12 +598,12 @@ statistics. The benchmark reports whether the measured median reaches the
   it is not imposed by the physical tile memory itself. Extending it would
   require rebalancing the weight stream and cache buffer layout across the
   AIE tiles and recompiling the xclbin. Prompts longer than 64 tokens are
-  automatically trimmed by the host.
-- **Padlocked to XDNA1 (`npu1`, AIE2, 4 columns).** XDNA2/NPU4 silicon
-  (Strix Point, Strix Halo — 8 columns, larger local memory, shared
+  shortened by the host at turn boundaries.
+- **Padlocked to XDNA1 (`npu1`, AIE2, 4 columns).** XDNA2 silicon (`npu2`,
+  AIE2P: Strix Point, Strix Halo — 8 columns, larger local memory, shared
   caches) is not targeted. The IRON graph layouts, tile counts, and ObjectFifo
   depths assume a 4-column array. Porting requires at minimum a re-parameterized
- IRON design and a full AIE2→AIE4 kernel rewrite.
+  IRON design and porting the AIE2 kernels to AIE2P.
 - **No native BF16/FP16 tensor cores.** All AIE2 operations use a software
   BF16 multiply-accumulate path via `aie::mul` + `aie::accum`. There is no
   equivalent to NVIDIA Tensor Cores or Apple AMX blocks on this NPU
@@ -564,8 +621,8 @@ generation.
 - **Greedy by default, with opt-in sampling**. `temperature`, `top_p`,
   `top_k`, `repetition_penalty`, `presence_penalty`, `frequency_penalty`, and
   `seed` are supported. A request that sets none of them decodes greedily and
-  reproduces the checked-in acceptance sequences exactly. `n > 1`, beam search,
-  `logprobs`, and stop sequences are still unsupported.
+  reproduces the checked-in acceptance sequences exactly. Stop sequences and
+  `logprobs` are supported; `n > 1` and beam search are not.
 
 ### Performance
 

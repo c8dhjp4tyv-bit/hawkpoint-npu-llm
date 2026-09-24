@@ -80,8 +80,11 @@ model.
 For example, an assumed sustained rate of 78 GMAC/s would yield a projection
 floor of about **4.59 ms/token** (`357.83M / 78G`) before those omitted
 operations. That is arithmetic under an explicit assumption, not a hardware
-measurement. It must not be compared directly with the 274 ms/token observed
-end-to-end result or used to assign the remaining time to any phase.
+measurement. It must not be compared directly with measured Qwen step latency
+(the token-agreement gate records it as `npu_median_seconds` in
+`qwen-token-agreement.json`) or used to assign the remaining time to any phase.
+The 274 ms/token figure previously quoted here came from an older, since
+removed measurement and is not current evidence.
 
 ## Candidate Areas for Measurement
 
@@ -95,6 +98,10 @@ experiments, without claiming a speedup until they are benchmarked:
 - Compare the default persistent W8 cache against the opt-in native Q4_K/Q6_K
   kernels. The comparison must include first-use packing, warm-token latency,
   cache hit/upload bytes, and numerical agreement on the pinned model.
+- Measure prompt-prefix reuse separately from cold prefill: run
+  `scripts/benchmark_native.py` with and without `--prefix-cache`. The default
+  resets the cache before each timed run so TTFT stays comparable with older
+  results.
 - Measure continuous batching or pipelining only with fixed prompt, context,
   generation length, warm-up, and stability criteria from `BENCHMARKS.md`.
 - Run any XDNA2 port as a separate hardware-validation effort; XDNA2 is not

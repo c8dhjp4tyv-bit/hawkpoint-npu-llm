@@ -29,7 +29,13 @@ from designs.tensor_copy import slice_bf16
 from runtime.model import XDNA1Model
 from runtime.cpu_backend import CPUDecoderStage, _bf16 as _bf16_cpu
 from runtime.sampling import GREEDY, Sampler, SamplingParams
-from runtime.tokenizer import SmolLMTokenizer
+from runtime.stopping import (
+    StopMatcher,
+    log_softmax,
+    normalize_logprobs,
+    normalize_stop,
+)
+from runtime.tokenizer import SmolLMTokenizer, StreamDetokenizer
 
 
 class NPUDecoder:
@@ -63,6 +69,14 @@ class NPUDecoder:
         self._qwen_embedding_cache = OrderedDict()
         self._qwen_embedding_cache_limit = 128
         self._profile_enabled = os.environ.get("HAWKPOINT_PROFILE") == "1"
+        # Token ids whose keys and values are currently valid at cache
+        # positions 0..n-1. Attention reads only positions up to the current
+        # one, so a later prompt that starts with the same tokens can resume
+        # after them instead of recomputing the shared prefix.
+        self._cached_prefix = []
+        self._prefix_cache_enabled = (
+            os.environ.get("HAWKPOINT_PREFIX_CACHE", "1") != "0"
+        )
         self._phase_totals = {}
         self.rms_norm_eps = float(
             self.model.metadata.get("rms_norm_eps", 1e-5)
@@ -148,6 +162,14 @@ class NPUDecoder:
         self._embedding = None
         self._host_embedding = (
             self.model.raw("token_embedding")
+            if self.npu_layers
+            else None
+        )
+        # One persistent device buffer receives each token's embedding row.
+        # Creating a fresh tensor per token opened a new XRT device handle and
+        # buffer object on every decode step.
+        self._embedding_buffer = (
+            iron.zeros(self.hidden_size, dtype=bfloat16, device="npu")
             if self.npu_layers
             else None
         )
@@ -332,11 +354,10 @@ class NPUDecoder:
                 self._qwen_embedding_cache.move_to_end(token_id)
             while len(self._qwen_embedding_cache) > self._qwen_embedding_cache_limit:
                 self._qwen_embedding_cache.popitem(last=False)
-            return iron.tensor(
-                cached,
-                dtype=bfloat16,
-                device="npu",
-            )
+            # The decoder graphs update the hidden state in place, so the
+            # buffer is rewritten (and synced to the device) for every token.
+            self._embedding_buffer[:] = cached
+            return self._embedding_buffer
         raise RuntimeError("NPU embedding requested on a CPU-only decoder")
 
     def _rope_lut(self, position):
@@ -700,6 +721,9 @@ class NPUDecoder:
         """
         if not 0 <= position < self.context_length:
             raise ValueError("position outside the 64-token context")
+        # This step overwrites the cache at ``position``; later positions were
+        # computed from a different history and are no longer reusable.
+        del self._cached_prefix[position:]
         start = time.perf_counter()
         if self.npu_layers:
             phase = time.perf_counter()
@@ -855,15 +879,82 @@ class NPUDecoder:
                 cache.fill(0)
             for cache in self.cpu_stage.value_cache.values():
                 cache.fill(0)
+        self._cached_prefix.clear()
 
-    def generate_messages(self, messages, max_new_tokens=16, sampling=None):
+    def reset_prefix_cache(self):
+        """Forget the reusable prompt prefix so the next prompt is fully prefilled."""
+        self._cached_prefix.clear()
+
+    def _reusable_prefix(self, prompt_ids):
+        """Return how many leading prompt positions can be reused from the cache.
+
+        The final prompt position is always recomputed because its logits
+        select the first generated token.
+        """
+        if not self._prefix_cache_enabled:
+            return 0
+        shared = 0
+        for cached, token in zip(self._cached_prefix, prompt_ids):
+            if cached != token:
+                break
+            shared += 1
+        return min(shared, len(prompt_ids) - 1)
+
+    def _decode_step(self, token_id, position, **kwargs):
+        """Run ``decode_token`` and record the token whose cache it filled."""
+        del self._cached_prefix[position:]
+        result = self.decode_token(token_id, position, **kwargs)
+        if len(self._cached_prefix) == position:
+            self._cached_prefix.append(int(token_id))
+        return result
+
+    def _logprob_entry(self, logits, token_id, top_logprobs):
+        """Describe one emitted token in the OpenAI ``logprobs`` format.
+
+        Values are taken from the model's raw distribution, before penalties,
+        temperature, and top-k/top-p filtering.
+        """
+        values = log_softmax(logits)
+
+        def describe(index):
+            return {
+                "token": self.tokenizer.decode([int(index)]),
+                "logprob": float(values[index]),
+                "bytes": list(self.tokenizer.token_bytes(int(index))),
+            }
+
+        entry = describe(token_id)
+        top = []
+        if top_logprobs:
+            count = min(top_logprobs, values.shape[0])
+            indices = np.argpartition(values, -count)[-count:]
+            indices = indices[np.argsort(values[indices])[::-1]]
+            top = [describe(index) for index in indices]
+        entry["top_logprobs"] = top
+        return entry
+
+    def generate_messages(
+        self,
+        messages,
+        max_new_tokens=16,
+        sampling=None,
+        *,
+        stop=None,
+        logprobs=None,
+    ):
         """Generate a response for an OpenAI-style list of chat messages.
 
         The hardware attention cache is fixed at 64 tokens. When a conversation
-        grows beyond that window, the newest prompt tokens are retained.
+        grows beyond that window, it is shortened at turn boundaries so the
+        newest message stays whole for as long as possible (see
+        :meth:`SmolLMTokenizer.encode_chat_window`).
 
         ``sampling`` accepts a :class:`~runtime.sampling.SamplingParams` (or a
-        transport dict) and defaults to greedy decoding.
+        transport dict) and defaults to greedy decoding. ``stop`` is a string
+        or up to four strings that end generation without being emitted.
+        ``logprobs`` is ``None`` (disabled) or the number of alternatives to
+        report per token; when enabled, every yielded chunk is a
+        ``(text, stats, logprob_entries)`` triple instead of ``(text, stats)``.
         """
         if not 0 < max_new_tokens < self.context_length:
             raise ValueError(
@@ -875,64 +966,135 @@ class NPUDecoder:
             params = sampling
         else:
             params = SamplingParams.from_dict(sampling)
+        stop_matcher = StopMatcher(normalize_stop(stop))
+        top_logprobs = normalize_logprobs(logprobs)
         sampler = Sampler(params)
         if getattr(self, "_profile_enabled", False):
             self._phase_totals = {}
-        prompt_ids = self.tokenizer.encode_chat(messages)
-        if len(prompt_ids) + max_new_tokens > self.context_length:
-            prompt_ids = prompt_ids[-(self.context_length - max_new_tokens) :]
-        timings = []
-        next_token = None
-        position = 0
+        prompt_ids, truncation = self.tokenizer.encode_chat_window(
+            messages, self.context_length - max_new_tokens
+        )
         # Penalties are scored against the prompt as well as the generated text,
         # matching llama.cpp and vLLM.
         history = list(prompt_ids)
-        select = (
-            None
-            if sampler.greedy
-            else (lambda logits: sampler.select(logits, history))
-        )
+        # Log-probability entries wait here, keyed by the byte offset where
+        # their token starts in the generated text, until that text is emitted.
+        # Entries for text a stop sequence discards are never reported.
+        pending_logprobs = []
+        selected_entry = {}
+        generated_bytes = 0
+        emitted_bytes = 0
+
+        def choose(logits):
+            token = (
+                int(np.argmax(logits))
+                if sampler.greedy
+                else sampler.select(logits, history)
+            )
+            if top_logprobs is not None:
+                selected_entry["entry"] = self._logprob_entry(
+                    logits, token, top_logprobs
+                )
+            return token
+
+        # Greedy requests without log probabilities keep the historical
+        # argmax-inside-decode_token path used by the release gates.
+        select = None if sampler.greedy and top_logprobs is None else choose
+
+        def release(text, final=False):
+            """Return the entries whose tokens contributed to emitted text."""
+            nonlocal emitted_bytes
+            emitted_bytes += len(text.encode("utf-8"))
+            if final and stop_matcher.matched is None:
+                ready = len(pending_logprobs)
+            else:
+                ready = 0
+                while (
+                    ready < len(pending_logprobs)
+                    and pending_logprobs[ready][0] < emitted_bytes
+                ):
+                    ready += 1
+            entries = [entry for _, entry in pending_logprobs[:ready]]
+            del pending_logprobs[:ready]
+            return entries
+
+        def chunk(text, entries):
+            if top_logprobs is None:
+                return text, None
+            return text, None, entries
+
+        reused = self._reusable_prefix(prompt_ids)
+        timings = []
+        next_token = None
         last_prompt_index = len(prompt_ids) - 1
-        for index, token in enumerate(prompt_ids):
+        for index in range(reused, len(prompt_ids)):
             # Only the final prompt position produces a token that is used, so
             # the sampler (and its random stream) is engaged exactly once per
             # emitted token instead of once per ingested position.
-            next_token, elapsed = self.decode_token(
-                token,
-                position,
+            next_token, elapsed = self._decode_step(
+                prompt_ids[index],
+                index,
                 select=select if index == last_prompt_index else None,
                 compute_logits=index == last_prompt_index,
             )
             timings.append(elapsed)
-            position += 1
+        prefill_steps = len(timings)
+        position = len(prompt_ids)
+        detokenizer = StreamDetokenizer(self.tokenizer)
         generated = []
-        while len(generated) < max_new_tokens and next_token != self.tokenizer.eos_id:
+        finish_reason = "length"
+        while len(generated) < max_new_tokens:
+            # The end-of-turn token is not part of the returned content, so
+            # its log probability is dropped with it.
+            entry = selected_entry.pop("entry", None)
+            if next_token == self.tokenizer.eos_id:
+                finish_reason = "stop"
+                break
             generated.append(next_token)
             history.append(next_token)
-            yield self.tokenizer.decode([next_token]), None
+            if entry is not None:
+                pending_logprobs.append((generated_bytes, entry))
+                generated_bytes += len(self.tokenizer.token_bytes(next_token))
+            text = stop_matcher.feed(detokenizer.push(next_token))
+            if stop_matcher.matched is not None:
+                finish_reason = "stop"
+                break
+            if text:
+                yield chunk(text, release(text))
             # The caller requested exactly this many tokens. Do not run one
             # more full decoder/LM-head step merely to compute a discarded
             # successor token.
             if len(generated) >= max_new_tokens:
                 break
-            next_token, elapsed = self.decode_token(next_token, position, select=select)
+            next_token, elapsed = self._decode_step(
+                next_token, position, select=select
+            )
             timings.append(elapsed)
             position += 1
-        prefill_seconds = sum(timings[: len(prompt_ids)])
-        decode_seconds = sum(timings[len(prompt_ids) :])
-        decode_steps = max(0, len(timings) - len(prompt_ids))
+        if stop_matcher.matched is None:
+            text = stop_matcher.feed(detokenizer.flush())
+            if stop_matcher.matched is not None:
+                finish_reason = "stop"
+            text += stop_matcher.flush()
+        entries = release(text, final=True) if top_logprobs is not None else []
+        if text or entries:
+            yield chunk(text, entries)
+        prefill_seconds = sum(timings[:prefill_steps])
+        decode_seconds = sum(timings[prefill_steps:])
+        decode_steps = len(timings) - prefill_steps
         stats = {
             "prompt_tokens": len(prompt_ids),
+            "cached_prompt_tokens": reused,
+            "prompt_truncation": truncation,
             "generated_tokens": len(generated),
             "generated_token_ids": generated,
             "npu_layers": self.npu_layers,
             "cpu_layers": self.layers - self.npu_layers,
-            "finish_reason": (
-                "stop" if next_token == self.tokenizer.eos_id else "length"
-            ),
+            "finish_reason": finish_reason,
+            "stop_sequence": stop_matcher.matched,
             "ttft_seconds": prefill_seconds,
             "prefill_tokens_per_second": (
-                len(prompt_ids) / max(1e-9, prefill_seconds)
+                prefill_steps / max(1e-9, prefill_seconds)
             ),
             "decode_steps": decode_steps,
             "decode_seconds": decode_seconds,
@@ -947,14 +1109,27 @@ class NPUDecoder:
                 name: round(seconds * 1000.0, 3)
                 for name, seconds in self._phase_totals.items()
             }
-        yield "", stats
+        if top_logprobs is None:
+            yield "", stats
+        else:
+            yield "", stats, []
 
-    def generate(self, prompt, max_new_tokens=32, sampling=None):
+    def generate(
+        self,
+        prompt,
+        max_new_tokens=32,
+        sampling=None,
+        *,
+        stop=None,
+        logprobs=None,
+    ):
         """Backward-compatible single-prompt generation."""
         yield from self.generate_messages(
             [{"role": "user", "content": prompt}],
             max_new_tokens=max_new_tokens,
             sampling=sampling,
+            stop=stop,
+            logprobs=logprobs,
         )
 
     def close(self):
@@ -990,6 +1165,8 @@ class NPUDecoder:
             if isinstance(container, dict):
                 container.clear()
         self.kv_cache = []
+        self._cached_prefix = []
+        self._embedding_buffer = None
         self._decoder_weights = {}
         self._decoder_gammas = {}
         self._cpu_lm_head_f32 = None

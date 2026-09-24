@@ -32,6 +32,7 @@ except ImportError:
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 from runtime.sampling import GREEDY, SamplingParams  # noqa: E402
+from runtime.stopping import normalize_logprobs, normalize_stop  # noqa: E402
 
 
 def _completion_id():
@@ -94,15 +95,56 @@ def _validate_completion_options(request):
     return requested, bool(options and options.get("include_usage"))
 
 
+def _validate_output_options(request):
+    """Validate ``stop`` and log-probability options.
+
+    Returns ``(stop, top_logprobs)`` where ``stop`` is a tuple of strings and
+    ``top_logprobs`` is ``None`` when log probabilities were not requested.
+    """
+    stop = normalize_stop(request.get("stop"))
+    enabled = request.get("logprobs", False)
+    if enabled is None:
+        enabled = False
+    if type(enabled) is not bool:
+        raise ValueError("logprobs must be a boolean")
+    top = request.get("top_logprobs")
+    if top is not None and not enabled:
+        raise ValueError("top_logprobs requires logprobs=true")
+    if not enabled:
+        return stop, None
+    return stop, normalize_logprobs(0 if top is None else top)
+
+
 def _usage(stats):
     """Translate decoder token counts into the OpenAI usage structure."""
     prompt = int(stats.get("prompt_tokens", 0))
     completion = int(stats.get("generated_tokens", 0))
-    return {
+    usage = {
         "prompt_tokens": prompt,
         "completion_tokens": completion,
         "total_tokens": prompt + completion,
     }
+    if "cached_prompt_tokens" in stats:
+        usage["prompt_tokens_details"] = {
+            "cached_tokens": int(stats["cached_prompt_tokens"])
+        }
+    return usage
+
+
+def _generation_options(sampling=None, stop=None, logprobs=None):
+    """Keyword arguments for ``generate_messages``, omitting unused options.
+
+    Decoders that predate an option are still driven with their historical
+    signature as long as a request does not use that option.
+    """
+    options = {}
+    if sampling is not None:
+        options["sampling"] = sampling
+    if stop:
+        options["stop"] = list(stop)
+    if logprobs is not None:
+        options["logprobs"] = logprobs
+    return options
 
 
 @dataclass(frozen=True)
@@ -319,15 +361,23 @@ class CompletionEngine:
         """Report readiness for the in-process test engine."""
         return True
 
-    def generate(self, model_id, messages, max_tokens, timeout=None, sampling=None):
+    def generate(
+        self,
+        model_id,
+        messages,
+        max_tokens,
+        timeout=None,
+        sampling=None,
+        stop=None,
+        logprobs=None,
+    ):
         """Serialize model inference and yield text chunks with final statistics."""
         with self.lock:
             decoder = self._load(model_id)
-            if sampling is None:
-                yield from decoder.generate_messages(messages, max_tokens)
-                return
             yield from decoder.generate_messages(
-                messages, max_tokens, sampling=sampling
+                messages,
+                max_tokens,
+                **_generation_options(sampling, stop, logprobs),
             )
 
 
@@ -348,13 +398,19 @@ def _worker_loop(models, decoder_factory, connection):
                     engine.prewarm_default()
                     connection.send(("done", None))
                     continue
-                for text, stats in engine.generate(
+                # Options are revalidated here rather than trusted from the
+                # parent process, like the sampling parameters.
+                stop = normalize_stop(command.get("stop"))
+                logprobs = normalize_logprobs(command.get("logprobs"))
+                for chunk in engine.generate(
                     command["model"],
                     command["messages"],
                     command["max_tokens"],
                     sampling=command.get("sampling"),
+                    stop=stop,
+                    logprobs=logprobs,
                 ):
-                    connection.send(("chunk", (text, stats)))
+                    connection.send(("chunk", tuple(chunk)))
                 connection.send(("done", None))
             except Exception as exc:
                 logging.exception("inference worker failed")
@@ -487,7 +543,16 @@ class ProcessCompletionEngine:
                 raise RuntimeError("inference worker prewarm failed")
             self._ready = True
 
-    def generate(self, model_id, messages, max_tokens, timeout=None, sampling=None):
+    def generate(
+        self,
+        model_id,
+        messages,
+        max_tokens,
+        timeout=None,
+        sampling=None,
+        stop=None,
+        logprobs=None,
+    ):
         """Serialize model inference and yield text chunks with final statistics."""
         deadline = time.monotonic() + (timeout or self.timeout)
         with self._lock:
@@ -500,6 +565,8 @@ class ProcessCompletionEngine:
                     # Sent as a plain dict, never a live object, and revalidated
                     # inside the worker before it reaches the decoder.
                     "sampling": sampling,
+                    "stop": list(stop) if stop else None,
+                    "logprobs": logprobs,
                 }
             )
             try:
@@ -759,6 +826,7 @@ def make_handler(engine, config=None):
                 if not isinstance(request, dict):
                     raise ValueError("request body must be a JSON object")
                 requested, include_usage = _validate_completion_options(request)
+                stop, logprobs = _validate_output_options(request)
                 messages = _validate_messages(request.get("messages"))
                 model_id = request.get("model") or engine.default_model_id
                 if not engine.has_model(model_id):
@@ -803,31 +871,58 @@ def make_handler(engine, config=None):
                 return
             self.connection.settimeout(config.request_timeout)
             self._deadline = time.monotonic() + config.request_timeout
+            output = {"stop": stop, "logprobs": logprobs}
             try:
                 if request.get("stream", False):
-                    self._stream(model_id, messages, max_tokens, sampling, include_usage)
+                    self._stream(
+                        model_id,
+                        messages,
+                        max_tokens,
+                        sampling,
+                        include_usage,
+                        **output,
+                    )
                 else:
-                    self._complete(model_id, messages, max_tokens, sampling)
+                    self._complete(
+                        model_id, messages, max_tokens, sampling, **output
+                    )
             finally:
                 inference_tracker.leave()
                 slots.release()
 
-        def _complete(self, model_id, messages, max_tokens, sampling=None):
+        def _generation(self, model_id, messages, max_tokens, sampling, stop, logprobs):
+            """Start engine generation, forwarding only the options in use."""
+            return engine.generate(
+                model_id,
+                messages,
+                max_tokens,
+                timeout=config.request_timeout,
+                **_generation_options(sampling, stop, logprobs),
+            )
+
+        def _complete(
+            self,
+            model_id,
+            messages,
+            max_tokens,
+            sampling=None,
+            stop=(),
+            logprobs=None,
+        ):
             """Collect one completion and return token usage or a sanitized error."""
             pieces = []
+            entries = []
             stats = None
             try:
-                with closing(engine.generate(
-                    model_id,
-                    messages,
-                    max_tokens,
-                    timeout=config.request_timeout,
-                    sampling=sampling,
+                with closing(self._generation(
+                    model_id, messages, max_tokens, sampling, stop, logprobs
                 )) as generation:
-                    for text, final_stats in generation:
+                    for text, final_stats, *extra in generation:
                         if time.monotonic() > self._deadline:
                             raise TimeoutError
                         pieces.append(text)
+                        if extra:
+                            entries.extend(extra[0])
                         if final_stats is not None:
                             stats = final_stats
             except (TimeoutError, socket.timeout):
@@ -852,6 +947,11 @@ def make_handler(engine, config=None):
                                 "role": "assistant",
                                 "content": "".join(pieces),
                             },
+                            "logprobs": (
+                                None
+                                if logprobs is None
+                                else {"content": entries}
+                            ),
                             "finish_reason": finish_reason,
                         }
                     ],
@@ -860,7 +960,16 @@ def make_handler(engine, config=None):
                 }
             )
 
-        def _stream(self, model_id, messages, max_tokens, sampling=None, include_usage=False):
+        def _stream(
+            self,
+            model_id,
+            messages,
+            max_tokens,
+            sampling=None,
+            include_usage=False,
+            stop=(),
+            logprobs=None,
+        ):
             """Emit SSE chunks, optional usage, and a success or error terminator."""
             completion_id = _completion_id()
             created = int(time.time())
@@ -891,30 +1000,28 @@ def make_handler(engine, config=None):
                     }
                 )
                 stats = None
-                with closing(engine.generate(
-                    model_id,
-                    messages,
-                    max_tokens,
-                    timeout=config.request_timeout,
-                    sampling=sampling,
+                with closing(self._generation(
+                    model_id, messages, max_tokens, sampling, stop, logprobs
                 )) as generation:
-                    for text, final_stats in generation:
+                    for text, final_stats, *extra in generation:
                         if time.monotonic() > self._deadline:
                             raise TimeoutError
-                        if text:
+                        entries = extra[0] if extra else []
+                        if text or entries:
+                            choice = {
+                                "index": 0,
+                                "delta": {"content": text},
+                                "finish_reason": None,
+                            }
+                            if logprobs is not None:
+                                choice["logprobs"] = {"content": entries}
                             send(
                                 {
                                     "id": completion_id,
                                     "object": "chat.completion.chunk",
                                     "created": created,
                                     "model": model_id,
-                                    "choices": [
-                                        {
-                                            "index": 0,
-                                            "delta": {"content": text},
-                                            "finish_reason": None,
-                                        }
-                                    ],
+                                    "choices": [choice],
                                 }
                             )
                         if final_stats is not None:

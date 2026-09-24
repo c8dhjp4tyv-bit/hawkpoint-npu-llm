@@ -71,6 +71,44 @@ class RecordingDecoder:
         }
 
 
+class OptionsDecoder:
+    """Records stop/logprob options and emits OpenAI-shaped logprob chunks."""
+
+    context_length = 64
+
+    def __init__(self):
+        """Initialize the list of forwarded output options."""
+        self.calls = []
+
+    def generate_messages(
+        self, messages, max_new_tokens, sampling=None, stop=None, logprobs=None
+    ):
+        """Emit two scored tokens when log probabilities are requested."""
+        self.calls.append({"stop": stop, "logprobs": logprobs})
+        stats = {
+            "prompt_tokens": 7,
+            "cached_prompt_tokens": 5,
+            "generated_tokens": 2,
+            "finish_reason": "stop" if stop else "length",
+        }
+        if logprobs is None:
+            yield "ok", None
+            yield "", stats
+            return
+        entry = {
+            "token": "ok",
+            "logprob": -0.25,
+            "bytes": [111, 107],
+            "top_logprobs": [
+                {"token": "ok", "logprob": -0.25, "bytes": [111, 107]}
+            ][:logprobs],
+        }
+        yield "ok", None, [entry]
+        # A held partial character: log probabilities without new text.
+        yield "", None, [dict(entry, token="\ufffd", bytes=[195])]
+        yield "", stats, []
+
+
 class FailingDecoder:
     context_length = 64
 
@@ -521,6 +559,92 @@ def test_sampling_parameters_reach_the_decoder():
 
 
 
+def test_stop_and_logprobs_options():
+    """Check stop/logprob forwarding, response shapes, and validation."""
+    decoder = OptionsDecoder()
+    server, thread, base = start_server(
+        {"smollm2-135m-xdna1": decoder}, rate_limit_per_minute=0
+    )
+    try:
+        status, body, _ = fetch(f"{base}/v1/chat/completions", payload())
+        assert status == 200
+        # Unused options are not forwarded, keeping older decoder signatures.
+        assert decoder.calls[-1] == {"stop": None, "logprobs": None}
+        response = json.loads(body)
+        assert response["choices"][0]["logprobs"] is None
+        assert response["usage"]["prompt_tokens_details"] == {"cached_tokens": 5}
+
+        request = {**payload(), "stop": "\nUser:", "logprobs": True, "top_logprobs": 1}
+        status, body, _ = fetch(f"{base}/v1/chat/completions", request)
+        assert status == 200, body
+        assert decoder.calls[-1] == {"stop": ["\nUser:"], "logprobs": 1}
+        choice = json.loads(body)["choices"][0]
+        assert choice["message"]["content"] == "ok"
+        assert choice["finish_reason"] == "stop"
+        content = choice["logprobs"]["content"]
+        assert [item["bytes"] for item in content] == [[111, 107], [195]]
+        assert content[0]["top_logprobs"][0]["logprob"] == -0.25
+
+        request = {**payload(), "stream": True, "logprobs": True}
+        status, body, _ = fetch(f"{base}/v1/chat/completions", request)
+        assert status == 200
+        assert decoder.calls[-1] == {"stop": None, "logprobs": 0}
+        frames = [line[6:] for line in body.splitlines() if line.startswith("data: ")]
+        assert frames[-1] == "[DONE]"
+        chunks = [json.loads(frame) for frame in frames[:-1]]
+        scored = [
+            chunk["choices"][0]
+            for chunk in chunks
+            if chunk["choices"] and "logprobs" in chunk["choices"][0]
+        ]
+        assert [choice["delta"]["content"] for choice in scored] == ["ok", ""]
+        assert [len(choice["logprobs"]["content"]) for choice in scored] == [1, 1]
+        assert scored[0]["logprobs"]["content"][0]["top_logprobs"] == []
+
+        before = len(decoder.calls)
+        for invalid in (
+            {"stop": ""},
+            {"stop": ["a", "b", "c", "d", "e"]},
+            {"stop": [1]},
+            {"stop": 7},
+            {"logprobs": "yes"},
+            {"logprobs": True, "top_logprobs": 21},
+            {"logprobs": True, "top_logprobs": -1},
+            {"logprobs": True, "top_logprobs": 1.5},
+            {"top_logprobs": 2},
+            {"logprobs": False, "top_logprobs": 2},
+        ):
+            status, body, _ = fetch(
+                f"{base}/v1/chat/completions", {**payload(), **invalid}
+            )
+            assert status == 400, (invalid, status)
+            assert json.loads(body)["error"]["type"] == "invalid_request_error"
+        assert len(decoder.calls) == before
+    finally:
+        stop_server(server, thread)
+
+
+def test_worker_forwards_output_options():
+    """Output options and logprob triples cross the worker process boundary."""
+    engine = ProcessCompletionEngine(
+        {"smollm2-135m-xdna1": OptionsDecoder()}, decoder_factory=None, timeout=5
+    )
+    messages = payload()["messages"]
+    try:
+        chunks = list(
+            engine.generate(
+                "smollm2-135m-xdna1", messages, 5, stop=("END",), logprobs=2
+            )
+        )
+        assert [len(chunk) for chunk in chunks] == [3, 3, 3]
+        assert chunks[0][0] == "ok"
+        assert chunks[-1][1]["finish_reason"] == "stop"
+        plain = list(engine.generate("smollm2-135m-xdna1", messages, 5))
+        assert [len(chunk) for chunk in plain] == [2, 2]
+    finally:
+        engine.close()
+
+
 def test_strict_request_types():
     """Reject malformed protocol types before any decoder invocation."""
     decoder = RecordingDecoder()
@@ -854,6 +978,8 @@ def main():
     test_modern_token_alias_routes_and_headers()
     test_rate_limiter_evicts_idle_clients()
     test_strict_request_types()
+    test_stop_and_logprobs_options()
+    test_worker_forwards_output_options()
     test_stream_usage_and_errors()
     test_timeout_closes_generation()
     test_body_read_timeout()

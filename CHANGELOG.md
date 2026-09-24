@@ -42,6 +42,29 @@ ship as the next gated candidate (`v0.1.0-rc.10`) only after the physical
 Hawk Point job succeeds. Existing RC tags without GitHub Release records remain
 tag history, not published artifacts.
 
+- Fix corrupted streamed text: tokens were decoded one at a time, so characters
+  whose UTF-8 bytes span several byte-level BPE tokens (Turkish `ç`/`Ş` in
+  SmolLM2, emoji in both families) were emitted as `�`. Text is now released
+  only at character boundaries.
+- Reuse the K/V cache across requests: a prompt that starts with the tokens
+  already cached, as every multi-turn chat does, resumes prefill after them.
+  Usage reports `prompt_tokens_details.cached_tokens`; `HAWKPOINT_PREFIX_CACHE=0`
+  disables reuse, and `benchmark_native.py` resets it per run unless
+  `--prefix-cache` is passed.
+- Shorten long conversations at turn boundaries instead of cutting raw tokens
+  from the front, which kept only the tail of the system prompt and started
+  mid-turn. Older turns go first, then the end of the system prompt, and only
+  then the front of the newest message. The SmolLM acceptance prompt no longer
+  fits with the default system prompt, so it now runs without one.
+- Encode message content with special-token parsing disabled, so a literal
+  `<|im_end|>` in a message can no longer close the turn and forge a system or
+  assistant turn.
+- Add `stop` sequences (previously accepted and silently ignored) and
+  OpenAI-style `logprobs`/`top_logprobs` to the runtime and the API.
+- Upload each token's embedding into one persistent XRT buffer instead of
+  allocating a new tensor and device handle per decode step.
+- Correct the XDNA2 architecture (AIE2P, `npu2`, not AIE4) and remove a stale
+  274 ms/token figure from the performance analysis.
 - Port the Ollama XDNA patch and release pin from `v0.32.5` to the clean
   upstream `v0.33.3` commit `b79067b0db7417f20108363bc22adb97f35c966a`.
   Hosted CI now reads the tag, commit, and patch filename from

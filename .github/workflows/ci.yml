@@ -29,9 +29,11 @@ jobs:
           python npu_llm/tests/test_converter.py
           cd npu_llm
           python tests/test_model_integrity.py
-      - name: Test host-side sampling and the decode loop
+      - name: Test host-side sampling, tokenizer, and the decode loop
         run: |
           python npu_llm/tests/test_sampling.py
+          python npu_llm/tests/test_stopping.py
+          python npu_llm/tests/test_tokenizer.py
           python npu_llm/tests/test_decode_loop.py
           python npu_llm/tests/test_cpu_backend.py
       - name: Test OpenAI-compatible protocol
