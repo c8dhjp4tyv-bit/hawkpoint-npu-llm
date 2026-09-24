@@ -977,7 +977,13 @@ class NPUDecoder:
         # Penalties are scored against the prompt as well as the generated text,
         # matching llama.cpp and vLLM.
         history = list(prompt_ids)
+        # Log-probability entries wait here, keyed by the byte offset where
+        # their token starts in the generated text, until that text is emitted.
+        # Entries for text a stop sequence discards are never reported.
         pending_logprobs = []
+        selected_entry = {}
+        generated_bytes = 0
+        emitted_bytes = 0
 
         def choose(logits):
             token = (
@@ -986,8 +992,8 @@ class NPUDecoder:
                 else sampler.select(logits, history)
             )
             if top_logprobs is not None:
-                pending_logprobs.append(
-                    self._logprob_entry(logits, token, top_logprobs)
+                selected_entry["entry"] = self._logprob_entry(
+                    logits, token, top_logprobs
                 )
             return token
 
@@ -995,11 +1001,26 @@ class NPUDecoder:
         # argmax-inside-decode_token path used by the release gates.
         select = None if sampler.greedy and top_logprobs is None else choose
 
-        def chunk(text):
+        def release(text, final=False):
+            """Return the entries whose tokens contributed to emitted text."""
+            nonlocal emitted_bytes
+            emitted_bytes += len(text.encode("utf-8"))
+            if final and stop_matcher.matched is None:
+                ready = len(pending_logprobs)
+            else:
+                ready = 0
+                while (
+                    ready < len(pending_logprobs)
+                    and pending_logprobs[ready][0] < emitted_bytes
+                ):
+                    ready += 1
+            entries = [entry for _, entry in pending_logprobs[:ready]]
+            del pending_logprobs[:ready]
+            return entries
+
+        def chunk(text, entries):
             if top_logprobs is None:
                 return text, None
-            entries = list(pending_logprobs)
-            pending_logprobs.clear()
             return text, None, entries
 
         reused = self._reusable_prefix(prompt_ids)
@@ -1023,20 +1044,23 @@ class NPUDecoder:
         generated = []
         finish_reason = "length"
         while len(generated) < max_new_tokens:
+            # The end-of-turn token is not part of the returned content, so
+            # its log probability is dropped with it.
+            entry = selected_entry.pop("entry", None)
             if next_token == self.tokenizer.eos_id:
                 finish_reason = "stop"
-                # The end-of-turn token is not part of the returned content.
-                if pending_logprobs:
-                    pending_logprobs.pop()
                 break
             generated.append(next_token)
             history.append(next_token)
+            if entry is not None:
+                pending_logprobs.append((generated_bytes, entry))
+                generated_bytes += len(self.tokenizer.token_bytes(next_token))
             text = stop_matcher.feed(detokenizer.push(next_token))
             if stop_matcher.matched is not None:
                 finish_reason = "stop"
                 break
             if text:
-                yield chunk(text)
+                yield chunk(text, release(text))
             # The caller requested exactly this many tokens. Do not run one
             # more full decoder/LM-head step merely to compute a discarded
             # successor token.
@@ -1052,8 +1076,9 @@ class NPUDecoder:
             if stop_matcher.matched is not None:
                 finish_reason = "stop"
             text += stop_matcher.flush()
-        if text or pending_logprobs:
-            yield chunk(text)
+        entries = release(text, final=True) if top_logprobs is not None else []
+        if text or entries:
+            yield chunk(text, entries)
         prefill_seconds = sum(timings[:prefill_steps])
         decode_seconds = sum(timings[prefill_steps:])
         decode_steps = len(timings) - prefill_steps

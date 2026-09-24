@@ -367,6 +367,21 @@ def test_logprobs_follow_the_emitted_text():
     assert stats["generated_token_ids"] == [7, 8, 3]
 
 
+def test_logprobs_exclude_text_discarded_by_a_stop_sequence():
+    decoder = build_decoder([1], _ramp)
+    chunks = list(
+        decoder.generate_messages(
+            [{"role": "user", "content": "hi"}], 8, stop="<4><", logprobs=0
+        )
+    )
+    text = "".join(chunk[0] for chunk in chunks)
+    entries = [entry for chunk in chunks for entry in chunk[2]]
+    assert text == "<2><3>"
+    # Tokens 4 and 5 only formed the stop sequence, so they are not reported.
+    assert [entry["token"] for entry in entries] == ["<2>", "<3>"]
+    assert chunks[-1][1]["generated_token_ids"] == [2, 3, 4, 5]
+
+
 def test_logprobs_do_not_change_greedy_tokens():
     plain = run(build_decoder([1, 2], _ramp), max_new_tokens=5)[1]
     scored = run(build_decoder([1, 2], _ramp), max_new_tokens=5, logprobs=0)[1]

@@ -103,6 +103,31 @@ def test_window_keeps_the_system_prompt_and_newest_turns(tokenizer):
     assert ids[0] == tokenizer._im_start_id
 
 
+def test_window_drops_many_turns_without_reencoding_them(tokenizer):
+    turns = [
+        {"role": "user" if index % 2 else "assistant", "content": f"turn {index}"}
+        for index in range(2000)
+    ]
+    messages = [{"role": "system", "content": "Be brief."}, *turns]
+    calls = []
+    original = tokenizer._encode_text
+
+    def counting(text):
+        calls.append(text)
+        return original(text)
+
+    tokenizer._encode_text = counting
+    try:
+        ids, truncation = tokenizer.encode_chat_window(messages, 40)
+    finally:
+        del tokenizer._encode_text
+    kept = len(messages) - truncation["dropped_messages"]
+    assert ids == tokenizer.encode_chat(messages[:1] + messages[-(kept - 1):])
+    assert len(ids) <= 40
+    # One encoding per message plus the generation prompt.
+    assert len(calls) == len(messages) + 1
+
+
 def test_window_shortens_the_system_prompt_before_the_question(tokenizer):
     system = "You are a helpful assistant. The quick brown fox jumps over the lazy dog."
     question = "Why is the sky blue?"

@@ -129,20 +129,36 @@ class SmolLMTokenizer:
             "truncated_content": False,
             "token_fallback": False,
         }
-        full = self._encode_turns(messages)
+        # Each turn is encoded once; dropping old turns only re-sums lengths,
+        # so long message lists stay linear rather than quadratic.
+        encoded = [
+            self._encode_turn(message["role"], message["content"])
+            for message in messages
+        ]
+        generation = self._generation_prompt()
+        full = [token for turn in encoded for token in turn] + generation
         if len(full) <= budget:
             return full, truncation
 
         system, turns = messages[0], messages[1:]
+        system_ids, turn_ids = encoded[0], encoded[1:]
         if not turns:
             # Only the system prompt was supplied; it is the newest message.
             system, turns = None, [system]
-        while len(turns) > 1:
-            turns = turns[1:]
+            system_ids, turn_ids = [], [system_ids]
+        total = len(full)
+        first = 0
+        while len(turns) - first > 1:
+            total -= len(turn_ids[first])
+            first += 1
             truncation["dropped_messages"] += 1
-            ids = self._encode_turns([system, *turns])
-            if len(ids) <= budget:
+            if total <= budget:
+                ids = list(system_ids)
+                for turn in turn_ids[first:]:
+                    ids.extend(turn)
+                ids.extend(generation)
                 return ids, truncation
+        turns = turns[first:]
 
         newest = turns[-1]
         if system is not None:
