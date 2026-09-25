@@ -108,12 +108,13 @@ startup. Results are from the same Hawk Point system and vary with temperature,
 memory pressure, concurrent NPU activity, and CPU BLAS configuration. The
 current loop skips the discarded LM-head work at non-final prefill positions
 and does not execute an unused successor step after reaching `max_tokens`.
-Consequently, the corrected measurements use 15 timed decode intervals for 16
-emitted tokens after TTFT. Repeated three- and five-run sessions produced
-14.42–19.99 token/s medians (20.20 token/s best individual run), demonstrating
-the device's temperature/load sensitivity. The older 18.42 token/s result timed an
-additional discarded successor step and is historical decoder-step evidence,
-not a directly comparable current end-to-end rate.
+Consequently, the benchmark times 15 decode intervals for 16 emitted tokens
+after TTFT. Historical sessions of the opt-in W8 chunked decoder
+(`HAWKPOINT_DECODER_W8=1`) produced 14.42–19.99 token/s medians (20.20 token/s
+best individual run), demonstrating the device's temperature/load sensitivity;
+they are separate from the decoder-engine and chunked BF16 results above. The
+older 18.42 token/s result timed an additional discarded successor step and is
+historical decoder-step evidence, not a directly comparable end-to-end rate.
 
 The decoder engine meets the requested 50–75 token/s range on this
 benchmark. It runs every SmolLM layer in one dispatch and streams the weights

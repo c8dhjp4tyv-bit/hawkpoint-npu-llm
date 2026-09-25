@@ -50,8 +50,8 @@ tag history, not published artifacts.
   1.7 s to 0.3 s. The engine is selected automatically for all-NPU BF16
   SmolLM decoding; `HAWKPOINT_ENGINE=0` restores the chunked layer graphs.
 - Run the engine's attention softmax on the vector unit. The AIE2 scalar unit
-  has no floating point, so the scalar softmax cost up to 9.5 ms per token at
-  late positions.
+  has no floating point, so with the scalar softmax one engine dispatch took
+  17.1 ms at position 63, against 8.9 ms with the vector softmax.
 - Fully unroll the engine's copy loops: llvm-aie `21.0.0.2026072001` compiles
   some 16-lane copy loops into a zero-overhead loop that can hang the core.
 - Add a hardware-free test of the engine's weight-stream layout and a
