@@ -64,19 +64,23 @@ current full-model validation boundary are documented in the
 
 Validated on a Hawk Point XDNA1 NPU (`RyzenAI-npu1`, AIE2, 4 columns):
 
-| Measurement | Result |
+| Measurement (SmolLM2 135M, decoder engine) | Result |
 |---|---:|
 | CPU/BF16 reference first-token argmax | 198 |
 | NPU first-token argmax | 198 |
-| Cold compile/load | 7.82 s |
-| Warm `decode_token` smoke test | 13.25 token/s (0.0755 s/token) |
-| 32-token streaming chat | 15.93 token/s |
-| Native 16-token W8 decode, latest 3-run median | 14.42 token/s |
-| Corrected-loop session medians / best individual run | 14.42–19.99 / 20.20 token/s |
-| Native W8 TTFT, 35-token prompt | 1.47–1.62 s session medians |
-| End-to-end TTFT for the 32-token acceptance prompt | 2.56 s |
-| Peak host RAM during acceptance | 349.5 MiB |
+| Native 16-token decode, 5-run median | 74.61 token/s |
+| Individual runs | 73.17–75.83 token/s |
+| TTFT, 35-token prompt | 0.28–0.29 s |
+| TTFT, repeated prompt with `--prefix-cache` | 0.014 s |
+| NPU time per token (all 30 layers, one dispatch) | 7.6–8.9 ms |
+| CPU LM head per token | about 5 ms |
+| Warmup (engine compile cached) | 5.1 s |
+| Peak host RAM during the benchmark | 354 MiB |
+| Quick soak / model-switch stress | 100/100 completions, 100 switches, 0 NPU errors |
 | Fixed hardware context | 64 tokens |
+
+The chunked layer graphs (`HAWKPOINT_ENGINE=0`) measured 17.1 token/s with
+1.71–1.81 s TTFT on the same machine and benchmark.
 
 The acceptance prompt generated:
 
@@ -111,17 +115,19 @@ the device's temperature/load sensitivity. The older 18.42 token/s result timed 
 additional discarded successor step and is historical decoder-step evidence,
 not a directly comparable current end-to-end rate.
 
-The current controlled benchmark remains below the requested 50–75 token/s
-range: the full 30-layer SmolLM decoder is the dominant measured phase on this
-XDNA1 device. The best measured configuration is opt-in W8 projection plus
-CPU final RMSNorm/LM-head (`HAWKPOINT_DECODER_W8=1
-HAWKPOINT_CPU_FINAL_NORM=1`); it reports the miss rather than extrapolating an
-unmeasured kernel rate.
+The decoder engine meets the requested 50–75 token/s range on this
+benchmark. It runs every SmolLM layer in one dispatch and streams the weights
+over six NPU channels at once; the chunked graphs issued 15 dispatches per
+token and streamed one projection at a time. The measurements, the bandwidth
+limits, and the design are in the [performance
+analysis](docs/PERFORMANCE-ANALYSIS.md).
 
 ## What is included
 
 - Interactive, multi-turn terminal chat with `/reset`, `/stats`, and `/exit`
 - Four selectable checkpoints across the SmolLM and Qwen families
+- A single-dispatch SmolLM decoder engine that streams weights over six
+  parallel NPU channels
 - Configurable NPU/CPU layer offload for hybrid execution
 - OpenAI-compatible `GET /v1/models`
 - OpenAI-compatible `POST /v1/chat/completions`
@@ -507,6 +513,7 @@ python npu_llm/tests/test_sampling.py
 python npu_llm/tests/test_stopping.py
 python npu_llm/tests/test_tokenizer.py
 python npu_llm/tests/test_decode_loop.py
+python npu_llm/tests/test_engine_layout.py
 python npu_llm/tests/test_cpu_backend.py
 python tests/test_api_server.py
 ```
@@ -520,6 +527,7 @@ Run the complete hardware acceptance test:
 
 ```bash
 python npu_llm/tests/validate_chat_npu.py
+python npu_llm/tests/validate_engine_npu.py
 ```
 
 The tag-triggered release pipeline performs fresh pinned downloads and
@@ -560,7 +568,28 @@ python npu_llm/designs/rope.py --dev npu --heads 12 --position 7 -w 2 -i 5
 
 ## Architecture
 
-Each generated token follows this path:
+For SmolLM checkpoints running entirely on the NPU with BF16 weights, the
+default decoder is the row-split engine in `designs/engine.py`:
+
+1. Write the token's embedding row and RoPE table into a small header in the
+   K/V cache buffer.
+2. Run all 30 decoder layers and the final RMSNorm in one dispatch. Six GEMV
+   tiles each read their own weight stream from DDR and own a fixed slice of
+   the output rows of every projection; a MemTile joins their slices and a
+   hub tile runs RoPE and attention and broadcasts each combined vector back.
+   The hidden state stays inside the array between layers.
+3. Append the new key/value rows the hub returns to the K/V cache.
+4. Compute the 49k-row LM head with host BLAS and select the next token.
+
+`HAWKPOINT_ENGINE=0` switches back to the chunked layer graphs described
+below, which also run Qwen, hybrid NPU/CPU placements, and the opt-in W8
+decoder. The engine's projections, norms, and final RMSNorm compute the same
+BF16 values as the chunked path; its attention softmax runs on the vector unit
+with a lookup-table exponential, so a few near-tie tokens can differ. See the
+[performance analysis](docs/PERFORMANCE-ANALYSIS.md) for the measurements and
+design.
+
+With the chunked layer graphs, each generated token follows this path:
 
 1. Copy the token embedding row into a persistent XRT buffer.
 2. Run SmolLM decoder layers in persistent two-layer graph chunks (the Phoenix
@@ -608,8 +637,10 @@ statistics. The benchmark reports whether the measured median reaches the
   BF16 multiply-accumulate path via `aie::mul` + `aie::accum`. There is no
   equivalent to NVIDIA Tensor Cores or Apple AMX blocks on this NPU
 generation.
-- **Two decoder layers per persistent invocation** — verified firmware
-  limit. Qwen2.5 0.5B stacks 12 chunks of 2 layers each.
+- **Two decoder layers per persistent invocation for the chunked graphs** —
+  larger chunks of that design time out on the validated firmware, so
+  Qwen2.5 0.5B stacks 12 chunks of 2 layers each. The SmolLM decoder engine
+  uses a different dataflow and runs all 30 layers in one invocation.
 
 ### Model support
 
@@ -637,6 +668,11 @@ generation.
   Q4_K/Q6_K AIE2 kernels are included under `npu_llm/kernels/` and can be
   compiled with `ollama-xdna/backend/compile_quantized.py`; their xclbins are
   opt-in until the physical release gates validate the exact toolchain stack.
+- **The SmolLM engine is limited by weight streaming and the host LM head.**
+  One token moves about 214 MB of BF16 weights through six streams (7.6-8.9 ms
+  of NPU time depending on the position), and the CPU LM head adds about
+  5 ms. Moving the LM head onto the NPU and an int8-weight engine are the
+  measured next steps.
 - **Warm decode is line-rate only for a single token stream**
   with no batching. The NPU has one execution context shared across all
   requests; the HTTP server serializes inference and returns `429 Too Many

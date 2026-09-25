@@ -111,6 +111,7 @@ def main():
                 ),
                 "smollm_chunk": os.environ.get("HAWKPOINT_SMOLLM_CHUNK", "2"),
                 "prefix_cache": args.prefix_cache,
+                "decoder_engine": decoder._engine is not None,
             },
             "tokens": args.tokens,
             "runs": results,

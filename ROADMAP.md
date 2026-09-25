@@ -29,6 +29,14 @@ and reworked IRON runtimes.
 
 ## Completed
 
+### Row-split SmolLM decoder engine
+Every SmolLM decoder layer runs in one dispatch with six parallel weight
+streams (`designs/engine.py`), reaching about 70 token/s warm decode on the
+validated Hawk Point. Remaining per-token costs, measured: about 8-9 ms of NPU
+time (weight streaming plus attention) and about 5 ms of CPU LM head.
+Follow-ups: move the 49k-row LM head onto the NPU in the same dispatch, add
+an int8-weight variant of the engine, and apply the same layout to Qwen2.5.
+
 ### Sampling parameter support
 Temperature, top-k, top-p, repetition/presence/frequency penalties, and a
 reproducible `seed` are supported by the runtime, the terminal chat, and the

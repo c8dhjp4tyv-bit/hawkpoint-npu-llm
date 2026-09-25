@@ -173,6 +173,25 @@ class NPUDecoder:
             if self.npu_layers
             else None
         )
+        # Row-split engine: every SmolLM decoder layer and the final RMSNorm in
+        # one dispatch with six parallel weight streams (designs/engine.py).
+        # It computes the same BF16 results as the chunked layer graphs.
+        self._engine = None
+        if (
+            self._fused_smollm
+            and self.npu_layers == self.layers
+            and not self._use_quantized_decoder
+            and self._use_cpu_lm_head
+            and os.environ.get("HAWKPOINT_ENGINE", "1") != "0"
+        ):
+            # Imported lazily: the engine module builds its layout constants
+            # from designs.engine, which is only meaningful with MLIR-AIE.
+            from runtime import engine as engine_module
+
+            if engine_module.supports(self.model.metadata):
+                self._engine = engine_module.DecoderEngine(
+                    self.model, self._rope_inv_freq
+                )
         self.cpu_stage = (
             CPUDecoderStage(self.model, self.npu_layers, context_length)
             if (
@@ -725,6 +744,29 @@ class NPUDecoder:
         # computed from a different history and are no longer reusable.
         del self._cached_prefix[position:]
         start = time.perf_counter()
+        if getattr(self, "_engine", None) is not None:
+            phase = time.perf_counter()
+            row = self._qwen_embedding_cache.get(token_id)
+            if row is None:
+                row = np.asarray(
+                    self._host_embedding[token_id], dtype=np.float32
+                ).astype(bfloat16)
+                self._qwen_embedding_cache[token_id] = row
+                while (
+                    len(self._qwen_embedding_cache)
+                    > self._qwen_embedding_cache_limit
+                ):
+                    self._qwen_embedding_cache.popitem(last=False)
+            normalized = self._engine.step(row, position)
+            self._record_phase("npu_engine", phase)
+            if not compute_logits:
+                return None, time.perf_counter() - start
+            phase = time.perf_counter()
+            logits = self._cpu_lm_head_logits_values(
+                np.asarray(normalized, dtype=np.float32)
+            )
+            self._record_phase("cpu_lm_head", phase)
+            return self._decode_result(logits, start, diagnostics, select)
         if self.npu_layers:
             phase = time.perf_counter()
             hidden = self._embedding_for(token_id)
@@ -879,6 +921,8 @@ class NPUDecoder:
                 cache.fill(0)
             for cache in self.cpu_stage.value_cache.values():
                 cache.fill(0)
+        if getattr(self, "_engine", None) is not None:
+            self._engine.reset()
         self._cached_prefix.clear()
 
     def reset_prefix_cache(self):
@@ -1174,6 +1218,10 @@ class NPUDecoder:
         self._embedding = None
         self._final_norm_buffer = None
         self._lm_head_buffer = None
+        engine = getattr(self, "_engine", None)
+        if engine is not None:
+            engine.close()
+        self._engine = None
         # Release the cached, driver-level hardware contexts before another
         # model loads. Only meaningful when this decoder actually touched the
         # NPU; the CPU-only path (npu_layers == 0) never created a context.
