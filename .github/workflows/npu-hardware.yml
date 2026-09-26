@@ -60,6 +60,9 @@ jobs:
         run: |
           python npu_llm/tests/test_model_runtime.py
           python npu_llm/tests/validate_chat_npu.py
+          python npu_llm/tests/validate_engine_npu.py \
+            "$HAWKPOINT_MODEL_DIR" \
+            --report "$RUNNER_TEMP/engine-agreement.json"
       - name: Qwen component and 32-token agreement gate
         env:
           HAWKPOINT_QWEN_MODEL_DIR: ${{ runner.temp }}/hawkpoint-models/Qwen2.5-0.5B-Instruct-xdna1-w8a16
@@ -119,6 +122,7 @@ jobs:
             ${{ runner.temp }}/hawkpoint-soak-report.json
             ${{ runner.temp }}/hawkpoint-switch-stress-report.json
             ${{ runner.temp }}/qwen-token-agreement.json
+            ${{ runner.temp }}/engine-agreement.json
             ${{ runner.temp }}/qwen-fused-benchmark.json
             ${{ runner.temp }}/expected-token-ids.json
             ${{ runner.temp }}/hardware-versions.json

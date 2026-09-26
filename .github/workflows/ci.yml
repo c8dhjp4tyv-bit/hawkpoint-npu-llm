@@ -35,6 +35,8 @@ jobs:
           python npu_llm/tests/test_stopping.py
           python npu_llm/tests/test_tokenizer.py
           python npu_llm/tests/test_decode_loop.py
+          python npu_llm/tests/test_engine_layout.py
+          python npu_llm/tests/test_qwen_engine_layout.py
           python npu_llm/tests/test_cpu_backend.py
       - name: Test OpenAI-compatible protocol
         run: |

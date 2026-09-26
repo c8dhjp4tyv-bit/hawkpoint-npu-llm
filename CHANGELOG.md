@@ -42,6 +42,27 @@ ship as the next gated candidate (`v0.1.0-rc.10`) only after the physical
 Hawk Point job succeeds. Existing RC tags without GitHub Release records remain
 tag history, not published artifacts.
 
+- Add the row-split SmolLM decoder engine (`designs/engine.py`): all 30
+  decoder layers and the final RMSNorm run in one NPU dispatch, with six GEMV
+  tiles that each read their own weight stream and a hub tile for attention.
+  Warm SmolLM2 decode on the validated Hawk Point rises from about 17 to about
+  70 token/s and TTFT for the 35-token benchmark prompt drops from about
+  1.7 s to 0.3 s. The engine is selected automatically for all-NPU BF16
+  SmolLM decoding; `HAWKPOINT_ENGINE=0` restores the chunked layer graphs.
+- Run the engine's attention softmax on the vector unit. The AIE2 scalar unit
+  has no floating point, so with the scalar softmax one engine dispatch took
+  17.1 ms at position 63, against 8.9 ms with the vector softmax.
+- Fully unroll the engine's copy loops: llvm-aie `21.0.0.2026072001` compiles
+  some 16-lane copy loops into a zero-overhead loop that can hang the core.
+- Add a hardware-free test of the engine's weight-stream layout and a
+  hardware agreement gate against the CPU BF16 reference.
+- Add a Qwen2.5 0.5B decoder engine (`designs/qwen_engine.py`) that also runs
+  the final RMSNorm and the LM head on the NPU. Warm decode rises from 1.39 to
+  28.8 token/s and TTFT for a 40-token prompt from 25.1 s to 1.0 s, and the
+  32-token CPU BF16 reference gate still passes exactly. Its kernels follow
+  the reference's FP32 arithmetic through a BF16-split emulation of FP32
+  products (`kernels/fp32_emulation.h`).
+
 - Fix corrupted streamed text: tokens were decoded one at a time, so characters
   whose UTF-8 bytes span several byte-level BPE tokens (Turkish `ç`/`Ş` in
   SmolLM2, emoji in both families) were emitted as `�`. Text is now released
