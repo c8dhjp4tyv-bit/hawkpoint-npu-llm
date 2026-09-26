@@ -6,9 +6,11 @@ The implementation uses MLIR-AIE/IRON and targets the `npu1` AIE2 array
 directly.
 
 The GPU is not used. The CPU handles tokenization, orchestration, argmax,
-printing, reference validation, and Qwen's final LM head. Decoder projections,
-RMSNorm, RoPE, attention, KV caches, residuals, and SwiGLU execute as AIE2
-kernels.
+printing, reference validation, and SmolLM's final LM head (host BLAS is
+faster for its 49k-row head). Qwen's LM head runs on the NPU, except under
+hybrid placement, which moves it to the CPU together with the trailing layers.
+Decoder projections, RMSNorm, RoPE, attention, KV caches, residuals, and SwiGLU
+execute as AIE2 kernels.
 
 > Experimental research project. It is not affiliated with or supported by
 > AMD, Xilinx, Hugging Face, or the Open WebUI project.
