@@ -56,6 +56,12 @@ tag history, not published artifacts.
   some 16-lane copy loops into a zero-overhead loop that can hang the core.
 - Add a hardware-free test of the engine's weight-stream layout and a
   hardware agreement gate against the CPU BF16 reference.
+- Add a Qwen2.5 0.5B decoder engine (`designs/qwen_engine.py`) that also runs
+  the final RMSNorm and the LM head on the NPU. Warm decode rises from 1.39 to
+  28.8 token/s and TTFT for a 40-token prompt from 25.1 s to 1.0 s, and the
+  32-token CPU BF16 reference gate still passes exactly. Its kernels follow
+  the reference's FP32 arithmetic through a BF16-split emulation of FP32
+  products (`kernels/fp32_emulation.h`).
 
 - Fix corrupted streamed text: tokens were decoded one at a time, so characters
   whose UTF-8 bytes span several byte-level BPE tokens (Turkish `ç`/`Ş` in

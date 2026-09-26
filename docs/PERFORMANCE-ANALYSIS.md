@@ -171,6 +171,64 @@ LM head (a 49152 x 576 FP32 matrix-vector product). A quick soak of 100
 completions and a 100-switch model-switch stress test through the API ran
 without NPU errors.
 
+## Qwen2.5 0.5B Decoder Engine
+
+`designs/qwen_engine.py` applies the same dataflow to Qwen2.5 0.5B (hidden
+896, MLP 4864, 14 query heads over 2 KV heads, qkv bias). Its dimensions do
+not divide by six, so the GEMV tiles own uneven row ranges (152/148 o_proj
+and down_proj rows, 816/800 MLP rows, 192 qkv rows each), and the down
+projection is streamed in 896-column chunks that line up with the tiles'
+MLP slices. After the last layer every tile applies the final RMSNorm and
+computes its share of the 151,936 LM-head rows, streaming FP32 logits to DDR.
+Prefill positions whose logits are discarded use a variant of the design that
+stops after the last layer.
+
+### Why the chunked Qwen graphs were slow
+
+The chunked Qwen kernel (`kernels/qwen_decoder_layer_bf16.cc`) sums each
+projection row's 128 accumulator lanes, and computes RMSNorm, RoPE, softmax,
+and SiLU, in scalar `float` code. On the AIE2 scalar unit every such operation
+is a soft-float call. Profiled per token: 590 ms of NPU decoder time and
+24 ms of CPU LM head.
+
+### Matching the CPU reference
+
+The Qwen release gate requires the CPU BF16 reference's 32 greedy tokens
+exactly, and the smallest top-1 margin along that sequence is 0.068 logits.
+The engine's kernels therefore follow the reference's FP32 arithmetic on the
+vector unit. The vector unit adds and compares FP32 but multiplies only BF16,
+so `kernels/fp32_emulation.h` splits FP32 values into three BF16 parts whose
+products are exact, and rounds to BF16 with integer operations. Measured on
+the NPU against NumPy, products are within 1 ulp, `exp` within 4 ulp, and the
+reciprocal within 3 ulp. RMSNorm, the projections, SiLU, the residual adds,
+and the qkv bias reproduce the CPU reference bit for bit on the tested
+inputs; attention differs in the last bits, from the exponential and the
+summation order. The gate passes 32/32.
+
+### Measured result
+
+`scripts/benchmark_native.py`, 16 tokens after a 40-token prompt:
+
+| | Chunked graphs | Engine |
+|---|---:|---:|
+| Median decode rate | 1.39 token/s | 28.83 token/s |
+| TTFT | 25.1 s | 1.01–1.03 s |
+| Peak host RAM | 1.71 GiB | 1.28 GiB |
+
+One decode dispatch takes 32–36 ms of NPU time and one prefill dispatch
+without the LM head about 24 ms. A token reads about 1 GB of BF16 weights
+(739 MB of layers and 272 MB of LM head), so this is close to the measured
+streaming limit.
+
+### Two more toolchain constraints
+
+* Each AIE2 core has 16 KB of program memory. The Qwen GEMV tiles' program is
+  about 15.9–16.2 KB, so the hub's attention kernels live in a separate
+  object file, the FP32 helpers stay rolled, and `exp` and the reciprocal are
+  out of line.
+* With llvm-aie `21.0.0.2026072001`, an out-of-line helper that takes two FP32
+  vectors by value returns wrong results; those helpers stay inline.
+
 ## Static Decoder Projection Arithmetic
 
 For Qwen2.5-0.5B, the native fused graph uses hidden size `896`, intermediate

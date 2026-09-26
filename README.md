@@ -82,6 +82,19 @@ Validated on a Hawk Point XDNA1 NPU (`RyzenAI-npu1`, AIE2, 4 columns):
 The chunked layer graphs (`HAWKPOINT_ENGINE=0`) measured 17.1 token/s with
 1.71–1.81 s TTFT on the same machine and benchmark.
 
+Qwen2.5 0.5B runs on its own engine (`designs/qwen_engine.py`), including the
+LM head:
+
+| Measurement (Qwen2.5 0.5B, same benchmark) | Engine | Chunked graphs |
+|---|---:|---:|
+| Native 16-token decode, median | 28.83 token/s | 1.39 token/s |
+| TTFT, 40-token prompt | 1.01–1.03 s | 25.1 s |
+| Peak host RAM | 1.28 GiB | 1.71 GiB |
+| 32-token CPU BF16 reference gate | 32/32 | 32/32 |
+
+Each Qwen token reads about 1 GB of BF16 weights (24 layers plus the
+151,936-row LM head), so the engine is bound by weight streaming.
+
 The acceptance prompt generated:
 
 ```text
@@ -96,7 +109,7 @@ turn-boundary truncation, the prompt kept only the newest 32 tokens (the tail
 of the system prompt) and generated "The sky appears blue during the day
 because our eyes are sensitive to the color of the sky…".
 
-The fused Qwen2.5 0.5B path is checked against both the NumPy BF16 runtime and
+The Qwen2.5 0.5B path is checked against both the NumPy BF16 runtime and
 the upstream BF16 checkpoint. Release candidates require an exact checked-in
 32-token generated sequence. A separate 32-position prefill benchmark records
 the top-five logits, BF16 near-ties, and CPU/NPU latency without treating a
@@ -582,8 +595,16 @@ default decoder is the row-split engine in `designs/engine.py`:
 3. Append the new key/value rows the hub returns to the K/V cache.
 4. Compute the 49k-row LM head with host BLAS and select the next token.
 
-`HAWKPOINT_ENGINE=0` switches back to the chunked layer graphs described
-below, which also run Qwen, hybrid NPU/CPU placements, and the opt-in W8
+Qwen2.5 0.5B uses the same dataflow in `designs/qwen_engine.py`, with uneven
+row ranges per tile, and also runs the final RMSNorm and the 151,936-row LM
+head on the NPU, streaming FP32 logits to the host. Its release gate requires
+the CPU BF16 reference's exact greedy tokens, so its kernels follow the
+reference's FP32 arithmetic; the AIE2 vector unit has no FP32 multiply, so
+`kernels/fp32_emulation.h` builds FP32 products from exact BF16 partial
+products.
+
+`HAWKPOINT_ENGINE=0` switches both models back to the chunked layer graphs
+described below, which also run hybrid NPU/CPU placements and the opt-in W8
 decoder. The engine's projections, norms, and final RMSNorm compute the same
 BF16 values as the chunked path; its attention softmax runs on the vector unit
 with a lookup-table exponential, so a few near-tie tokens can differ. See the
@@ -658,11 +679,11 @@ generation.
 
 ### Performance
 
-- **Qwen2.5 0.5B NPU path is not faster than an eight-thread CPU baseline**
-  on measured hardware. The first-generation XDNA AIE2 array has ~2.34 TFLOPS
-  of BF16 peak throughput compared to a Zen 4 CPU core cluster at comparable
-  throughput with much lower launch overhead. See [Performance
-  Analysis](docs/PERFORMANCE-ANALYSIS.md) for a detailed breakdown.
+- **Qwen2.5 0.5B is bound by weight streaming.** Its engine reaches 28.8
+  token/s (the CPU BF16 reference runs at about 3.8 token/s on the same
+  machine); each token moves about 1 GB of BF16 weights. The chunked Qwen
+  graphs (`HAWKPOINT_ENGINE=0`) remain much slower, at 1.4 token/s. See
+  [Performance Analysis](docs/PERFORMANCE-ANALYSIS.md).
 - The **Ollama XDNA backend** now packs GGML rows once and retains dense tiles
   and selected MoE experts in a bounded persistent cache. Unchanged decode
   steps no longer repeat CPU dequantize/requantize or weight DMA. Native

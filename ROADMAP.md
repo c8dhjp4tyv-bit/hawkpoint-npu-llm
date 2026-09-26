@@ -34,8 +34,10 @@ Every SmolLM decoder layer runs in one dispatch with six parallel weight
 streams (`designs/engine.py`), reaching about 70 token/s warm decode on the
 validated Hawk Point. Remaining per-token costs, measured: about 8-9 ms of NPU
 time (weight streaming plus attention) and about 5 ms of CPU LM head.
-Follow-ups: move the 49k-row LM head onto the NPU in the same dispatch, add
-an int8-weight variant of the engine, and apply the same layout to Qwen2.5.
+Qwen2.5 0.5B has its own engine (`designs/qwen_engine.py`), with the LM head
+on the NPU: 28.8 token/s, bound by about 1 GB of BF16 weights per token.
+Follow-ups: move SmolLM's LM head onto the NPU as well, and add int8-weight
+engine variants (they would change outputs, so they need their own gates).
 
 ### Sampling parameter support
 Temperature, top-k, top-p, repetition/presence/frequency penalties, and a

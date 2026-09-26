@@ -192,6 +192,15 @@ class NPUDecoder:
                 self._engine = engine_module.DecoderEngine(
                     self.model, self._rope_inv_freq
                 )
+        elif (
+            self.model_family == "qwen2"
+            and self.npu_layers == self.layers
+            and os.environ.get("HAWKPOINT_ENGINE", "1") != "0"
+        ):
+            from runtime import qwen_engine as qwen_engine_module
+
+            if qwen_engine_module.supports(self.model.metadata):
+                self._engine = qwen_engine_module.QwenDecoderEngine(self.model)
         self.cpu_stage = (
             CPUDecoderStage(self.model, self.npu_layers, context_length)
             if (
@@ -757,13 +766,24 @@ class NPUDecoder:
                     > self._qwen_embedding_cache_limit
                 ):
                     self._qwen_embedding_cache.popitem(last=False)
-            normalized = self._engine.step(row, position)
+            if self.model_family == "qwen2":
+                # The Qwen engine also runs the final RMSNorm and LM head;
+                # prefill positions skip them in a shorter dispatch.
+                logits = self._engine.step(
+                    row, position, logits=compute_logits
+                )
+                self._record_phase("npu_engine", phase)
+                if not compute_logits:
+                    return None, time.perf_counter() - start
+                return self._decode_result(logits, start, diagnostics, select)
+            output = self._engine.step(row, position)
             self._record_phase("npu_engine", phase)
             if not compute_logits:
                 return None, time.perf_counter() - start
             phase = time.perf_counter()
+            # The SmolLM engine already applied the final RMSNorm.
             logits = self._cpu_lm_head_logits_values(
-                np.asarray(normalized, dtype=np.float32)
+                np.asarray(output, dtype=np.float32)
             )
             self._record_phase("cpu_lm_head", phase)
             return self._decode_result(logits, start, diagnostics, select)
