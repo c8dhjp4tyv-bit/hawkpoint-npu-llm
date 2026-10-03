@@ -27,11 +27,16 @@ def build_synthetic_placement_data(
     diverge_on_confident: bool = False,
     diverge_on_ambiguous: bool = True,
     seed: int = 42,
-) -> tuple[dict[str, list[list[dict]]], list[str]]:
+) -> dict[str, list[list[dict]]]:
     """Synthesize multi-placement top-k logit records for offline evaluation.
 
     Generates realistic log-probability distributions with known margins.
     """
+    if positions <= 0:
+        raise ValueError("positions must be positive")
+    if top_k < 2:
+        raise ValueError("top_k must be at least 2")
+
     rng = random.Random(seed)
     vocab_base = 100
 
@@ -47,7 +52,7 @@ def build_synthetic_placement_data(
             top2_logprob = top1_logprob - (margin_threshold + rng.uniform(0.5, 2.0))
         else:
             top1_logprob = -0.6
-            top2_logprob = top1_logprob - rng.uniform(0.01, max(0.05, margin_threshold * 0.4))
+            top2_logprob = top1_logprob - rng.uniform(0.0, margin_threshold * 0.4)
 
         # Rest of candidates
         other_logprobs = [top2_logprob - rng.uniform(0.5, 2.0) * (i + 1) for i in range(top_k - 2)]
@@ -59,23 +64,29 @@ def build_synthetic_placement_data(
         ref_candidates = [
             {"id": top1_id, "logprob": round(top1_logprob, 4)},
             {"id": top2_id, "logprob": round(top2_logprob, 4)},
-        ] + [{"id": tid, "logprob": round(lp, 4)} for tid, lp in zip(other_ids, other_logprobs)]
+        ] + [{"id": tid, "logprob": round(lp, 4)} for tid, lp in zip(other_ids, other_logprobs, strict=True)]
         cpu_rows.append(ref_candidates)
 
         # GPU placement: generally matches CPU, may flip near-ties
         gpu_cands = [dict(c) for c in ref_candidates]
         if not is_confident and diverge_on_ambiguous:
-            # Swap top-1 and top-2 for ambiguous position (tolerated)
-            gpu_cands[0], gpu_cands[1] = gpu_cands[1], gpu_cands[0]
+            # Swap top-1 and top-2 for ambiguous position (tolerated) with consistent scores
+            gpu_cands[0] = {"id": top2_id, "logprob": round(top1_logprob, 4)}
+            gpu_cands[1] = {"id": top1_id, "logprob": round(top2_logprob, 4)}
+            gpu_cands.sort(key=lambda c: c["logprob"], reverse=True)
         gpu_rows.append(gpu_cands)
 
         # XDNA placement: optionally diverges on confident tokens to test gate rejection
         xdna_cands = [dict(c) for c in ref_candidates]
         if is_confident and diverge_on_confident and pos == 0:
-            # Force high-margin violation
-            xdna_cands[0], xdna_cands[1] = xdna_cands[1], xdna_cands[0]
+            # Force high-margin violation with consistent scores
+            xdna_cands[0] = {"id": top2_id, "logprob": round(top1_logprob, 4)}
+            xdna_cands[1] = {"id": top1_id, "logprob": round(top2_logprob, 4)}
+            xdna_cands.sort(key=lambda c: c["logprob"], reverse=True)
         elif not is_confident and diverge_on_ambiguous:
-            xdna_cands[0], xdna_cands[1] = xdna_cands[1], xdna_cands[0]
+            xdna_cands[0] = {"id": top2_id, "logprob": round(top1_logprob, 4)}
+            xdna_cands[1] = {"id": top1_id, "logprob": round(top2_logprob, 4)}
+            xdna_cands.sort(key=lambda c: c["logprob"], reverse=True)
         xdna_rows.append(xdna_cands)
 
     placements = {
@@ -94,6 +105,10 @@ def run_offline_harness(
     seed: int = 42,
 ) -> tuple[dict, list[str]]:
     """Execute the offline agreement evaluation harness for a specific scenario."""
+    if positions <= 0:
+        raise ValueError("positions must be positive")
+    if top_k < 2:
+        raise ValueError("top_k must be at least 2")
     if scenario == "pass":
         # Tolerates ambiguous flips, no high-margin divergence
         data = build_synthetic_placement_data(
@@ -174,6 +189,11 @@ def main(argv: list[str] | None = None) -> int:
         help="Write JSON report to specified path",
     )
     args = parser.parse_args(argv)
+
+    if args.positions <= 0:
+        parser.error("positions must be positive")
+    if args.top_k < 2:
+        parser.error("top-k must be at least 2")
 
     scenarios = ["pass", "fail_confident", "exact"] if args.scenario == "all" else [args.scenario]
     results = {}

@@ -728,8 +728,9 @@ generation.
 - **Greedy by default, with opt-in sampling**. `temperature`, `top_p`,
   `top_k`, `repetition_penalty`, `presence_penalty`, `frequency_penalty`, and
   `seed` are supported. A request that sets none of them decodes greedily and
-  reproduces the checked-in acceptance sequences exactly. Stop sequences and
-  `logprobs` are supported; `n > 1` and beam search are not.
+  reproduces the checked-in acceptance sequences exactly. Stop sequences,
+  `logprobs`, and multiple candidate choices (`1 <= n <= 8`) are supported;
+  beam search is not.
 
 ### Performance
 

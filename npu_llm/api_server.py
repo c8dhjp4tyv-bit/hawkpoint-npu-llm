@@ -107,6 +107,8 @@ def _validate_prompt(value):
             raise ValueError("prompt exceeds 32768 characters")
         return value
     if isinstance(value, list) and value:
+        if len(value) > 1:
+            raise ValueError("only a single prompt per request is supported")
         for item in value:
             if not isinstance(item, str):
                 raise ValueError("each prompt in array must be a string")

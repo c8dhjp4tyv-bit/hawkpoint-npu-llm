@@ -1054,6 +1054,7 @@ def test_completions_endpoint():
             {"prompt": 123},
             {"prompt": []},
             {"prompt": [123]},
+            {"prompt": ["first", "second"]},
         ):
             status, _, _ = fetch(f"{base}/v1/completions", {"model": "smollm2-135m-xdna1", **bad_prompt})
             assert status == 400

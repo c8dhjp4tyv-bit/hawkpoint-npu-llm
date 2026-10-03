@@ -71,7 +71,7 @@ def build_smollm_model() -> GraphModel:
         TileNode(1, 3, "core", "GEMV_3", "GEMV Tile 3", ["RMSNorm, QKV rows 480..639", "O/MLP/Down slice 3"]),
         TileNode(2, 2, "core", "GEMV_4", "GEMV Tile 4", ["RMSNorm, QKV rows 640..799", "O/MLP/Down slice 4"]),
         TileNode(2, 3, "core", "GEMV_5", "GEMV Tile 5", ["RMSNorm, QKV rows 800..959", "O/MLP/Down slice 5"]),
-        TileNode(3, 2, "core", "Hub_Tile", "Attention Hub", ["RoPE, 3-Head Attention", "Vectorized Softmax", "K/V Cache Append", "1536-Elem Broadcast"]),
+        TileNode(3, 2, "core", "Hub_Tile", "Attention Hub", ["RoPE, 9 Q / 3 KV Heads", "Vectorized Softmax", "K/V Cache Append", "1536-Elem Broadcast"]),
     ])
     # Fifo channels
     gemv_tiles = [(0, 2), (0, 3), (1, 2), (1, 3), (2, 2), (2, 3)]
@@ -103,26 +103,41 @@ def build_qwen_model() -> GraphModel:
     ])
     # Row 1: MemTile
     model.nodes.extend([
-        TileNode(1, 1, "memtile", "MemTile_Join", "6-Way Slice Join", ["Joins 6x256 slices into 1536-elem vector"]),
+        TileNode(1, 1, "memtile", "MemTile_Join", "6-Way Slice Join", ["Joins 6x896 slices into 5376-elem vector"]),
     ])
     # Rows 2 & 3: Compute Tiles
-    model.nodes.extend([
-        TileNode(0, 2, "core", "GEMV_0", "GEMV Tile 0", ["RMSNorm, QKV rows", "O/MLP/Down slice 0", "LM Head Rows 0..25322 (FP32)"]),
-        TileNode(0, 3, "core", "GEMV_1", "GEMV Tile 1", ["RMSNorm, QKV rows", "O/MLP/Down slice 1", "LM Head Rows 25323..50645 (FP32)"]),
-        TileNode(1, 2, "core", "GEMV_2", "GEMV Tile 2", ["RMSNorm, QKV rows", "O/MLP/Down slice 2", "LM Head Rows 50646..75968 (FP32)"]),
-        TileNode(1, 3, "core", "GEMV_3", "GEMV Tile 3", ["RMSNorm, QKV rows", "O/MLP/Down slice 3", "LM Head Rows 75969..101291 (FP32)"]),
-        TileNode(2, 2, "core", "GEMV_4", "GEMV Tile 4", ["RMSNorm, QKV rows", "O/MLP/Down slice 4", "LM Head Rows 101292..126614 (FP32)"]),
-        TileNode(2, 3, "core", "GEMV_5", "GEMV Tile 5", ["RMSNorm, QKV rows", "O/MLP/Down slice 5", "LM Head Rows 126615..151935 (FP32)"]),
-        TileNode(3, 2, "core", "Hub_Tile", "Attention Hub", ["QKV Bias Add, RoPE", "14 Q-Heads / 2 KV-Heads Attention", "Vectorized Softmax", "1536-Elem Broadcast"]),
-    ])
+    lm_start_table = (0, 25344, 50688, 76032, 101376, 126656)
+    lm_groups_table = (396, 396, 396, 396, 395, 395)
+    lm_group_sz = 64
+
     gemv_tiles = [(0, 2), (0, 3), (1, 2), (1, 3), (2, 2), (2, 3)]
     for i, (col, row) in enumerate(gemv_tiles):
+        lm_start = lm_start_table[i]
+        lm_len = lm_groups_table[i] * lm_group_sz
+        lm_end = lm_start + lm_len - 1
+        model.nodes.append(
+            TileNode(col, row, "core", f"GEMV_{i}", f"GEMV Tile {i}", [
+                "RMSNorm, QKV rows",
+                f"O/MLP/Down slice {i}",
+                f"LM Head {lm_start}..{lm_end} (FP32)",
+            ])
+        )
+    model.nodes.append(
+        TileNode(3, 2, "core", "Hub_Tile", "Attention Hub", [
+            "QKV Bias Add, RoPE",
+            "14 Q-Heads / 2 KV-Heads Attention",
+            "Vectorized Softmax",
+            "5376-Elem Broadcast",
+        ])
+    )
+    for i, (col, row) in enumerate(gemv_tiles):
         shim_col = i // 2
+        lm_len = lm_groups_table[i] * lm_group_sz
         model.channels.append(FifoChannel(f"weights{i}", (shim_col, 0), (col, row), "bf16[1536]", 2, f"Weight Stream {i}"))
-        model.channels.append(FifoChannel(f"slice{i}", (col, row), (1, 1), "bf16[256]", 2, f"Result Slice {i}"))
-        model.channels.append(FifoChannel("broadcast", (3, 2), (col, row), "bf16[1536]", 2, "Activation Broadcast"))
-        model.channels.append(FifoChannel(f"logits{i}", (col, row), (shim_col, 0), "f32[25323]", 1, f"LM Head Logits {i}"))
-    model.channels.append(FifoChannel("joined", (1, 1), (3, 2), "bf16[1536]", 2, "Joined 1536-vector"))
+        model.channels.append(FifoChannel(f"slice{i}", (col, row), (1, 1), "bf16[896]", 2, f"Result Slice {i}"))
+        model.channels.append(FifoChannel("broadcast", (3, 2), (col, row), "bf16[5376]", 2, "Activation Broadcast"))
+        model.channels.append(FifoChannel(f"logits{i}", (col, row), (shim_col, 0), f"fp32[{lm_len}]", 1, f"LM Head Logits {i}"))
+    model.channels.append(FifoChannel("joined", (1, 1), (3, 2), "bf16[5376]", 2, "Joined 5376-vector"))
     model.channels.append(FifoChannel("cache", (3, 0), (3, 2), "bf16[256]", 2, "K/V History from DDR"))
     model.channels.append(FifoChannel("kv_new", (3, 2), (3, 0), "bf16[128]", 1, "Appended K/V to DDR"))
     return model
@@ -351,18 +366,42 @@ def generate_svg(design_name: str) -> str:
             op_y += 18
         svg_parts.append('  </g>')
 
-    # Channel flows (Key dataflow indicators)
-    # We draw subtle curved lines for main data paths
-    # Join path: GEMV Tiles -> MemTile (1,1)
-    mt_x, mt_y = get_coords(1, 1)
-    hub_x, hub_y = get_coords(3, 2)
-    # Join -> Hub
-    svg_parts.append(f'  <path d="M {mt_x + cell_w} {mt_y + cell_h/2} C {mt_x + cell_w + 30} {mt_y + cell_h/2}, {hub_x - 30} {hub_y + cell_h/2}, {hub_x} {hub_y + cell_h/2}" fill="none" stroke="#fbbf24" stroke-width="2.5" stroke-dasharray="5 3" marker-end="url(#arrow-gold)"/>')
-    svg_parts.append(f'  <text x="{mt_x + cell_w + 15}" y="{mt_y + cell_h/2 - 10}" fill="#fbbf24" font-size="11" font-weight="700">joined [1536]</text>')
+    # Channel flows rendered from model.channels
+    vector_dim = "5376" if model.name == "qwen_engine" else "1536"
+    node_positions = {(node.col, node.row) for node in model.nodes}
+    for channel in model.channels:
+        if channel.src not in node_positions or channel.dst not in node_positions:
+            continue
+        src_x, src_y = get_coords(*channel.src)
+        dst_x, dst_y = get_coords(*channel.dst)
+        dx, dy = dst_x - src_x, dst_y - src_y
+        if abs(dx) >= abs(dy):
+            start_x = src_x + (cell_w if dx > 0 else 0)
+            start_y = src_y + cell_h / 2
+            end_x = dst_x + (0 if dx > 0 else cell_w)
+            end_y = dst_y + cell_h / 2
+        else:
+            start_x = src_x + cell_w / 2
+            start_y = src_y + (cell_h if dy > 0 else 0)
+            end_x = dst_x + cell_w / 2
+            end_y = dst_y + (0 if dy > 0 else cell_h)
 
-    # Hub -> Broadcast to GEMVs
-    svg_parts.append(f'  <path d="M {hub_x} {hub_y + 20} C {hub_x - 80} {hub_y - 40}, {margin_x + 300} {hub_y - 40}, {margin_x + 250} {hub_y + 10}" fill="none" stroke="#c084fc" stroke-width="2.5" marker-end="url(#arrow-purple)"/>')
-    svg_parts.append(f'  <text x="{hub_x - 140}" y="{hub_y - 30}" fill="#c084fc" font-size="11" font-weight="700">broadcast [1536]</text>')
+        if channel.name == "joined" or channel.name.startswith("slice"):
+            stroke, marker = "#fbbf24", "arrow-gold"
+        elif channel.name == "broadcast":
+            stroke, marker = "#c084fc", "arrow-purple"
+        else:
+            stroke, marker = "#38bdf8", "arrow"
+        svg_parts.append(
+            f'  <path d="M {start_x} {start_y} L {end_x} {end_y}" fill="none" '
+            f'stroke="{stroke}" stroke-width="2.5" marker-end="url(#{marker})"/>'
+        )
+
+    if (1, 1) in node_positions and (3, 2) in node_positions:
+        mt_x, mt_y = get_coords(1, 1)
+        hub_x, hub_y = get_coords(3, 2)
+        svg_parts.append(f'  <text x="{mt_x + cell_w + 15}" y="{mt_y + cell_h/2 - 10}" fill="#fbbf24" font-size="11" font-weight="700">joined [{vector_dim}]</text>')
+        svg_parts.append(f'  <text x="{hub_x - 140}" y="{hub_y - 30}" fill="#c084fc" font-size="11" font-weight="700">broadcast [{vector_dim}]</text>')
 
     # Legend at bottom
     leg_y = height - 30

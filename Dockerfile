@@ -9,7 +9,6 @@ ENV DEBIAN_FRONTEND=noninteractive \
     HAWKPOINT_HOST=0.0.0.0 \
     HAWKPOINT_PORT=8000 \
     HAWKPOINT_MODELS_DIR=/app/models \
-    HAWKPOINT_API_KEY=development-secret \
     PATH="/app/venv/bin:$PATH"
 
 # Install system dependencies
@@ -28,6 +27,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /app
 
+RUN groupadd --system app && useradd --system --gid app --home-dir /app --no-create-home app
+
 # Create virtualenv and install locked dependencies
 RUN python3 -m venv /app/venv
 COPY requirements.lock /app/requirements.lock
@@ -36,8 +37,10 @@ RUN /app/venv/bin/pip install --no-cache-dir --require-hashes -r /app/requiremen
 # Copy application source
 COPY . /app
 
-# Create models directory mount point
-RUN mkdir -p /app/models
+# Create models directory mount point and set ownership
+RUN mkdir -p /app/models && chown -R app:app /app
+
+USER app
 
 EXPOSE 8000
 

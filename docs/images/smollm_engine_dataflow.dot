@@ -38,7 +38,7 @@ digraph "smollm_engine" {
     "GEMV_3" [label="Tile(1, 3)\nGEMV Tile 3\nRMSNorm, QKV rows 480..639\nO/MLP/Down slice 3", fillcolor="#1e3a8a", color="#3b82f6", fontcolor="#eff6ff"];
     "GEMV_4" [label="Tile(2, 2)\nGEMV Tile 4\nRMSNorm, QKV rows 640..799\nO/MLP/Down slice 4", fillcolor="#1e3a8a", color="#3b82f6", fontcolor="#eff6ff"];
     "GEMV_5" [label="Tile(2, 3)\nGEMV Tile 5\nRMSNorm, QKV rows 800..959\nO/MLP/Down slice 5", fillcolor="#1e3a8a", color="#3b82f6", fontcolor="#eff6ff"];
-    "Hub_Tile" [label="Tile(3, 2)\nAttention Hub\nRoPE, 3-Head Attention\nVectorized Softmax\nK/V Cache Append\n1536-Elem Broadcast", fillcolor="#581c87", color="#a855f7", fontcolor="#faf5ff"];
+    "Hub_Tile" [label="Tile(3, 2)\nAttention Hub\nRoPE, 9 Q / 3 KV Heads\nVectorized Softmax\nK/V Cache Append\n1536-Elem Broadcast", fillcolor="#581c87", color="#a855f7", fontcolor="#faf5ff"];
   }
 
   "Shim_0_0" -> "GEMV_0" [label="weights0 (d=2)", color="#34d399", fontcolor="#34d399"];

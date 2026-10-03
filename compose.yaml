@@ -10,7 +10,7 @@ services:
       - /dev/accel/accel0:/dev/accel/accel0
       - /dev/dri:/dev/dri
     environment:
-      - HAWKPOINT_API_KEY=${HAWKPOINT_API_KEY:-development-secret}
+      - HAWKPOINT_API_KEY=${HAWKPOINT_API_KEY:?Set HAWKPOINT_API_KEY to a dedicated high-entropy key}
       - HAWKPOINT_MODELS_DIR=/app/models
     volumes:
       - ./npu_llm/models:/app/models
@@ -27,7 +27,7 @@ services:
       HOST: "127.0.0.1"
       PORT: "3000"
       OPENAI_API_BASE_URLS: "http://127.0.0.1:8000/v1"
-      OPENAI_API_KEYS: "${HAWKPOINT_API_KEY:-development-secret}"
+      OPENAI_API_KEYS: "${HAWKPOINT_API_KEY:?Set HAWKPOINT_API_KEY to a dedicated high-entropy key}"
     volumes:
       - open-webui-data:/app/backend/data
 
