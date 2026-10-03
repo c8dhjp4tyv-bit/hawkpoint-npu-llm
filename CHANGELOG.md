@@ -1,5 +1,13 @@
 # Changelog
 
+- Harden API server against Prometheus metric cardinality exhaustion by normalizing unmapped
+  request endpoints to `/unknown` on 404 errors.
+- Require Bearer token authentication on OpenMetrics endpoint `GET /metrics` and declare security
+  requirement in OpenAPI 3.1.0 specification.
+- Explicitly reject unsupported `suffix` and unsupported `best_of` (`best_of != n`) in `/v1/completions`.
+- Add `render` and `video` groups to `compose.yaml` for host `/dev/accel` non-root container permissions.
+- Improve SVG architecture diagrams with channel routing detours avoiding intermediate GEMV tiles.
+- Add finite and positive validation for `margin_threshold` and fix text format file writing in offline harness.
 - Serve live OpenAPI 3.1.0 specification at `GET /openapi.json` and export static schema
   at `docs/openapi.json` covering all authenticated completions, model discovery, probes, and telemetry.
 - Add zero-dependency Python API client demonstration (`examples/api_client_example.py`)

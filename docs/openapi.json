@@ -75,6 +75,11 @@
     "/metrics": {
       "get": {
         "summary": "OpenMetrics / Prometheus Telemetry",
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
         "responses": {
           "200": {
             "description": "Prometheus metric exposition text"

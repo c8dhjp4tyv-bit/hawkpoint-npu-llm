@@ -393,8 +393,24 @@ def generate_svg(design_name: str) -> str:
             stroke, marker = "#c084fc", "arrow-purple"
         else:
             stroke, marker = "#38bdf8", "arrow"
+
+        if channel.name == "broadcast" and abs(dx) > cell_w + col_gap:
+            route_y = src_y + cell_h + row_gap / 2
+            source_route_x = src_x - col_gap / 2
+            target_route_x = end_x + col_gap / 2
+            path_d = (
+                f"M {start_x} {start_y} "
+                f"L {source_route_x} {start_y} "
+                f"L {source_route_x} {route_y} "
+                f"L {target_route_x} {route_y} "
+                f"L {target_route_x} {end_y} "
+                f"L {end_x} {end_y}"
+            )
+        else:
+            path_d = f"M {start_x} {start_y} L {end_x} {end_y}"
+
         svg_parts.append(
-            f'  <path d="M {start_x} {start_y} L {end_x} {end_y}" fill="none" '
+            f'  <path d="{path_d}" fill="none" '
             f'stroke="{stroke}" stroke-width="2.5" marker-end="url(#{marker})"/>'
         )
 

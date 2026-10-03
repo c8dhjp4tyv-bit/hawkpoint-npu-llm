@@ -33,6 +33,21 @@ def test_build_synthetic_placement_data_validation():
     else:
         raise AssertionError("did not raise for top_k=1")
 
+    for invalid_margin in (-1.0, 0.0, float("nan"), float("inf")):
+        try:
+            build_synthetic_placement_data(margin_threshold=invalid_margin)
+        except ValueError as exc:
+            assert "margin_threshold must be finite and positive" in str(exc)
+        else:
+            raise AssertionError(f"did not raise for margin_threshold={invalid_margin}")
+
+        try:
+            run_offline_harness(margin_threshold=invalid_margin)
+        except ValueError as exc:
+            assert "margin_threshold must be finite and positive" in str(exc)
+        else:
+            raise AssertionError(f"run_offline_harness did not raise for margin_threshold={invalid_margin}")
+
 
 def test_offline_harness_scenarios():
     """Verify pass, fail_confident, and exact scenario evaluation semantics."""
@@ -97,13 +112,30 @@ def test_cli_execution():
         content = md_path.read_text(encoding="utf-8")
         assert "| `pass` |" in content
 
-        # CLI validation error
+        # Text format output to file
+        txt_path = Path(tmp_dir) / "report.txt"
+        code = main(["--scenario", "pass", "--format", "text", "--output", str(txt_path)])
+        assert code == 0
+        assert txt_path.is_file()
+        txt_content = txt_path.read_text(encoding="utf-8")
+        assert "Scenario [pass]: PASSED" in txt_content
+        assert not txt_content.strip().startswith("{")
+
+        # CLI validation error: invalid positions
         try:
             main(["--positions", "0"])
         except SystemExit as exc:
             assert exc.code != 0
         else:
             raise AssertionError("did not exit for invalid positions")
+
+        # CLI validation error: invalid margin threshold
+        try:
+            main(["--margin-threshold", "-2.0"])
+        except SystemExit as exc:
+            assert exc.code != 0
+        else:
+            raise AssertionError("did not exit for negative margin threshold")
 
 
 def run_all_tests():

@@ -1068,8 +1068,10 @@ def test_completions_endpoint():
             {"prompt": ["first", "second"]},
             {"echo": "yes"},
             {"suffix": 123},
+            {"suffix": "fill-in-the-middle"},
             {"best_of": "two"},
             {"best_of": 0},
+            {"best_of": 2},
             {"n": 2, "best_of": 1},
         ):
             status, _, _ = fetch(f"{base}/v1/completions", {"model": "smollm2-135m-xdna1", **bad_prompt})
@@ -1110,6 +1112,14 @@ def test_metrics_and_health_probes():
         assert status == 200
         assert json.loads(body)["status"] == "ready"
 
+        # Unauthenticated request to /metrics must be rejected
+        unauth_status, _, _ = fetch(f"{base}/metrics", api_key=None)
+        assert unauth_status == 401
+
+        # Unknown route must record to /unknown instead of leaking arbitrary path label
+        unknown_status, _, _ = fetch(f"{base}/nonexistent-route-path", api_key=None)
+        assert unknown_status == 404
+
         # Send an authenticated chat completion request
         req = {
             "model": "smollm2-135m-xdna1",
@@ -1119,7 +1129,7 @@ def test_metrics_and_health_probes():
         status, _, _ = fetch(f"{base}/v1/chat/completions", req)
         assert status == 200
 
-        # Fetch Prometheus metrics
+        # Fetch Prometheus metrics with valid bearer token
         status, body, headers = fetch(f"{base}/metrics")
         assert status == 200
         content_type = headers.get("Content-Type", "")
@@ -1127,6 +1137,8 @@ def test_metrics_and_health_probes():
         assert "version=0.0.4" in content_type
         assert "# TYPE hawkpoint_api_requests_total counter" in body
         assert 'hawkpoint_api_requests_total{endpoint="/v1/chat/completions",status="200"} 1' in body
+        assert 'hawkpoint_api_requests_total{endpoint="/unknown",status="404"} 1' in body
+        assert 'hawkpoint_api_requests_total{endpoint="/metrics",status="401"} 1' in body
         assert "hawkpoint_api_active_requests 0" in body
         assert "hawkpoint_worker_restarts_total 0" in body
         assert 'hawkpoint_tokens_generated_total{model="smollm2-135m-xdna1"} 2' in body

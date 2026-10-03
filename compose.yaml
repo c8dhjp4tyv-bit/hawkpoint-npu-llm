@@ -9,6 +9,9 @@ services:
     devices:
       - /dev/accel/accel0:/dev/accel/accel0
       - /dev/dri:/dev/dri
+    group_add:
+      - "render"
+      - "video"
     environment:
       - HAWKPOINT_API_KEY=${HAWKPOINT_API_KEY:?Set HAWKPOINT_API_KEY to a dedicated high-entropy key}
       - HAWKPOINT_MODELS_DIR=/app/models

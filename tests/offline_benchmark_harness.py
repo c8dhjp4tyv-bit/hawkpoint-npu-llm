@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 from pathlib import Path
 import random
 import sys
@@ -36,6 +37,8 @@ def build_synthetic_placement_data(
         raise ValueError("positions must be positive")
     if top_k < 2:
         raise ValueError("top_k must be at least 2")
+    if not math.isfinite(margin_threshold) or margin_threshold <= 0:
+        raise ValueError("margin_threshold must be finite and positive")
 
     rng = random.Random(seed)
     vocab_base = 100
@@ -109,6 +112,8 @@ def run_offline_harness(
         raise ValueError("positions must be positive")
     if top_k < 2:
         raise ValueError("top_k must be at least 2")
+    if not math.isfinite(margin_threshold) or margin_threshold <= 0:
+        raise ValueError("margin_threshold must be finite and positive")
     if scenario == "pass":
         # Tolerates ambiguous flips, no high-margin divergence
         data = build_synthetic_placement_data(
@@ -237,10 +242,13 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("positions must be positive")
     if args.top_k < 2:
         parser.error("top-k must be at least 2")
+    if not math.isfinite(args.margin_threshold) or args.margin_threshold <= 0:
+        parser.error("margin-threshold must be finite and positive")
 
     scenarios = ["pass", "fail_confident", "exact"] if args.scenario == "all" else [args.scenario]
     results = {}
     any_unexpected_failure = False
+    text_lines = []
 
     for sc in scenarios:
         report, failures = run_offline_harness(
@@ -256,9 +264,11 @@ def main(argv: list[str] | None = None) -> int:
         elif sc == "fail_confident" and report["passed"]:
             any_unexpected_failure = True
 
+        status = "PASSED" if report["passed"] else "FAILED (expected)" if sc == "fail_confident" else "FAILED"
+        msg = f"Scenario [{sc}]: {status} - failures: {failures}"
+        text_lines.append(msg)
         if args.format == "text":
-            status = "PASSED" if report["passed"] else "FAILED (expected)" if sc == "fail_confident" else "FAILED"
-            print(f"Scenario [{sc}]: {status} - failures: {failures}")
+            print(msg)
 
     if args.format == "markdown":
         md_content = generate_markdown_report(results)
@@ -276,10 +286,7 @@ def main(argv: list[str] | None = None) -> int:
             print(json_content)
     else:  # text format
         if args.output:
-            if args.output.suffix == ".md":
-                args.output.write_text(generate_markdown_report(results), encoding="utf-8")
-            else:
-                args.output.write_text(json.dumps(results, indent=2), encoding="utf-8")
+            args.output.write_text("\n".join(text_lines) + "\n", encoding="utf-8")
             print(f"Report written to {args.output}")
 
     return 1 if any_unexpected_failure else 0

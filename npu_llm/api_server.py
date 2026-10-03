@@ -225,6 +225,7 @@ OPENAPI_SPEC = {
         "/metrics": {
             "get": {
                 "summary": "OpenMetrics / Prometheus Telemetry",
+                "security": [{"bearerAuth": []}],
                 "responses": {"200": {"description": "Prometheus metric exposition text"}},
             }
         },
@@ -989,11 +990,7 @@ def make_handler(engine, config=None, metrics=None):
             extra_headers=None,
         ):
             """Return a structured API error with a chosen HTTP status."""
-            endpoint = getattr(
-                self,
-                "_current_endpoint",
-                urlsplit(self.path).path.rstrip("/") if hasattr(self, "path") else "/unknown",
-            )
+            endpoint = getattr(self, "_current_endpoint", "/unknown")
             metrics.record_request(endpoint, status)
             self._json(
                 {
@@ -1022,8 +1019,9 @@ def make_handler(engine, config=None, metrics=None):
         def do_GET(self):
             """Serve liveness, readiness, OpenMetrics, and authenticated model metadata routes."""
             path = urlsplit(self.path).path.rstrip("/")
-            self._current_endpoint = path
+            self._current_endpoint = "/unknown"
             if path in ("", "/"):
+                self._current_endpoint = "/"
                 metrics.record_request("/", 200)
                 self._json(
                     {
@@ -1045,10 +1043,12 @@ def make_handler(engine, config=None, metrics=None):
                 )
                 return
             if path in ("/openapi.json", "/v1/openapi.json"):
+                self._current_endpoint = "/openapi.json"
                 metrics.record_request("/openapi.json", 200)
                 self._json(OPENAPI_SPEC)
                 return
             if path in ("/health", "/health/live"):
+                self._current_endpoint = "/health"
                 metrics.record_request("/health", 200)
                 self._json(
                     {
@@ -1058,6 +1058,7 @@ def make_handler(engine, config=None, metrics=None):
                 )
                 return
             if path in ("/ready", "/health/ready"):
+                self._current_endpoint = "/ready"
                 ready = engine.ready and not inference_tracker.draining
                 status = 200 if ready else 503
                 metrics.record_request("/ready", status)
@@ -1074,6 +1075,9 @@ def make_handler(engine, config=None, metrics=None):
                 )
                 return
             if path == "/metrics":
+                self._current_endpoint = "/metrics"
+                if not self._authorized():
+                    return
                 output = metrics.export_openmetrics(
                     active_requests=inference_tracker.active,
                     worker_restarts=getattr(engine, "worker_restarts", 0),
@@ -1088,6 +1092,7 @@ def make_handler(engine, config=None, metrics=None):
                 self.wfile.write(body)
                 return
             if path == "/v1/models":
+                self._current_endpoint = "/v1/models"
                 if not self._authorized():
                     return
                 metrics.record_request("/v1/models", 200)
@@ -1099,6 +1104,7 @@ def make_handler(engine, config=None, metrics=None):
                 )
                 return
             if path.startswith("/v1/models/"):
+                self._current_endpoint = "/v1/models/*"
                 if not self._authorized():
                     return
                 model_id = path.removeprefix("/v1/models/")
@@ -1113,15 +1119,17 @@ def make_handler(engine, config=None, metrics=None):
                 metrics.record_request("/v1/models/*", 200)
                 self._json(model)
                 return
+            self._current_endpoint = "/unknown"
             self._error("not found", 404)
 
         def do_POST(self):
             """Validate and admit a completion request before driving generation."""
             endpoint = urlsplit(self.path).path.rstrip("/")
-            self._current_endpoint = endpoint
             if endpoint not in ("/v1/chat/completions", "/v1/completions"):
+                self._current_endpoint = "/unknown"
                 self._error("not found", 404)
                 return
+            self._current_endpoint = endpoint
             if not self._authorized():
                 return
             if inference_tracker.draining:
@@ -1166,12 +1174,12 @@ def make_handler(engine, config=None, metrics=None):
                     if not isinstance(echo, bool):
                         raise ValueError("echo must be a boolean")
                     suffix = request.get("suffix")
-                    if suffix is not None and not isinstance(suffix, str):
-                        raise ValueError("suffix must be a string")
+                    if suffix is not None:
+                        raise ValueError("suffix is not supported")
                     best_of = request.get("best_of")
                     if best_of is not None:
-                        if not isinstance(best_of, int) or best_of < n:
-                            raise ValueError("best_of must be an integer >= n")
+                        if not isinstance(best_of, int) or best_of != n:
+                            raise ValueError("best_of is not supported when different from n")
                 else:
                     messages = _validate_messages(request.get("messages"))
                     input_payload = messages
