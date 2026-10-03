@@ -98,7 +98,8 @@ def execute_single_request(
     first_token_time: float | None = None
     generated_tokens = 0
     prompt_tokens = 0
-    token_count_known = stream
+    token_count_known = False
+    stream_done = False
 
     try:
         with open_api_request(req, api_key, timeout=120) as resp:
@@ -110,6 +111,7 @@ def execute_single_request(
                         continue
                     data_str = line.removeprefix("data: ")
                     if data_str == "[DONE]":
+                        stream_done = True
                         break
                     try:
                         data = json.loads(data_str)
@@ -124,18 +126,22 @@ def execute_single_request(
                         if content:
                             if first_token_time is None:
                                 first_token_time = time.monotonic()
-                            generated_tokens += 1
                     if "usage" in data and data["usage"]:
                         u = data["usage"]
-                        if "completion_tokens" in u:
-                            generated_tokens = u["completion_tokens"]
+                        count = u.get("completion_tokens")
+                        if type(count) is int and count >= 0:
+                            generated_tokens = count
+                            token_count_known = True
                         if "prompt_tokens" in u:
                             prompt_tokens = u["prompt_tokens"]
+                if not stream_done:
+                    raise RuntimeError("Incomplete API stream: missing [DONE]")
             else:
                 body = json.loads(resp.read().decode("utf-8"))
                 usage = body.get("usage") or {}
-                token_count_known = "completion_tokens" in usage
-                generated_tokens = usage.get("completion_tokens", 0)
+                count = usage.get("completion_tokens")
+                token_count_known = type(count) is int and count >= 0
+                generated_tokens = count if token_count_known else 0
                 prompt_tokens = usage.get("prompt_tokens", 0)
 
         end_time = time.monotonic()
@@ -164,6 +170,7 @@ def execute_single_request(
             prompt_tokens=0,
             tokens_per_second=0.0,
             error=f"HTTP {exc.code}: {err_body[:200]}",
+            token_count_known=False,
         )
     except Exception as exc:
         return RequestBenchmarkResult(
@@ -174,6 +181,7 @@ def execute_single_request(
             prompt_tokens=0,
             tokens_per_second=0.0,
             error=str(exc),
+            token_count_known=False,
         )
 
 
@@ -225,10 +233,10 @@ def run_benchmark(
     wall_duration = time.monotonic() - wall_start
     final_metrics = fetch_metrics(base_url, api_key)
 
-    successful = [r for r in results if r.status_code == 200]
+    successful = [r for r in results if r.status_code == 200 and r.error is None]
     latencies = [r.total_latency_seconds for r in successful]
     ttfts = [r.ttft_seconds for r in successful if r.ttft_seconds is not None]
-    tps_list = [r.tokens_per_second for r in successful]
+    tps_list = [r.tokens_per_second for r in successful if r.token_count_known]
     total_tokens = sum(r.generated_tokens for r in successful)
     aggregate_tps = (total_tokens / wall_duration) if wall_duration > 0 else 0.0
 

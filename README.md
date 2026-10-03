@@ -383,8 +383,8 @@ JSON integer (then capped to the hardware context); supplying both is rejected.
 `n` can be an integer between `1` and `8` (default `1`) to generate multiple
 indexed candidate choices, and `stream` must be a JSON boolean.
 `echo` is accepted for `/v1/completions` (JSON boolean) to prepend the prompt
-to the resulting text, and `suffix` (optional string) / `best_of` (optional integer `>= n`)
-are supported for text completion workflows.
+to the resulting text. `suffix` is unsupported; a supplied `best_of` must be
+a JSON integer equal to `n`. Other values return `400` for text completions.
 `stream_options` is only accepted with streaming enabled. Invalid types return
 `400` before inference admission. Header and body reads are also bounded by
 `--request-timeout`; a stalled body receives `408` when the connection remains
@@ -608,7 +608,9 @@ and keep the backend private.
 
 ## Docker and Compose deployment
 
-Run the containerized API server with hardware NPU access (`/dev/accel/accel0` and `/dev/dri`):
+Run the containerized API server with hardware NPU access (`/dev/accel/accel0` and `/dev/dri`).
+The host-networked API binds to `127.0.0.1:8000` by default. For remote access,
+place a trusted TLS reverse proxy in front of that loopback endpoint:
 
 ```bash
 # Set a dedicated HAWKPOINT_API_KEY in your environment first.

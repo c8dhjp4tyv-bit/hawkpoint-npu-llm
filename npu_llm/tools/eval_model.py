@@ -85,13 +85,15 @@ class EvalItemResult:
     generated_text: str
     matched: bool
     tokens: list[str]
-    token_logprobs: list[float]
+    token_logprobs: list[float | None]
     cross_entropy: float | None
     perplexity: float | None
     per_token_latency_ms: float
     decode_tokens_per_second: float
     prompt_tokens: int = 0
     completion_tokens: int = 0
+    scored_tokens: int = 0
+    negative_log_likelihood: float = 0.0
 
 
 @dataclass
@@ -112,21 +114,36 @@ class EvalReport:
     items: list[EvalItemResult]
 
 
-def compute_cross_entropy_and_perplexity(
-    token_logprobs: list[float],
-) -> tuple[float | None, float | None]:
-    """Calculate mean negative log-likelihood (cross-entropy) and perplexity."""
+def logprob_totals(token_logprobs):
+    """Return negative log-likelihood and count of valid scored tokens."""
     valid_logprobs = [
-        lp
-        for lp in token_logprobs
-        if lp is not None and type(lp) in (int, float) and math.isfinite(lp) and lp <= 0
+        lp for lp in (token_logprobs or [])
+        if type(lp) in (int, float) and math.isfinite(lp) and lp <= 0
     ]
-    if not valid_logprobs:
+    return -math.fsum(valid_logprobs), len(valid_logprobs)
+
+
+def loss_and_perplexity(negative_log_likelihood, scored_tokens):
+    """Calculate token-weighted loss, preserving missing scores as None."""
+    if not scored_tokens:
         return None, None
-    mean_neg_ll = -sum(valid_logprobs) / len(valid_logprobs)
-    clamped_loss = min(max(mean_neg_ll, 0.0), 100.0)
-    perplexity = math.exp(clamped_loss)
-    return mean_neg_ll, perplexity
+    mean_loss = negative_log_likelihood / scored_tokens
+    return mean_loss, math.exp(min(max(mean_loss, 0.0), 100.0))
+
+
+def compute_cross_entropy_and_perplexity(
+    token_logprobs: list[float | None],
+) -> tuple[float | None, float | None]:
+    """Calculate mean negative log-likelihood and perplexity for scored tokens."""
+    return loss_and_perplexity(*logprob_totals(token_logprobs))
+
+
+def aggregate_loss(results):
+    """Weight completion losses by their valid logprob counts, not their lengths."""
+    return loss_and_perplexity(
+        math.fsum(r.negative_log_likelihood for r in results),
+        sum(r.scored_tokens for r in results),
+    )
 
 
 def evaluate_single_item(
@@ -174,9 +191,13 @@ def evaluate_single_item(
     logprobs_info = choice.get("logprobs") or {}
 
     tokens = logprobs_info.get("tokens", [])
-    token_logprobs = logprobs_info.get("token_logprobs", [])
+    token_logprobs = [
+        lp if type(lp) in (int, float) and math.isfinite(lp) and lp <= 0 else None
+        for lp in (logprobs_info.get("token_logprobs") or [])
+    ]
 
-    cross_entropy, ppl = compute_cross_entropy_and_perplexity(token_logprobs)
+    negative_log_likelihood, scored_tokens = logprob_totals(token_logprobs)
+    cross_entropy, ppl = loss_and_perplexity(negative_log_likelihood, scored_tokens)
 
     # Check if expected target answer is matched (case-insensitive substring or exact word)
     norm_expected = expected.strip().lower()
@@ -203,6 +224,8 @@ def evaluate_single_item(
         decode_tokens_per_second=tps,
         prompt_tokens=usage.get("prompt_tokens", 0),
         completion_tokens=num_tokens,
+        scored_tokens=scored_tokens,
+        negative_log_likelihood=negative_log_likelihood,
     )
 
 
@@ -231,9 +254,7 @@ def run_evaluation(
     matched = sum(1 for r in results if r.matched)
     accuracy = (matched / total) if total > 0 else 0.0
 
-    all_losses = [r.cross_entropy for r in results if r.cross_entropy is not None and math.isfinite(r.cross_entropy)]
-    mean_loss = sum(all_losses) / len(all_losses) if all_losses else None
-    overall_ppl = math.exp(min(max(mean_loss, 0.0), 100.0)) if mean_loss is not None else None
+    mean_loss, overall_ppl = aggregate_loss(results)
 
     mean_per_token_latency = sum(r.per_token_latency_ms for r in results) / total if total > 0 else 0.0
     mean_tps = (
@@ -249,14 +270,13 @@ def run_evaluation(
         cat_items = [r for r in results if r.category == c]
         cat_total = len(cat_items)
         cat_matched = sum(1 for r in cat_items if r.matched)
-        cat_losses = [r.cross_entropy for r in cat_items if r.cross_entropy is not None and math.isfinite(r.cross_entropy)]
-        cat_mean_loss = sum(cat_losses) / len(cat_losses) if cat_losses else None
+        cat_mean_loss, cat_ppl = aggregate_loss(cat_items)
         categories[c] = {
             "total": cat_total,
             "matched": cat_matched,
             "accuracy": cat_matched / cat_total if cat_total > 0 else 0.0,
             "cross_entropy": cat_mean_loss,
-            "perplexity": math.exp(min(max(cat_mean_loss, 0.0), 100.0)) if cat_mean_loss is not None else None,
+            "perplexity": cat_ppl,
         }
 
     total_tokens = sum(r.completion_tokens for r in results)

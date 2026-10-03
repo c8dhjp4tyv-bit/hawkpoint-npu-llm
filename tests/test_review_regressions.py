@@ -5,6 +5,7 @@ from dataclasses import asdict, replace
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import io
 import json
+import math
 from pathlib import Path
 import sys
 import tempfile
@@ -24,7 +25,7 @@ from npu_llm.http_client import open_api_request, validate_api_url
 from npu_llm.tools import eval_model
 from npu_llm.tools.inspect_model import verify_model_files
 from scripts import doctor
-from scripts.benchmark_api import execute_single_request
+from scripts.benchmark_api import execute_single_request, run_benchmark
 from test_api_server import API_KEY, OptionsDecoder, fetch, start_server, stop_server
 
 
@@ -38,6 +39,8 @@ def test_evaluator_against_real_api():
         assert report.total_prompt_tokens == 7
         assert report.total_completion_tokens == 2
         assert report.mean_per_token_latency_ms > 0
+        assert report.items[0].scored_tokens == 2
+        assert report.items[0].negative_log_likelihood == 0.5
     finally:
         stop_server(server, thread)
 
@@ -69,7 +72,7 @@ def test_all_multi_choice_usage_and_metrics():
 def test_missing_loss_aggregation_and_gate():
     assert eval_model.compute_cross_entropy_and_perplexity([None, True, float("nan"), 0.5]) == (None, None)
     item = eval_model.EvalItemResult("a", "same", "Q", "A", "A", True, [], [], None, None, 1, 1)
-    valid = replace(item, item_id="b", cross_entropy=2.0, perplexity=7.389)
+    valid = replace(item, item_id="b", cross_entropy=2.0, perplexity=7.389, scored_tokens=1, negative_log_likelihood=2.0)
     with patch.object(eval_model, "evaluate_single_item", side_effect=[item, valid]):
         mixed = eval_model.run_evaluation("unused", None, "model", [{}, {}])
     assert mixed.mean_cross_entropy == 2.0
@@ -83,6 +86,67 @@ def test_missing_loss_aggregation_and_gate():
     assert json.loads(json.dumps(asdict(missing), allow_nan=False))["perplexity"] is None
     with patch.object(eval_model, "run_evaluation", return_value=missing):
         assert eval_model.main(["--max-perplexity", "100", "--format", "json"]) == 1
+
+
+def test_token_weighted_loss_and_perplexity_gate():
+    item = {"id": "weighted", "category": "same", "prompt": "Q", "expected": "A"}
+    scored = []
+    for logprobs in [[-10.0, None, True, float("nan")], [-0.01] * 100]:
+        response = MagicMock()
+        response.__enter__.return_value = response
+        response.read.return_value = json.dumps({
+            "choices": [{"text": "A", "logprobs": {"token_logprobs": logprobs}}],
+            # Reported generation counts must not weight loss aggregates.
+            "usage": {"completion_tokens": 999},
+        }).encode()
+        with patch.object(eval_model, "open_api_request", return_value=response):
+            scored.append(eval_model.evaluate_single_item("http://localhost", None, "model", item))
+    assert [result.scored_tokens for result in scored] == [1, 100]
+    assert [result.negative_log_likelihood for result in scored] == [10.0, 1.0]
+    with patch.object(eval_model, "evaluate_single_item", side_effect=scored):
+        report = eval_model.run_evaluation("unused", None, "model", [{}, {}])
+    expected_loss = 11.0 / 101
+    assert math.isclose(report.mean_cross_entropy, expected_loss)
+    assert math.isclose(report.perplexity, math.exp(expected_loss))
+    assert math.isclose(report.categories["same"]["cross_entropy"], expected_loss)
+    assert math.isclose(report.categories["same"]["perplexity"], math.exp(expected_loss))
+    with patch.object(eval_model, "run_evaluation", return_value=report):
+        assert eval_model.main(["--max-perplexity", "2", "--format", "json"]) == 0
+        assert eval_model.main(["--max-perplexity", "1.05", "--format", "json"]) == 1
+
+
+def test_benchmark_stream_completion_and_exact_token_counts():
+    content = 'data: {"choices":[{"delta":{"content":"several tokens in one chunk"}}]}\n\n'
+    usage = 'data: {"usage":{"completion_tokens":3,"prompt_tokens":2}}\n\n'
+    done = 'data: [DONE]\n\n'
+    results = []
+    for wire, success, known, tokens in [
+        (content, False, False, 0),
+        (content + usage, False, False, 0),
+        (content + done, True, False, 0),
+        (content + usage + done, True, True, 3),
+    ]:
+        response = MagicMock()
+        response.__enter__.return_value = response
+        response.status = 200
+        response.__iter__.return_value = iter(wire.encode().splitlines(keepends=True))
+        with patch("scripts.benchmark_api.open_api_request", return_value=response):
+            result = execute_single_request("http://localhost", None, "model", "Q", 1000)
+        assert (result.status_code == 200 and result.error is None) == success
+        assert result.token_count_known == known
+        assert result.generated_tokens == tokens
+        if not success:
+            assert "missing [DONE]" in result.error
+        if not known:
+            assert result.tokens_per_second == 0
+        results.append(result)
+    with patch("scripts.benchmark_api.execute_single_request", side_effect=results), patch("scripts.benchmark_api.fetch_metrics", return_value={}):
+        report = run_benchmark("http://localhost", "model", num_requests=4)
+    assert report["summary"]["successful_requests"] == 2
+    assert report["summary"]["failed_requests"] == 2
+    assert report["summary"]["total_generated_tokens"] == 3
+    assert report["summary"]["unknown_token_count_requests"] == 1
+    assert report["tokens_per_second"]["min"] > 0
 
 
 def test_manifest_inventory_validation():
@@ -220,6 +284,7 @@ def test_schema_and_container_command():
     assert "suffix" not in props
     import subprocess
     command = json.loads(next(line[4:] for line in (ROOT / "Dockerfile").read_text().splitlines() if line.startswith("CMD ")))
+    assert command[command.index("--host") + 1] == "127.0.0.1"
     result = subprocess.run([sys.executable, *command, "--help"], cwd=ROOT, capture_output=True, text=True)
     assert result.returncode == 0, result.stderr
 
