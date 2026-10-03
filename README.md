@@ -587,6 +587,36 @@ docker compose --profile api up -d
 docker compose --profile full up -d
 ```
 
+## Developer Makefile targets
+
+Standard development and operational tasks are accessible via `make`:
+
+```bash
+make help         # View all available targets
+make doctor       # Run preflight host environment diagnostics
+make test         # Run all unit, integration, and release gate test suites
+make api          # Launch the API server
+make chat         # Launch interactive terminal chat
+make benchmark    # Run automated API latency and TTFT benchmark suite
+make docker-build # Build local container image
+```
+
+## Python API client example
+
+A runnable zero-dependency client demonstration is available in `examples/api_client_example.py`:
+
+```bash
+# Run against a live server on localhost:8000
+python examples/api_client_example.py
+
+# Run standalone self-test with built-in mock server
+python examples/api_client_example.py --self-test
+```
+
+## OpenAPI 3.1.0 Specification
+
+The complete API schema is served live at `GET /openapi.json` and saved in `docs/openapi.json`. You can load this file directly into Swagger UI, Postman, Insomnia, or LangChain clients.
+
 ## IRON AIE2 Array and Dataflow Visualizer
 
 Generate visual architecture and ObjectFifo dataflow representations for the single-dispatch SmolLM and Qwen2.5 engines:

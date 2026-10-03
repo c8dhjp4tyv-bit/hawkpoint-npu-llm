@@ -1,7 +1,11 @@
 # Changelog
 
-## Unreleased
-
+- Serve live OpenAPI 3.1.0 specification at `GET /openapi.json` and export static schema
+  at `docs/openapi.json` covering all authenticated completions, model discovery, probes, and telemetry.
+- Add zero-dependency Python API client demonstration (`examples/api_client_example.py`)
+  supporting real-time SSE streaming, TTFT/TPS calculation, text completions, and mock self-testing.
+- Add developer `Makefile` with canonical targets (`test`, `doctor`, `inspect`, `benchmark`,
+  `chat`, `api`, `openwebui`, `docker-build`, `lint`, and `clean`).
 - Add model inspection and validation tool (`npu_llm/tools/inspect_model.py`)
   supporting parameter breakdown analysis, weight binary size and SHA-256 verification,
   streaming memory bandwidth estimations, and text/JSON/Markdown reporting.

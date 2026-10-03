@@ -1,0 +1,303 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "HawkPoint NPU LLM API",
+    "description": "OpenAI-compatible LLM serving API accelerated by AMD Ryzen AI (HawkPoint) XDNA1 NPU.",
+    "version": "1.0.0"
+  },
+  "paths": {
+    "/": {
+      "get": {
+        "summary": "Root Service Information",
+        "responses": {
+          "200": {
+            "description": "Service status and endpoint index"
+          }
+        }
+      }
+    },
+    "/openapi.json": {
+      "get": {
+        "summary": "OpenAPI 3.1.0 Specification",
+        "responses": {
+          "200": {
+            "description": "OpenAPI JSON schema"
+          }
+        }
+      }
+    },
+    "/health": {
+      "get": {
+        "summary": "Liveness Probe",
+        "responses": {
+          "200": {
+            "description": "Service is alive"
+          }
+        }
+      }
+    },
+    "/health/live": {
+      "get": {
+        "summary": "Kubernetes Liveness Probe",
+        "responses": {
+          "200": {
+            "description": "Service is alive"
+          }
+        }
+      }
+    },
+    "/ready": {
+      "get": {
+        "summary": "Readiness Probe",
+        "responses": {
+          "200": {
+            "description": "Inference worker is ready"
+          },
+          "503": {
+            "description": "Inference worker is starting or draining"
+          }
+        }
+      }
+    },
+    "/health/ready": {
+      "get": {
+        "summary": "Kubernetes Readiness Probe",
+        "responses": {
+          "200": {
+            "description": "Inference worker is ready"
+          },
+          "503": {
+            "description": "Inference worker is starting or draining"
+          }
+        }
+      }
+    },
+    "/metrics": {
+      "get": {
+        "summary": "OpenMetrics / Prometheus Telemetry",
+        "responses": {
+          "200": {
+            "description": "Prometheus metric exposition text"
+          }
+        }
+      }
+    },
+    "/v1/models": {
+      "get": {
+        "summary": "List Models",
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "List of installed models"
+          }
+        }
+      }
+    },
+    "/v1/models/{model_id}": {
+      "get": {
+        "summary": "Retrieve Model",
+        "parameters": [
+          {
+            "name": "model_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Model metadata"
+          },
+          "404": {
+            "description": "Model not found"
+          }
+        }
+      }
+    },
+    "/v1/chat/completions": {
+      "post": {
+        "summary": "Create Chat Completion",
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "model": {
+                    "type": "string"
+                  },
+                  "messages": {
+                    "type": "array",
+                    "items": {
+                      "type": "object"
+                    }
+                  },
+                  "stream": {
+                    "type": "boolean",
+                    "default": false
+                  },
+                  "max_tokens": {
+                    "type": "integer"
+                  },
+                  "temperature": {
+                    "type": "number"
+                  },
+                  "top_p": {
+                    "type": "number"
+                  },
+                  "repetition_penalty": {
+                    "type": "number"
+                  },
+                  "seed": {
+                    "type": "integer"
+                  },
+                  "n": {
+                    "type": "integer",
+                    "default": 1
+                  },
+                  "stream_options": {
+                    "type": "object"
+                  }
+                },
+                "required": [
+                  "messages"
+                ]
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful completion"
+          },
+          "400": {
+            "description": "Invalid parameter request"
+          },
+          "429": {
+            "description": "Rate limited or concurrency saturated"
+          },
+          "503": {
+            "description": "Server unavailable / draining"
+          }
+        }
+      }
+    },
+    "/v1/completions": {
+      "post": {
+        "summary": "Create Text Completion",
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "model": {
+                    "type": "string"
+                  },
+                  "prompt": {
+                    "oneOf": [
+                      {
+                        "type": "string"
+                      },
+                      {
+                        "type": "array",
+                        "items": {
+                          "type": "string"
+                        }
+                      }
+                    ]
+                  },
+                  "stream": {
+                    "type": "boolean",
+                    "default": false
+                  },
+                  "max_tokens": {
+                    "type": "integer"
+                  },
+                  "temperature": {
+                    "type": "number"
+                  },
+                  "top_p": {
+                    "type": "number"
+                  },
+                  "repetition_penalty": {
+                    "type": "number"
+                  },
+                  "seed": {
+                    "type": "integer"
+                  },
+                  "n": {
+                    "type": "integer",
+                    "default": 1
+                  },
+                  "echo": {
+                    "type": "boolean",
+                    "default": false
+                  },
+                  "suffix": {
+                    "type": "string"
+                  },
+                  "best_of": {
+                    "type": "integer"
+                  },
+                  "stream_options": {
+                    "type": "object"
+                  }
+                },
+                "required": [
+                  "prompt"
+                ]
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful text completion"
+          },
+          "400": {
+            "description": "Invalid parameter request"
+          },
+          "429": {
+            "description": "Rate limited or concurrency saturated"
+          },
+          "503": {
+            "description": "Server unavailable / draining"
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "securitySchemes": {
+      "bearerAuth": {
+        "type": "http",
+        "scheme": "bearer",
+        "bearerFormat": "API Key"
+      }
+    }
+  }
+}

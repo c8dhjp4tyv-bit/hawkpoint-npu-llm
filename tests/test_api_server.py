@@ -1089,7 +1089,16 @@ def test_metrics_and_health_probes():
         root_data = json.loads(body)
         assert root_data["service"] == "hawkpoint-npu-api"
         assert "/metrics" in root_data["endpoints"]
+        assert "/openapi.json" in root_data["endpoints"]
         assert "/v1/chat/completions" in root_data["endpoints"]
+
+        # OpenAPI specification route
+        status, body, _ = fetch(f"{base}/openapi.json")
+        assert status == 200
+        spec = json.loads(body)
+        assert spec["openapi"] == "3.1.0"
+        assert "/v1/chat/completions" in spec["paths"]
+        assert "/v1/completions" in spec["paths"]
 
         # Liveness probe alias
         status, body, _ = fetch(f"{base}/health/live")
