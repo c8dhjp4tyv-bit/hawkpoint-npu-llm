@@ -154,6 +154,37 @@ def run_offline_harness(
     return report, failures
 
 
+def generate_markdown_report(results: dict[str, dict]) -> str:
+    """Generate a clean Markdown summary table from offline evaluation results."""
+    lines = [
+        "# Cross-Placement Logit Agreement Evaluation Report",
+        "",
+        "| Scenario | Placement | Top-1 Agreement | Tolerated Near-Ties | High-Margin Violations | Mean Top-k Overlap | Gate Status |",
+        "|:---------|:----------|:----------------|:---------------------|:-----------------------|:-------------------|:------------|",
+    ]
+
+    for scenario_name, report in results.items():
+        placements = report.get("placements", {})
+        passed = report.get("passed", False)
+        gate_status = "PASS" if passed else "FAIL"
+
+        for p_name, p_stats in placements.items():
+            matches = p_stats["top1_matches"]
+            total = p_stats["top1_total"]
+            pct = (matches / total * 100) if total else 0.0
+            tolerated_cnt = len(p_stats["tolerated_mismatches"])
+            violations_cnt = len(p_stats["high_margin_violations"])
+            mean_overlap = p_stats.get("mean_topk_overlap")
+            overlap_str = f"{mean_overlap:.2f}" if mean_overlap is not None else "N/A"
+
+            lines.append(
+                f"| `{scenario_name}` | `{p_name}` | {matches}/{total} ({pct:.1f}%) | "
+                f"{tolerated_cnt} | {violations_cnt} | {overlap_str} | **{gate_status}** |"
+            )
+
+    return "\n".join(lines)
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description="Run offline cross-placement logit agreement verification harness."
@@ -183,10 +214,22 @@ def main(argv: list[str] | None = None) -> int:
         help="Threshold margin for failing gate (default: 1.0)",
     )
     parser.add_argument(
+        "--seed",
+        type=int,
+        default=42,
+        help="Random seed for reproducible synthetic generation (default: 42)",
+    )
+    parser.add_argument(
+        "--format",
+        choices=["text", "json", "markdown"],
+        default="text",
+        help="Output report format (default: text)",
+    )
+    parser.add_argument(
         "--output",
         "-o",
         type=Path,
-        help="Write JSON report to specified path",
+        help="Write report to specified file path",
     )
     args = parser.parse_args(argv)
 
@@ -205,6 +248,7 @@ def main(argv: list[str] | None = None) -> int:
             top_k=args.top_k,
             margin_threshold=args.margin_threshold,
             scenario=sc,
+            seed=args.seed,
         )
         results[sc] = report
         if sc in ("pass", "exact") and not report["passed"]:
@@ -212,12 +256,31 @@ def main(argv: list[str] | None = None) -> int:
         elif sc == "fail_confident" and report["passed"]:
             any_unexpected_failure = True
 
-        status = "PASSED" if report["passed"] else "FAILED (expected)" if sc == "fail_confident" else "FAILED"
-        print(f"Scenario [{sc}]: {status} - failures: {failures}")
+        if args.format == "text":
+            status = "PASSED" if report["passed"] else "FAILED (expected)" if sc == "fail_confident" else "FAILED"
+            print(f"Scenario [{sc}]: {status} - failures: {failures}")
 
-    if args.output:
-        args.output.write_text(json.dumps(results, indent=2), encoding="utf-8")
-        print(f"Report written to {args.output}")
+    if args.format == "markdown":
+        md_content = generate_markdown_report(results)
+        if args.output:
+            args.output.write_text(md_content, encoding="utf-8")
+            print(f"Markdown report written to {args.output}")
+        else:
+            print(md_content)
+    elif args.format == "json":
+        json_content = json.dumps(results, indent=2)
+        if args.output:
+            args.output.write_text(json_content, encoding="utf-8")
+            print(f"JSON report written to {args.output}")
+        else:
+            print(json_content)
+    else:  # text format
+        if args.output:
+            if args.output.suffix == ".md":
+                args.output.write_text(generate_markdown_report(results), encoding="utf-8")
+            else:
+                args.output.write_text(json.dumps(results, indent=2), encoding="utf-8")
+            print(f"Report written to {args.output}")
 
     return 1 if any_unexpected_failure else 0
 

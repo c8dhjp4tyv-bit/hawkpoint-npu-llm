@@ -1046,6 +1046,17 @@ def test_completions_endpoint():
         assert "text_completion" in body
         assert "[DONE]" in body
 
+        # Echo parameter test (non-streaming)
+        status, body, _ = fetch(f"{base}/v1/completions", {**req, "echo": True})
+        assert status == 200
+        data_echo = json.loads(body)
+        assert data_echo["choices"][0]["text"] == "HelloHello!"
+
+        # Echo parameter test (streaming)
+        status, body, _ = fetch(f"{base}/v1/completions", {**req, "echo": True, "stream": True})
+        assert status == 200
+        assert '"text":"Hello"' in body
+
         # Validation errors
         for bad_prompt in (
             {},
@@ -1055,9 +1066,55 @@ def test_completions_endpoint():
             {"prompt": []},
             {"prompt": [123]},
             {"prompt": ["first", "second"]},
+            {"echo": "yes"},
+            {"suffix": 123},
+            {"best_of": "two"},
+            {"best_of": 0},
+            {"n": 2, "best_of": 1},
         ):
             status, _, _ = fetch(f"{base}/v1/completions", {"model": "smollm2-135m-xdna1", **bad_prompt})
             assert status == 400
+    finally:
+        stop_server(server, thread)
+
+
+def test_metrics_and_health_probes():
+    """Verify Prometheus /metrics and k8s liveness/readiness probe aliases."""
+    decoder = FakeDecoder()
+    server, thread, base = start_server({"smollm2-135m-xdna1": decoder})
+    try:
+        # Liveness probe alias
+        status, body, _ = fetch(f"{base}/health/live")
+        assert status == 200
+        assert json.loads(body)["status"] == "ok"
+
+        # Readiness probe alias
+        status, body, _ = fetch(f"{base}/health/ready")
+        assert status == 200
+        assert json.loads(body)["status"] == "ready"
+
+        # Send an authenticated chat completion request
+        req = {
+            "model": "smollm2-135m-xdna1",
+            "messages": [{"role": "user", "content": "Hello"}],
+            "max_tokens": 5,
+        }
+        status, _, _ = fetch(f"{base}/v1/chat/completions", req)
+        assert status == 200
+
+        # Fetch Prometheus metrics
+        status, body, headers = fetch(f"{base}/metrics")
+        assert status == 200
+        content_type = headers.get("Content-Type", "")
+        assert "text/plain" in content_type
+        assert "version=0.0.4" in content_type
+        assert "# TYPE hawkpoint_api_requests_total counter" in body
+        assert 'hawkpoint_api_requests_total{endpoint="/v1/chat/completions",status="200"} 1' in body
+        assert "hawkpoint_api_active_requests 0" in body
+        assert "hawkpoint_worker_restarts_total 0" in body
+        assert 'hawkpoint_tokens_generated_total{model="smollm2-135m-xdna1"} 2' in body
+        assert 'hawkpoint_inference_duration_seconds_count{model="smollm2-135m-xdna1"} 1' in body
+        assert body.endswith("# EOF\n")
     finally:
         stop_server(server, thread)
 
@@ -1086,6 +1143,7 @@ def main():
     test_model_switch_releases_previous_decoder()
     test_multiple_choices_generation()
     test_completions_endpoint()
+    test_metrics_and_health_probes()
     print("PASS API security and protocol")
 
 

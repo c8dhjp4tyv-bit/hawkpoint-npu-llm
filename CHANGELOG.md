@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+- Add Prometheus / OpenMetrics monitoring endpoint (`GET /metrics`) tracking
+  total requests, active concurrent requests, generated and prompt token counters,
+  inference duration summaries, and worker restarts.
+- Add Kubernetes probe aliases (`GET /health/live` and `GET /health/ready`).
+- Add support and validation for `echo`, `suffix`, and `best_of` parameters in
+  OpenAI-compatible text completions (`POST /v1/completions`).
+- Add structured JSON (`--format json`) and terminal ASCII grid (`--format text`)
+  exports to the IRON AIE2 Array and ObjectFifo dataflow visualizer (`visualize_graph.py`).
+- Add Markdown summary table reporting (`--format markdown`) and reproducible
+  random seed control (`--seed`) to the offline cross-placement logit agreement harness.
 - Add OpenAI-compatible text completions endpoint (`POST /v1/completions`)
   supporting raw string and array prompts with prompt window truncation
   (`encode_prompt_window`) and direct text generation (`generate_text`).

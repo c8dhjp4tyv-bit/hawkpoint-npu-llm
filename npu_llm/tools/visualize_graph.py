@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 from dataclasses import dataclass, field
 import html
+import json
 from pathlib import Path
 import sys
 
@@ -423,6 +424,86 @@ def generate_svg(design_name: str) -> str:
     return "\n".join(svg_parts)
 
 
+def generate_json(design_name: str) -> str:
+    """Generate structured JSON representation of the AIE2 array and dataflow channels."""
+    model = get_graph_model(design_name)
+    data = {
+        "name": model.name,
+        "title": model.title,
+        "description": model.description,
+        "grid": {
+            "columns": model.cols,
+            "rows": model.rows,
+        },
+        "tiles": [
+            {
+                "col": node.col,
+                "row": node.row,
+                "type": node.tile_type,
+                "name": node.name,
+                "role": node.role,
+                "operations": list(node.operations),
+            }
+            for node in model.nodes
+        ],
+        "channels": [
+            {
+                "name": ch.name,
+                "source": {"col": ch.src[0], "row": ch.src[1]},
+                "destination": {"col": ch.dst[0], "row": ch.dst[1]},
+                "shape": ch.shape,
+                "depth": ch.depth,
+                "description": ch.description,
+            }
+            for ch in model.channels
+        ],
+    }
+    return json.dumps(data, indent=2)
+
+
+def generate_text(design_name: str) -> str:
+    """Generate an ASCII grid and channel summary for CLI/headless inspection."""
+    model = get_graph_model(design_name)
+    grid = {(n.col, n.row): n for n in model.nodes}
+
+    lines = [
+        f"=== {model.title} ===",
+        model.description,
+        "",
+        "AIE2 Array Topology (Rows 3..0, Cols 0..3):",
+        "+" + ("-" * 23 + "+") * model.cols,
+    ]
+
+    for r in reversed(range(model.rows)):
+        row_type = "Core" if r >= 2 else ("MemTile" if r == 1 else "Shim DMA")
+        row_cells = []
+        sub_cells = []
+        for c in range(model.cols):
+            node = grid.get((c, r))
+            if node:
+                name_str = f"[{c},{r}] {node.name}"[:21].center(21)
+                role_str = node.role[:21].center(21)
+            else:
+                name_str = f"[{c},{r}] Empty".center(21)
+                role_str = " " * 21
+            row_cells.append(f" {name_str} ")
+            sub_cells.append(f" {role_str} ")
+        lines.append("|" + "|".join(row_cells) + f"| Row {r} ({row_type})")
+        lines.append("|" + "|".join(sub_cells) + "|")
+        lines.append("+" + ("-" * 23 + "+") * model.cols)
+
+    lines.append("")
+    lines.append(f"ObjectFifo Channels ({len(model.channels)} total):")
+    lines.append(f"{'Channel':<16} {'Source':<10} {'Destination':<14} {'Shape':<16} {'Depth':<6} Description")
+    lines.append("-" * 80)
+    for ch in model.channels:
+        src_str = f"({ch.src[0]},{ch.src[1]})"
+        dst_str = f"({ch.dst[0]},{ch.dst[1]})"
+        lines.append(f"{ch.name:<16} {src_str:<10} {dst_str:<14} {ch.shape:<16} {ch.depth:<6} {ch.description}")
+
+    return "\n".join(lines)
+
+
 def export_graph(design_name: str, fmt: str, output_path: str | Path | None = None) -> str:
     """Export graph representation in requested format."""
     fmt = fmt.lower()
@@ -430,14 +511,25 @@ def export_graph(design_name: str, fmt: str, output_path: str | Path | None = No
         content = generate_dot(design_name)
     elif fmt == "svg":
         content = generate_svg(design_name)
+    elif fmt == "json":
+        content = generate_json(design_name)
+    elif fmt == "text":
+        content = generate_text(design_name)
     elif fmt == "all":
         dot_content = generate_dot(design_name)
         svg_content = generate_svg(design_name)
+        json_content = generate_json(design_name)
+        text_content = generate_text(design_name)
         if output_path:
             p = Path(output_path)
             p.with_suffix(".dot").write_text(dot_content, encoding="utf-8")
             p.with_suffix(".svg").write_text(svg_content, encoding="utf-8")
-        return f"{dot_content}\n\n<!-- SVG Output -->\n{svg_content}"
+            p.with_suffix(".json").write_text(json_content, encoding="utf-8")
+            p.with_suffix(".txt").write_text(text_content, encoding="utf-8")
+        return (
+            f"{dot_content}\n\n<!-- SVG Output -->\n{svg_content}\n\n"
+            f"<!-- JSON Output -->\n{json_content}\n\n<!-- Text Output -->\n{text_content}"
+        )
     else:
         raise ValueError(f"unsupported format: {fmt!r}")
 
@@ -458,7 +550,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument(
         "--format",
-        choices=["svg", "dot", "all"],
+        choices=["svg", "dot", "json", "text", "all"],
         default="svg",
         help="Output format (default: svg)",
     )
