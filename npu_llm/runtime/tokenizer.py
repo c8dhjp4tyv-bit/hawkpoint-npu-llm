@@ -101,6 +101,21 @@ class SmolLMTokenizer:
     def encode_chat(self, messages):
         return self._encode_turns(self._with_default_system(messages))
 
+    def encode_prompt_window(self, prompt, budget):
+        """Encode a raw text prompt into at most ``budget`` prompt tokens.
+
+        For raw text completions without ChatML turn scaffolding. If the
+        encoded token sequence exceeds ``budget``, the most recent suffix of
+        length ``budget`` is retained, matching standard context-window
+        behavior. Returns ``(ids, truncated)``.
+        """
+        if budget <= 0:
+            raise ValueError("prompt budget must be positive")
+        ids = self._encode_text(prompt)
+        if len(ids) <= budget:
+            return ids, False
+        return ids[-budget:], True
+
     def encode_chat_window(self, messages, budget):
         """Encode a conversation into at most ``budget`` prompt tokens.
 

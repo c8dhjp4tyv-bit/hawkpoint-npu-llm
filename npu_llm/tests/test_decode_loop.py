@@ -68,6 +68,9 @@ class FakeTokenizer:
     def encode_chat_window(self, messages, budget):
         return list(self.prompt_ids), {"dropped_messages": 0}
 
+    def encode_prompt_window(self, prompt, budget):
+        return list(self.prompt_ids), False
+
     def decode(self, ids):
         return "".join(f"<{token}>" for token in ids)
 
@@ -386,6 +389,16 @@ def test_logprobs_do_not_change_greedy_tokens():
     plain = run(build_decoder([1, 2], _ramp), max_new_tokens=5)[1]
     scored = run(build_decoder([1, 2], _ramp), max_new_tokens=5, logprobs=0)[1]
     assert scored["generated_token_ids"] == plain["generated_token_ids"]
+
+
+def test_generate_text_emits_tokens():
+    decoder = build_decoder([1, 2], _ramp)
+    chunks = list(decoder.generate_text("test prompt", max_new_tokens=4))
+    text = "".join(chunk[0] for chunk in chunks)
+    stats = chunks[-1][1]
+    assert text == "<3><4><5><6>"
+    assert stats["generated_token_ids"] == [3, 4, 5, 6]
+    assert stats["prompt_tokens"] == 2
 
 
 def main():

@@ -145,13 +145,17 @@ analysis](docs/PERFORMANCE-ANALYSIS.md).
 - A single-dispatch SmolLM decoder engine that streams weights over six
   parallel NPU channels
 - Configurable NPU/CPU layer offload for hybrid execution
-- OpenAI-compatible `GET /v1/models`
-- OpenAI-compatible `POST /v1/chat/completions`
-- Streaming chat completions over server-sent events
+- OpenAI-compatible `GET /v1/models` and `GET /v1/models/{model_id}`
+- OpenAI-compatible `POST /v1/chat/completions` and `POST /v1/completions`
+- Multiple candidate choices generation (`n` parameter up to 8)
+- Streaming chat and text completions over server-sent events
 - Temperature, top-k, top-p, penalty, and seed sampling (greedy by default)
 - Stop sequences and per-token log probabilities
 - Prompt-prefix reuse across turns, so a follow-up message only prefills its
   new tokens
+- Containerized runtime environment via Dockerfile and multi-service Docker Compose
+- IRON AIE2 Array and ObjectFifo dataflow visualizer (DOT and responsive SVG)
+- Offline cross-placement logit agreement simulation harness
 - One-command API or API + Open WebUI launcher
 - Weight converter and hardware component/acceptance tests
 - AIE2 C++ kernels and IRON graph definitions
@@ -322,6 +326,18 @@ curl http://localhost:8000/v1/chat/completions \
   }'
 ```
 
+```bash
+curl http://localhost:8000/v1/completions \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $HAWKPOINT_API_KEY" \
+  -d '{
+    "model": "smollm2-135m-xdna1",
+    "prompt": "The primary mechanism of Rayleigh scattering is",
+    "max_tokens": 16,
+    "stream": false
+  }'
+```
+
 For streaming output, set `"stream": true`. Add
 `"stream_options": {"include_usage": true}` to receive a final chunk with
 `choices: []` and token counts in `usage`, immediately before `[DONE]`.
@@ -335,11 +351,12 @@ success `[DONE]` marker. Clients should treat a disconnected stream without
 
 `max_tokens` or its modern alias `max_completion_tokens` must be a positive
 JSON integer (then capped to the hardware context); supplying both is rejected.
-`n` must be integer `1`, and `stream` must be a JSON boolean.
+`n` can be an integer between `1` and `8` (default `1`) to generate multiple
+indexed candidate choices, and `stream` must be a JSON boolean.
 `stream_options` is only accepted with streaming enabled. Invalid types return
 `400` before inference admission. Header and body reads are also bounded by
 `--request-timeout`; a stalled body receives `408` when the connection remains
-writable. Inference timeouts return `504` for non-streaming requests.
+`writable`. Inference timeouts return `504` for non-streaming requests.
 
 Responses include a unique `X-Request-ID`, `Cache-Control: no-store`, and
 `X-Content-Type-Options: nosniff`. Streaming responses additionally disable
@@ -503,6 +520,39 @@ localhost. To run the server directly with TLS, pass `--tls-cert CERT.pem
 --tls-key KEY.pem`. For non-local deployment, use a trusted TLS reverse proxy
 and keep the backend private.
 
+## Docker and Compose deployment
+
+Run the containerized API server with hardware NPU access (`/dev/accel/accel0` and `/dev/dri`):
+
+```bash
+# Build and run the standalone NPU API container
+docker compose --profile api up -d
+
+# Or run both the NPU API server and Open WebUI
+docker compose --profile full up -d
+```
+
+## IRON AIE2 Array and Dataflow Visualizer
+
+Generate visual architecture and ObjectFifo dataflow representations for the single-dispatch SmolLM and Qwen2.5 engines:
+
+```bash
+# Export standalone responsive SVG diagrams
+python npu_llm/tools/visualize_graph.py --design smollm --format svg -o docs/images/smollm_engine_dataflow.svg
+python npu_llm/tools/visualize_graph.py --design qwen --format svg -o docs/images/qwen_engine_dataflow.svg
+
+# Or export Graphviz DOT representations
+python npu_llm/tools/visualize_graph.py --design smollm --format dot -o docs/images/smollm_engine_dataflow.dot
+```
+
+## Offline cross-placement logit agreement harness
+
+Simulate teacher-forced multi-backend (CPU, GPU, NPU) logit distributions and evaluate agreement gates offline without requiring physical hardware:
+
+```bash
+python tests/offline_benchmark_harness.py --scenario all
+```
+
 ## Convert a model manually
 
 ```bash
@@ -532,6 +582,8 @@ python npu_llm/tests/test_decode_loop.py
 python npu_llm/tests/test_engine_layout.py
 python npu_llm/tests/test_cpu_backend.py
 python tests/test_api_server.py
+python npu_llm/tests/test_visualizer.py
+python tests/offline_benchmark_harness.py
 ```
 
 `test_sampling.py`, `test_stopping.py`, `test_tokenizer.py`, and

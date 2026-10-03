@@ -2,6 +2,21 @@
 
 ## Unreleased
 
+- Add OpenAI-compatible text completions endpoint (`POST /v1/completions`)
+  supporting raw string and array prompts with prompt window truncation
+  (`encode_prompt_window`) and direct text generation (`generate_text`).
+- Support multiple candidate choices generation (`n` parameter between 1 and 8)
+  for both `/v1/chat/completions` and `/v1/completions`, including non-streaming
+  and SSE streaming indexed choices.
+- Add containerized runtime environment via `Dockerfile` and multi-service
+  `compose.yaml` with hardware NPU accel device mapping and Open WebUI service orchestration.
+- Add IRON AIE2 Array and ObjectFifo dataflow visualizer tool
+  (`npu_llm/tools/visualize_graph.py`) exporting standalone responsive SVGs and
+  Graphviz DOT representations for SmolLM, Qwen2.5, and chunked decoders.
+- Add offline simulation and evaluation benchmark harness
+  (`tests/offline_benchmark_harness.py`) for teacher-forced cross-placement logit
+  agreement verification across CPU, GPU, and NPU without requiring physical hardware.
+- Integrate visualizer and offline benchmark harness test coverage into GitHub Actions CI.
 - Fix shutdown past the drain deadline by cancelling the worker independently
   of the generation lock; prevent queued work from restarting a closed engine.
 - Check quick-test model coverage against the real checkpoint catalog.

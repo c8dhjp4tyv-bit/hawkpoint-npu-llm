@@ -1,0 +1,66 @@
+digraph "smollm_engine" {
+  graph [rankdir=TB, compound=true, bgcolor="#0f172a", fontname="Inter,sans-serif", fontcolor="#f8fafc", pad=0.5, nodesep=0.5, ranksep=0.8];
+  node [shape=box, style="rounded,filled", fontname="Inter,sans-serif", margin="0.2,0.15", penwidth=1.5];
+  edge [fontname="Inter,sans-serif", fontsize=10, penwidth=1.8];
+  label = "SmolLM2 135M Single-Dispatch Decoder Engine\n6 GEMV tiles (256-elem slices), 1 MemTile join, 1 Hub tile (RoPE/Attention/KV), DDR streaming.";
+  labelloc = "t";
+  fontsize = 16;
+
+  subgraph cluster_shim {
+    label = "Row 0: Shim DMA (External DDR Interfaces)";
+    style = "rounded,dashed";
+    color = "#334155";
+    fontcolor = "#94a3b8";
+    rank = same;
+    "Shim_0_0" [label="Tile(0, 0)\nDDR Shim DMA Col 0\nWeights 0 & 1 stream", fillcolor="#064e3b", color="#10b981", fontcolor="#ecfdf5"];
+    "Shim_1_0" [label="Tile(1, 0)\nDDR Shim DMA Col 1\nWeights 2 & 3 stream", fillcolor="#064e3b", color="#10b981", fontcolor="#ecfdf5"];
+    "Shim_2_0" [label="Tile(2, 0)\nDDR Shim DMA Col 2\nWeights 4 & 5 stream", fillcolor="#064e3b", color="#10b981", fontcolor="#ecfdf5"];
+    "Shim_3_0" [label="Tile(3, 0)\nDDR Shim DMA Col 3\nK/V Cache In\nKvNew Out\nHidden Out", fillcolor="#064e3b", color="#10b981", fontcolor="#ecfdf5"];
+  }
+
+  subgraph cluster_memtile {
+    label = "Row 1: Memory Tiles (MemTile Shared Memory)";
+    style = "rounded,dashed";
+    color = "#334155";
+    fontcolor = "#94a3b8";
+    rank = same;
+    "MemTile_Join" [label="Tile(1, 1)\n6-Way Slice Join\nJoins 6x256 slices into 1536-elem vector", fillcolor="#78350f", color="#f59e0b", fontcolor="#fef3c7"];
+  }
+
+  subgraph cluster_core {
+    label = "Rows 2-3: AIE2 Core Compute Tiles";
+    style = "rounded,dashed";
+    color = "#334155";
+    fontcolor = "#94a3b8";
+    "GEMV_0" [label="Tile(0, 2)\nGEMV Tile 0\nRMSNorm, QKV rows 0..159\nO/MLP/Down slice 0\nFinal norm -> Hidden Out", fillcolor="#1e3a8a", color="#3b82f6", fontcolor="#eff6ff"];
+    "GEMV_1" [label="Tile(0, 3)\nGEMV Tile 1\nRMSNorm, QKV rows 160..319\nO/MLP/Down slice 1", fillcolor="#1e3a8a", color="#3b82f6", fontcolor="#eff6ff"];
+    "GEMV_2" [label="Tile(1, 2)\nGEMV Tile 2\nRMSNorm, QKV rows 320..479\nO/MLP/Down slice 2", fillcolor="#1e3a8a", color="#3b82f6", fontcolor="#eff6ff"];
+    "GEMV_3" [label="Tile(1, 3)\nGEMV Tile 3\nRMSNorm, QKV rows 480..639\nO/MLP/Down slice 3", fillcolor="#1e3a8a", color="#3b82f6", fontcolor="#eff6ff"];
+    "GEMV_4" [label="Tile(2, 2)\nGEMV Tile 4\nRMSNorm, QKV rows 640..799\nO/MLP/Down slice 4", fillcolor="#1e3a8a", color="#3b82f6", fontcolor="#eff6ff"];
+    "GEMV_5" [label="Tile(2, 3)\nGEMV Tile 5\nRMSNorm, QKV rows 800..959\nO/MLP/Down slice 5", fillcolor="#1e3a8a", color="#3b82f6", fontcolor="#eff6ff"];
+    "Hub_Tile" [label="Tile(3, 2)\nAttention Hub\nRoPE, 3-Head Attention\nVectorized Softmax\nK/V Cache Append\n1536-Elem Broadcast", fillcolor="#581c87", color="#a855f7", fontcolor="#faf5ff"];
+  }
+
+  "Shim_0_0" -> "GEMV_0" [label="weights0 (d=2)", color="#34d399", fontcolor="#34d399"];
+  "GEMV_0" -> "MemTile_Join" [label="slice0 (d=2)", color="#fbbf24", fontcolor="#fbbf24"];
+  "Hub_Tile" -> "GEMV_0" [label="broadcast (d=2)", color="#c084fc", fontcolor="#c084fc"];
+  "Shim_0_0" -> "GEMV_1" [label="weights1 (d=2)", color="#34d399", fontcolor="#34d399"];
+  "GEMV_1" -> "MemTile_Join" [label="slice1 (d=2)", color="#fbbf24", fontcolor="#fbbf24"];
+  "Hub_Tile" -> "GEMV_1" [label="broadcast (d=2)", color="#c084fc", fontcolor="#c084fc"];
+  "Shim_1_0" -> "GEMV_2" [label="weights2 (d=2)", color="#34d399", fontcolor="#34d399"];
+  "GEMV_2" -> "MemTile_Join" [label="slice2 (d=2)", color="#fbbf24", fontcolor="#fbbf24"];
+  "Hub_Tile" -> "GEMV_2" [label="broadcast (d=2)", color="#c084fc", fontcolor="#c084fc"];
+  "Shim_1_0" -> "GEMV_3" [label="weights3 (d=2)", color="#34d399", fontcolor="#34d399"];
+  "GEMV_3" -> "MemTile_Join" [label="slice3 (d=2)", color="#fbbf24", fontcolor="#fbbf24"];
+  "Hub_Tile" -> "GEMV_3" [label="broadcast (d=2)", color="#c084fc", fontcolor="#c084fc"];
+  "Shim_2_0" -> "GEMV_4" [label="weights4 (d=2)", color="#34d399", fontcolor="#34d399"];
+  "GEMV_4" -> "MemTile_Join" [label="slice4 (d=2)", color="#fbbf24", fontcolor="#fbbf24"];
+  "Hub_Tile" -> "GEMV_4" [label="broadcast (d=2)", color="#c084fc", fontcolor="#c084fc"];
+  "Shim_2_0" -> "GEMV_5" [label="weights5 (d=2)", color="#34d399", fontcolor="#34d399"];
+  "GEMV_5" -> "MemTile_Join" [label="slice5 (d=2)", color="#fbbf24", fontcolor="#fbbf24"];
+  "Hub_Tile" -> "GEMV_5" [label="broadcast (d=2)", color="#c084fc", fontcolor="#c084fc"];
+  "MemTile_Join" -> "Hub_Tile" [label="joined (d=2)", color="#fbbf24", fontcolor="#fbbf24"];
+  "Shim_3_0" -> "Hub_Tile" [label="cache (d=2)", color="#f43f5e", fontcolor="#f43f5e"];
+  "Hub_Tile" -> "Shim_3_0" [label="kv_new (d=1)", color="#f43f5e", fontcolor="#f43f5e"];
+  "GEMV_0" -> "Shim_3_0" [label="hidden_out (d=1)", color="#38bdf8", fontcolor="#38bdf8"];
+}

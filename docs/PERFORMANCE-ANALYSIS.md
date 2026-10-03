@@ -102,6 +102,8 @@ at 8 streams the 212 MB of BF16 weights per token would take about 7 ms.
 
 ### Engine design
 
+![SmolLM2 135M Single-Dispatch Decoder Engine Dataflow](images/smollm_engine_dataflow.svg)
+
 `designs/engine.py` runs all 30 decoder layers and the final RMSNorm in one
 dispatch. Six GEMV tiles each read their own weight stream and own a fixed
 slice of the output rows of *every* projection (160 qkv, 96 o_proj, 256
@@ -172,6 +174,8 @@ completions and a 100-switch model-switch stress test through the API ran
 without NPU errors.
 
 ## Qwen2.5 0.5B Decoder Engine
+
+![Qwen2.5 0.5B Single-Dispatch Decoder Engine Dataflow](images/qwen_engine_dataflow.svg)
 
 `designs/qwen_engine.py` applies the same dataflow to Qwen2.5 0.5B (hidden
 896, MLP 4864, 14 query heads over 2 KV heads, qkv bias). Its dimensions do

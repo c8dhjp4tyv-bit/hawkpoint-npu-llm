@@ -1,4 +1,23 @@
 services:
+  npu-api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: hawkpoint-npu-api
+    restart: unless-stopped
+    network_mode: host
+    devices:
+      - /dev/accel/accel0:/dev/accel/accel0
+      - /dev/dri:/dev/dri
+    environment:
+      - HAWKPOINT_API_KEY=${HAWKPOINT_API_KEY:-development-secret}
+      - HAWKPOINT_MODELS_DIR=/app/models
+    volumes:
+      - ./npu_llm/models:/app/models
+    profiles:
+      - full
+      - api
+
   open-webui:
     image: ghcr.io/open-webui/open-webui:v0.11.0@sha256:72c0ba641ba75e7aa52655cb242570906ececd09b1140fb736483038a22b3228
     container_name: hawkpoint-npu-open-webui
@@ -8,7 +27,7 @@ services:
       HOST: "127.0.0.1"
       PORT: "3000"
       OPENAI_API_BASE_URLS: "http://127.0.0.1:8000/v1"
-      OPENAI_API_KEYS: "${HAWKPOINT_API_KEY:?HAWKPOINT_API_KEY must be set}"
+      OPENAI_API_KEYS: "${HAWKPOINT_API_KEY:-development-secret}"
     volumes:
       - open-webui-data:/app/backend/data
 

@@ -42,6 +42,10 @@ jobs:
         run: |
           python tests/test_api_server.py
           python tests/test_release_gates.py
+      - name: Test AIE2 dataflow visualizer and offline benchmark harness
+        run: |
+          python npu_llm/tests/test_visualizer.py
+          python tests/offline_benchmark_harness.py
 
   ollama-patch:
     runs-on: ubuntu-latest
