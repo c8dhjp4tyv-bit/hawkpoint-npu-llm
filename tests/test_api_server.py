@@ -1083,6 +1083,14 @@ def test_metrics_and_health_probes():
     decoder = FakeDecoder()
     server, thread, base = start_server({"smollm2-135m-xdna1": decoder})
     try:
+        # Root informational endpoint
+        status, body, _ = fetch(f"{base}/")
+        assert status == 200
+        root_data = json.loads(body)
+        assert root_data["service"] == "hawkpoint-npu-api"
+        assert "/metrics" in root_data["endpoints"]
+        assert "/v1/chat/completions" in root_data["endpoints"]
+
         # Liveness probe alias
         status, body, _ = fetch(f"{base}/health/live")
         assert status == 200

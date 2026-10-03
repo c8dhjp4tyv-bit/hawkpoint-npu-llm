@@ -861,6 +861,26 @@ def make_handler(engine, config=None, metrics=None):
             """Serve liveness, readiness, OpenMetrics, and authenticated model metadata routes."""
             path = urlsplit(self.path).path.rstrip("/")
             self._current_endpoint = path
+            if path in ("", "/"):
+                metrics.record_request("/", 200)
+                self._json(
+                    {
+                        "service": "hawkpoint-npu-api",
+                        "version": "1.0",
+                        "status": "ready" if (engine.ready and not inference_tracker.draining) else "not_ready",
+                        "endpoints": [
+                            "/health",
+                            "/health/live",
+                            "/ready",
+                            "/health/ready",
+                            "/metrics",
+                            "/v1/models",
+                            "/v1/chat/completions",
+                            "/v1/completions",
+                        ],
+                    }
+                )
+                return
             if path in ("/health", "/health/live"):
                 metrics.record_request("/health", 200)
                 self._json(

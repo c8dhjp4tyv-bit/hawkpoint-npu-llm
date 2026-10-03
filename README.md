@@ -285,13 +285,26 @@ every installed checkpoint returned by `/v1/models`. Its data is kept in a
 Docker volume, and the launcher gives it the same randomly generated API key
 as the native server.
 
-Run the terminal chatbot:
+Run the interactive chatbot (supports both direct NPU execution and connecting to a running API server):
 
 ```bash
+# Direct NPU execution (or via launcher choice 3)
+python launcher.py chat
+
+# Or run npu_llm/chat.py directly:
 python npu_llm/chat.py
+
+# Connect to a running API server (e.g. localhost:8000 or remote host):
+python npu_llm/chat.py --api-url http://localhost:8000 --api-key $HAWKPOINT_API_KEY
 ```
 
-Example one-shot invocation:
+Interactive commands inside the chat session:
+- `/reset`: Clear conversation context and start fresh.
+- `/stats`: Display latency, tokens generated, decode throughput (tok/s), and TTFT.
+- `/models`: List models installed on the connected API server.
+- `/exit`: Terminate session.
+
+Example one-shot prompt invocation:
 
 ```bash
 python npu_llm/chat.py \
@@ -398,7 +411,19 @@ Exposed metrics include:
 - `hawkpoint_worker_restarts_total`: Count of NPU worker process restarts.
 
 For Kubernetes deployments, configure container probes against `/health/live` (liveness)
-and `/health/ready` (readiness).
+and `/health/ready` (readiness). A root informational endpoint `GET /` reports overall service readiness and available endpoint paths.
+
+### Automated API Benchmarking
+
+The project includes `scripts/benchmark_api.py` for measuring API server latency percentiles, Time To First Token (TTFT), and decode tokens/second:
+
+```bash
+# Benchmark local API server with 10 streaming requests:
+python scripts/benchmark_api.py --url http://127.0.0.1:8000 --requests 10 --concurrency 1
+
+# Generate a GitHub Markdown report and enforce a minimum throughput SLA:
+python scripts/benchmark_api.py --format markdown --output benchmark.md --min-tps 40.0
+```
 
 ### Sampling
 

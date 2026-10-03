@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+- Add interactive and remote OpenAI HTTP API streaming client mode to `npu_llm/chat.py`
+  with automatic local API server discovery, live token streaming, latency and TTFT
+  telemetry, and interactive session commands (`/reset`, `/stats`, `/models`, `/exit`).
+- Add `chat` mode selection to `launcher.py` for direct interactive terminal chat sessions.
+- Add root informational endpoint `GET /` to `api_server.py` reporting service readiness
+  and discoverable endpoint route paths.
+- Add automated API benchmark tool (`scripts/benchmark_api.py`) measuring latency percentiles
+  (min, p50, p95, p99), streaming Time To First Token (TTFT), decode tokens/second,
+  Prometheus metrics deltas, and exporting text, JSON, and GitHub Markdown reports with SLA checks.
+- Add comprehensive Prometheus scrape configuration, alert rules, Kubernetes probe YAML
+  manifests, and API benchmarking guides to `docs/OPERATIONS.md`.
 - Add Prometheus / OpenMetrics monitoring endpoint (`GET /metrics`) tracking
   total requests, active concurrent requests, generated and prompt token counters,
   inference duration summaries, and worker restarts.

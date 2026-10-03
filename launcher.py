@@ -85,7 +85,7 @@ def run_openwebui(api_key, models_dir=None, npu_layers=None, npu_percent=None):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("mode", nargs="?", choices=["api", "openwebui"])
+    parser.add_argument("mode", nargs="?", choices=["api", "openwebui", "chat"])
     parser.add_argument(
         "--models-dir",
         type=Path,
@@ -105,8 +105,14 @@ def main():
     if mode is None:
         print("1) OpenAI-compatible API server (localhost:8000)")
         print("2) API server + Open WebUI (localhost:3000)")
-        choice = input("Choose [1/2]: ").strip()
-        mode = "openwebui" if choice == "2" else "api"
+        print("3) Interactive terminal chat")
+        choice = input("Choose [1/2/3]: ").strip()
+        if choice == "3":
+            mode = "chat"
+        elif choice == "2":
+            mode = "openwebui"
+        else:
+            mode = "api"
 
     if mode == "api":
         print(f"API bearer token: {api_key}")
@@ -120,6 +126,20 @@ def main():
             cwd=ROOT,
             env={**os.environ, "HAWKPOINT_API_KEY": api_key},
             check=True,
+        )
+    elif mode == "chat":
+        chat_script = ROOT / "npu_llm/chat.py"
+        cmd = [sys.executable, str(chat_script)]
+        if args.models_dir:
+            cmd.extend(["--model", str(args.models_dir)])
+        if args.npu_layers is not None:
+            cmd.extend(["--npu-layers", str(args.npu_layers)])
+        if args.npu_percent is not None:
+            cmd.extend(["--npu-percent", str(args.npu_percent)])
+        subprocess.run(
+            cmd,
+            cwd=ROOT,
+            env={**os.environ, "HAWKPOINT_API_KEY": api_key},
         )
     else:
         run_openwebui(
