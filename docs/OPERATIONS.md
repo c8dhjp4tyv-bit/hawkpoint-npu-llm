@@ -65,15 +65,98 @@ One physical NPU context serializes inference. Tune these controls together:
 Load-test with the intended model, prompt distribution, proxy, and client
 timeouts. Do not infer capacity from the component smoke benchmark.
 
-## Monitoring
+## Monitoring and Observability
 
-- Alert when `/ready` remains `503`, `worker_restarts` rises repeatedly, or
-  completion latency approaches the request timeout.
-- Correlate client errors with access logs using `X-Request-ID`.
-- Treat an SSE response without `[DONE]` as incomplete. Inspect sanitized SSE
-  error events even when HTTP status is already `200`.
-- Track host RAM, NPU driver errors, request `429`/`5xx` rates, and disk space
-  for converted models outside the process.
+The API server exposes standard OpenMetrics at `GET /metrics` and health endpoints compatible with Kubernetes liveness and readiness probes (`/health/live`, `/health/ready`).
+
+### Prometheus Scrape Configuration
+
+Add the scrape target to your `prometheus.yml`:
+
+```yaml
+scrape_configs:
+  - job_name: 'hawkpoint-npu'
+    scrape_interval: 10s
+    metrics_path: /metrics
+    authorization:
+      type: Bearer
+      credentials_file: /etc/prometheus/secrets/hawkpoint_api_key
+    static_configs:
+      - targets: ['127.0.0.1:8000']
+```
+
+Place the same `HAWKPOINT_API_KEY` used by the server in the credentials file.
+Keep it readable only by the Prometheus service account, mount it read-only in
+containers, and do not commit it. For remote targets, configure HTTPS at the
+server or reverse proxy and scrape that HTTPS endpoint.
+
+### Metrics Catalog
+
+| Metric | Type | Description |
+|:-------|:-----|:------------|
+| `hawkpoint_api_requests_total` | Counter | Total HTTP requests categorized by `endpoint` and `status` |
+| `hawkpoint_api_active_requests` | Gauge | Current number of concurrently running or queued requests |
+| `hawkpoint_worker_restarts_total` | Counter | Total worker process restarts triggered by timeouts or faults |
+| `hawkpoint_tokens_generated_total` | Counter | Cumulative completion tokens generated per `model` |
+| `hawkpoint_prompt_tokens_total` | Counter | Cumulative prompt tokens processed per `model` |
+| `hawkpoint_inference_duration_seconds` | Summary | Inference wall time duration summary (`_count` and `_sum`) |
+
+### Recommended Prometheus Alerting Rules
+
+```yaml
+groups:
+  - name: hawkpoint-npu.rules
+    rules:
+      - alert: NpuWorkerCrashLooping
+        expr: increase(hawkpoint_worker_restarts_total[5m]) > 2
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "HawkPoint NPU worker is crash-looping or timing out"
+          description: "NPU inference worker restarted {{ $value }} times in 5 minutes."
+
+      - alert: NpuHighRequestQueue
+        expr: hawkpoint_api_active_requests >= 3
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "HawkPoint NPU request queue saturation"
+          description: "Active requests ({{ $value }}) exceed optimal pipeline capacity."
+```
+
+### Kubernetes Probe Specs
+
+When running inside Kubernetes or K3s containers with access to `/dev/accel/accel*`:
+
+```yaml
+livenessProbe:
+  httpGet:
+    path: /health/live
+    port: 8000
+  initialDelaySeconds: 5
+  periodSeconds: 10
+
+readinessProbe:
+  httpGet:
+    path: /health/ready
+    port: 8000
+  initialDelaySeconds: 10
+  periodSeconds: 5
+```
+
+## API Benchmarking and Capacity Testing
+
+Use the dedicated benchmark tool to measure latency percentiles (min, p50, p95, p99), Time To First Token (TTFT), and decode tokens/second against an active API server:
+
+```bash
+# Measure streaming throughput with 10 requests:
+python scripts/benchmark_api.py --url http://127.0.0.1:8000 -n 10 -c 1
+
+# Export a Markdown report with SLA enforcement:
+python scripts/benchmark_api.py --format markdown -o benchmark-report.md --min-tps 45.0
+```
 
 ## Shutdown and recovery
 
@@ -107,3 +190,17 @@ A public release should not be described as validated unless all are true:
 5. A rollback candidate and the previous known-good artifacts remain available.
 
 See `SECURITY.md` for disclosure and network-boundary requirements.
+
+### Container device permissions
+
+Before starting the API Compose profile, set the numeric supplementary groups
+from the actual host device nodes (adjust the render node for your host):
+
+```bash
+export HAWKPOINT_ACCEL_GID=$(stat -c '%g' /dev/accel/accel0)
+export HAWKPOINT_DRI_GID=$(stat -c '%g' /dev/dri/renderD128)
+docker compose --profile full up -d
+```
+
+The container keeps its unprivileged `app` user. Host device GIDs must match
+`group_add`; image-local `render` and `video` names need not match the host.

@@ -77,8 +77,9 @@ def _validate_completion_options(request):
     requested = request.get(token_field, 16)
     if type(requested) is not int or requested <= 0:
         raise ValueError(f"{token_field} must be a positive integer")
-    if type(request.get("n", 1)) is not int or request.get("n", 1) != 1:
-        raise ValueError("only integer n=1 is supported")
+    n = request.get("n", 1)
+    if type(n) is not int or n < 1 or n > 8:
+        raise ValueError("n must be an integer between 1 and 8")
     stream = request.get("stream", False)
     if type(stream) is not bool:
         raise ValueError("stream must be a boolean")
@@ -92,7 +93,31 @@ def _validate_completion_options(request):
             raise ValueError("unsupported stream_options field")
         if type(options.get("include_usage", False)) is not bool:
             raise ValueError("stream_options.include_usage must be a boolean")
-    return requested, bool(options and options.get("include_usage"))
+    return requested, n, bool(options and options.get("include_usage"))
+
+
+def _validate_prompt(value):
+    """Validate prompt for text completions (string or non-empty list of strings)."""
+    if value is None:
+        raise ValueError("prompt is required")
+    if isinstance(value, str):
+        if not value:
+            raise ValueError("prompt cannot be empty")
+        if len(value) > 32_768:
+            raise ValueError("prompt exceeds 32768 characters")
+        return value
+    if isinstance(value, list) and value:
+        if len(value) > 1:
+            raise ValueError("only a single prompt per request is supported")
+        for item in value:
+            if not isinstance(item, str):
+                raise ValueError("each prompt in array must be a string")
+            if not item:
+                raise ValueError("prompt in array cannot be empty")
+            if len(item) > 32_768:
+                raise ValueError("prompt item exceeds 32768 characters")
+        return value[0]
+    raise ValueError("prompt must be a non-empty string or array of strings")
 
 
 def _validate_output_options(request):
@@ -145,6 +170,168 @@ def _generation_options(sampling=None, stop=None, logprobs=None):
     if logprobs is not None:
         options["logprobs"] = logprobs
     return options
+
+
+OPENAPI_SPEC = {
+    "openapi": "3.1.0",
+    "info": {
+        "title": "HawkPoint NPU LLM API",
+        "description": "OpenAI-compatible LLM serving API accelerated by AMD Ryzen AI (HawkPoint) XDNA1 NPU.",
+        "version": "1.0.0",
+    },
+    "paths": {
+        "/": {
+            "get": {
+                "summary": "Root Service Information",
+                "responses": {"200": {"description": "Service status and endpoint index"}},
+            }
+        },
+        "/openapi.json": {
+            "get": {
+                "summary": "OpenAPI 3.1.0 Specification",
+                "responses": {"200": {"description": "OpenAPI JSON schema"}},
+            }
+        },
+        "/health": {
+            "get": {
+                "summary": "Liveness Probe",
+                "responses": {"200": {"description": "Service is alive"}},
+            }
+        },
+        "/health/live": {
+            "get": {
+                "summary": "Kubernetes Liveness Probe",
+                "responses": {"200": {"description": "Service is alive"}},
+            }
+        },
+        "/ready": {
+            "get": {
+                "summary": "Readiness Probe",
+                "responses": {
+                    "200": {"description": "Inference worker is ready"},
+                    "503": {"description": "Inference worker is starting or draining"},
+                },
+            }
+        },
+        "/health/ready": {
+            "get": {
+                "summary": "Kubernetes Readiness Probe",
+                "responses": {
+                    "200": {"description": "Inference worker is ready"},
+                    "503": {"description": "Inference worker is starting or draining"},
+                },
+            }
+        },
+        "/metrics": {
+            "get": {
+                "summary": "OpenMetrics / Prometheus Telemetry",
+                "security": [{"bearerAuth": []}],
+                "responses": {"200": {"description": "Prometheus metric exposition text"}},
+            }
+        },
+        "/v1/models": {
+            "get": {
+                "summary": "List Models",
+                "security": [{"bearerAuth": []}],
+                "responses": {"200": {"description": "List of installed models"}},
+            }
+        },
+        "/v1/models/{model_id}": {
+            "get": {
+                "summary": "Retrieve Model",
+                "parameters": [
+                    {"name": "model_id", "in": "path", "required": True, "schema": {"type": "string"}}
+                ],
+                "security": [{"bearerAuth": []}],
+                "responses": {
+                    "200": {"description": "Model metadata"},
+                    "404": {"description": "Model not found"},
+                },
+            }
+        },
+        "/v1/chat/completions": {
+            "post": {
+                "summary": "Create Chat Completion",
+                "security": [{"bearerAuth": []}],
+                "requestBody": {
+                    "required": True,
+                    "content": {
+                        "application/json": {
+                            "schema": {
+                                "type": "object",
+                                "properties": {
+                                    "model": {"type": "string"},
+                                    "messages": {"type": "array", "items": {"type": "object"}},
+                                    "stream": {"type": "boolean", "default": False},
+                                    "max_tokens": {"type": "integer"},
+                                    "temperature": {"type": "number"},
+                                    "top_p": {"type": "number"},
+                                    "repetition_penalty": {"type": "number"},
+                                    "seed": {"type": "integer"},
+                                    "n": {"type": "integer", "default": 1},
+                                    "stream_options": {"type": "object"},
+                                },
+                                "required": ["messages"],
+                            }
+                        }
+                    },
+                },
+                "responses": {
+                    "200": {"description": "Successful completion"},
+                    "400": {"description": "Invalid parameter request"},
+                    "429": {"description": "Rate limited or concurrency saturated"},
+                    "503": {"description": "Server unavailable / draining"},
+                },
+            }
+        },
+        "/v1/completions": {
+            "post": {
+                "summary": "Create Text Completion",
+                "security": [{"bearerAuth": []}],
+                "requestBody": {
+                    "required": True,
+                    "content": {
+                        "application/json": {
+                            "schema": {
+                                "type": "object",
+                                "properties": {
+                                    "model": {"type": "string"},
+                                    "prompt": {"oneOf": [{"type": "string"}, {"type": "array", "items": {"type": "string"}, "minItems": 1, "maxItems": 1}]},
+                                    "stream": {"type": "boolean", "default": False},
+                                    "max_tokens": {"type": "integer"},
+                                    "temperature": {"type": "number"},
+                                    "top_p": {"type": "number"},
+                                    "repetition_penalty": {"type": "number"},
+                                    "seed": {"type": "integer"},
+                                    "n": {"type": "integer", "default": 1},
+                                    "echo": {"type": "boolean", "default": False},
+                                    "best_of": {"type": "integer"},
+                                    "stream_options": {"type": "object"},
+                                },
+                                "required": ["prompt"],
+                            }
+                        }
+                    },
+                },
+                "responses": {
+                    "200": {"description": "Successful text completion"},
+                    "400": {"description": "Invalid parameter request"},
+                    "429": {"description": "Rate limited or concurrency saturated"},
+                    "503": {"description": "Server unavailable / draining"},
+                },
+            }
+        },
+    },
+    "components": {
+        "securitySchemes": {
+            "bearerAuth": {
+                "type": "http",
+                "scheme": "bearer",
+                "bearerFormat": "API Key",
+            }
+        }
+    },
+}
 
 
 @dataclass(frozen=True)
@@ -248,6 +435,78 @@ class RateLimiter:
                 return False
             history.append(now)
             return True
+
+
+class ServerMetrics:
+    """Thread-safe Prometheus / OpenMetrics collector for the API server."""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self.requests_total = defaultdict(int)
+        self.tokens_generated_total = defaultdict(int)
+        self.prompt_tokens_total = defaultdict(int)
+        self.inference_duration_seconds = defaultdict(lambda: [0.0, 0])
+
+    def record_request(self, endpoint, status):
+        """Record an incoming HTTP request endpoint and response status."""
+        with self._lock:
+            self.requests_total[(str(endpoint), int(status))] += 1
+
+    def record_inference(
+        self,
+        model,
+        prompt_tokens=0,
+        generated_tokens=0,
+        duration_seconds=0.0,
+    ):
+        """Record token counts and execution duration for an inference run."""
+        with self._lock:
+            self.tokens_generated_total[str(model)] += int(generated_tokens)
+            self.prompt_tokens_total[str(model)] += int(prompt_tokens)
+            entry = self.inference_duration_seconds[str(model)]
+            entry[0] += float(duration_seconds)
+            entry[1] += 1
+
+    def export_openmetrics(self, active_requests=0, worker_restarts=0):
+        """Format metrics in standard OpenMetrics / Prometheus text exposition format."""
+        with self._lock:
+            lines = [
+                "# HELP hawkpoint_api_requests_total Total HTTP requests handled by the API server.",
+                "# TYPE hawkpoint_api_requests_total counter",
+            ]
+            for (endpoint, status), count in sorted(self.requests_total.items()):
+                lines.append(f'hawkpoint_api_requests_total{{endpoint="{endpoint}",status="{status}"}} {count}')
+
+            lines.extend([
+                "# HELP hawkpoint_api_active_requests Number of requests currently being processed.",
+                "# TYPE hawkpoint_api_active_requests gauge",
+                f"hawkpoint_api_active_requests {active_requests}",
+                "# HELP hawkpoint_worker_restarts_total Number of times the background inference worker restarted.",
+                "# TYPE hawkpoint_worker_restarts_total counter",
+                f"hawkpoint_worker_restarts_total {worker_restarts}",
+                "# HELP hawkpoint_prompt_tokens_total Total prompt tokens processed.",
+                "# TYPE hawkpoint_prompt_tokens_total counter",
+            ])
+            for model, count in sorted(self.prompt_tokens_total.items()):
+                lines.append(f'hawkpoint_prompt_tokens_total{{model="{model}"}} {count}')
+
+            lines.extend([
+                "# HELP hawkpoint_tokens_generated_total Total tokens generated by the inference engine.",
+                "# TYPE hawkpoint_tokens_generated_total counter",
+            ])
+            for model, count in sorted(self.tokens_generated_total.items()):
+                lines.append(f'hawkpoint_tokens_generated_total{{model="{model}"}} {count}')
+
+            lines.extend([
+                "# HELP hawkpoint_inference_duration_seconds Total time spent in inference.",
+                "# TYPE hawkpoint_inference_duration_seconds summary",
+            ])
+            for model, (duration_sum, count) in sorted(self.inference_duration_seconds.items()):
+                lines.append(f'hawkpoint_inference_duration_seconds_count{{model="{model}"}} {count}')
+                lines.append(f'hawkpoint_inference_duration_seconds_sum{{model="{model}"}} {duration_sum:.4f}')
+
+            lines.append("# EOF\n")
+            return "\n".join(lines)
 
 
 class CompletionEngine:
@@ -374,11 +633,26 @@ class CompletionEngine:
         """Serialize model inference and yield text chunks with final statistics."""
         with self.lock:
             decoder = self._load(model_id)
-            yield from decoder.generate_messages(
-                messages,
-                max_tokens,
-                **_generation_options(sampling, stop, logprobs),
-            )
+            options = _generation_options(sampling, stop, logprobs)
+            if isinstance(messages, str):
+                if hasattr(decoder, "generate_text"):
+                    yield from decoder.generate_text(
+                        messages, max_tokens, **options
+                    )
+                elif hasattr(decoder, "generate"):
+                    yield from decoder.generate(messages, max_tokens, **options)
+                else:
+                    yield from decoder.generate_messages(
+                        [{"role": "user", "content": messages}],
+                        max_tokens,
+                        **options,
+                    )
+            else:
+                yield from decoder.generate_messages(
+                    messages,
+                    max_tokens,
+                    **options,
+                )
 
 
 class InferenceTimeout(TimeoutError):
@@ -632,9 +906,10 @@ class NPUDecoderFactory:
         return NPUDecoder(path, npu_layers=selected)
 
 
-def make_handler(engine, config=None):
-    """Build handlers sharing authentication, admission, and drain state."""
+def make_handler(engine, config=None, metrics=None):
+    """Build handlers sharing authentication, admission, metrics, and drain state."""
     config = config or ServerConfig(api_key="test-only")
+    metrics = metrics or ServerMetrics()
     slots = threading.BoundedSemaphore(config.queue_capacity + 1)
     limiter = RateLimiter(config.rate_limit_per_minute)
     inference_tracker = InferenceTracker()
@@ -643,11 +918,13 @@ def make_handler(engine, config=None):
         server_version = "HawkPointNPU/1.0"
         tracker = inference_tracker
         server_config = config
+        server_metrics = metrics
 
         def setup(self):
             """Initialize request identity and apply the socket idle timeout."""
             super().setup()
             self.request_id = f"req-{uuid.uuid4().hex}"
+            self._current_endpoint = "/unknown"
             # Bound header/body reads too, before inference admission.
             self.connection.settimeout(config.request_timeout)
 
@@ -712,6 +989,8 @@ def make_handler(engine, config=None):
             extra_headers=None,
         ):
             """Return a structured API error with a chosen HTTP status."""
+            endpoint = getattr(self, "_current_endpoint", "/unknown")
+            metrics.record_request(endpoint, status)
             self._json(
                 {
                     "error": {
@@ -737,9 +1016,39 @@ def make_handler(engine, config=None):
             self._headers(204)
 
         def do_GET(self):
-            """Serve liveness, readiness, and authenticated model metadata routes."""
+            """Serve liveness, readiness, OpenMetrics, and authenticated model metadata routes."""
             path = urlsplit(self.path).path.rstrip("/")
-            if path == "/health":
+            self._current_endpoint = "/unknown"
+            if path in ("", "/"):
+                self._current_endpoint = "/"
+                metrics.record_request("/", 200)
+                self._json(
+                    {
+                        "service": "hawkpoint-npu-api",
+                        "version": "1.0",
+                        "status": "ready" if (engine.ready and not inference_tracker.draining) else "not_ready",
+                        "endpoints": [
+                            "/openapi.json",
+                            "/health",
+                            "/health/live",
+                            "/ready",
+                            "/health/ready",
+                            "/metrics",
+                            "/v1/models",
+                            "/v1/chat/completions",
+                            "/v1/completions",
+                        ],
+                    }
+                )
+                return
+            if path in ("/openapi.json", "/v1/openapi.json"):
+                self._current_endpoint = "/openapi.json"
+                metrics.record_request("/openapi.json", 200)
+                self._json(OPENAPI_SPEC)
+                return
+            if path in ("/health", "/health/live"):
+                self._current_endpoint = "/health"
+                metrics.record_request("/health", 200)
                 self._json(
                     {
                         "status": "ok",
@@ -747,8 +1056,11 @@ def make_handler(engine, config=None):
                     }
                 )
                 return
-            if path == "/ready":
+            if path in ("/ready", "/health/ready"):
+                self._current_endpoint = "/ready"
                 ready = engine.ready and not inference_tracker.draining
+                status = 200 if ready else 503
+                metrics.record_request("/ready", status)
                 self._json(
                     {
                         "status": "ready" if ready else "not_ready",
@@ -758,12 +1070,31 @@ def make_handler(engine, config=None):
                         "device": "npu1",
                         "worker_restarts": getattr(engine, "worker_restarts", 0),
                     },
-                    200 if ready else 503,
+                    status,
                 )
                 return
-            if path == "/v1/models":
+            if path == "/metrics":
+                self._current_endpoint = "/metrics"
                 if not self._authorized():
                     return
+                output = metrics.export_openmetrics(
+                    active_requests=inference_tracker.active,
+                    worker_restarts=getattr(engine, "worker_restarts", 0),
+                )
+                body = output.encode("utf-8")
+                metrics.record_request("/metrics", 200)
+                self.send_response(200)
+                self.send_header("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
+                self.send_header("Content-Length", str(len(body)))
+                self._common_headers()
+                self.end_headers()
+                self.wfile.write(body)
+                return
+            if path == "/v1/models":
+                self._current_endpoint = "/v1/models"
+                if not self._authorized():
+                    return
+                metrics.record_request("/v1/models", 200)
                 self._json(
                     {
                         "object": "list",
@@ -772,6 +1103,7 @@ def make_handler(engine, config=None):
                 )
                 return
             if path.startswith("/v1/models/"):
+                self._current_endpoint = "/v1/models/*"
                 if not self._authorized():
                     return
                 model_id = path.removeprefix("/v1/models/")
@@ -783,15 +1115,20 @@ def make_handler(engine, config=None):
                         "model_not_found",
                     )
                     return
+                metrics.record_request("/v1/models/*", 200)
                 self._json(model)
                 return
+            self._current_endpoint = "/unknown"
             self._error("not found", 404)
 
         def do_POST(self):
-            """Validate and admit a chat request before driving completion generation."""
-            if urlsplit(self.path).path.rstrip("/") != "/v1/chat/completions":
+            """Validate and admit a completion request before driving generation."""
+            endpoint = urlsplit(self.path).path.rstrip("/")
+            if endpoint not in ("/v1/chat/completions", "/v1/completions"):
+                self._current_endpoint = "/unknown"
                 self._error("not found", 404)
                 return
+            self._current_endpoint = endpoint
             if not self._authorized():
                 return
             if inference_tracker.draining:
@@ -825,9 +1162,26 @@ def make_handler(engine, config=None):
                 request = json.loads(self.rfile.read(length))
                 if not isinstance(request, dict):
                     raise ValueError("request body must be a JSON object")
-                requested, include_usage = _validate_completion_options(request)
+                requested, n, include_usage = _validate_completion_options(request)
                 stop, logprobs = _validate_output_options(request)
-                messages = _validate_messages(request.get("messages"))
+                is_text = endpoint == "/v1/completions"
+                echo = False
+                if is_text:
+                    prompt = _validate_prompt(request.get("prompt"))
+                    input_payload = prompt
+                    echo = request.get("echo", False)
+                    if not isinstance(echo, bool):
+                        raise ValueError("echo must be a boolean")
+                    suffix = request.get("suffix")
+                    if suffix is not None:
+                        raise ValueError("suffix is not supported")
+                    best_of = request.get("best_of")
+                    if best_of is not None:
+                        if not isinstance(best_of, int) or best_of != n:
+                            raise ValueError("best_of is not supported when different from n")
+                else:
+                    messages = _validate_messages(request.get("messages"))
+                    input_payload = messages
                 model_id = request.get("model") or engine.default_model_id
                 if not engine.has_model(model_id):
                     self._error(
@@ -873,19 +1227,48 @@ def make_handler(engine, config=None):
             self._deadline = time.monotonic() + config.request_timeout
             output = {"stop": stop, "logprobs": logprobs}
             try:
-                if request.get("stream", False):
-                    self._stream(
-                        model_id,
-                        messages,
-                        max_tokens,
-                        sampling,
-                        include_usage,
-                        **output,
-                    )
+                if is_text:
+                    if request.get("stream", False):
+                        self._stream_text(
+                            model_id,
+                            input_payload,
+                            max_tokens,
+                            n=n,
+                            sampling=sampling,
+                            include_usage=include_usage,
+                            echo=echo,
+                            **output,
+                        )
+                    else:
+                        self._complete_text(
+                            model_id,
+                            input_payload,
+                            max_tokens,
+                            n=n,
+                            sampling=sampling,
+                            echo=echo,
+                            **output,
+                        )
                 else:
-                    self._complete(
-                        model_id, messages, max_tokens, sampling, **output
-                    )
+                    if request.get("stream", False):
+                        self._stream(
+                            model_id,
+                            input_payload,
+                            max_tokens,
+                            n=n,
+                            sampling=sampling,
+                            include_usage=include_usage,
+                            **output,
+                        )
+                    else:
+                        self._complete(
+                            model_id,
+                            input_payload,
+                            max_tokens,
+                            n=n,
+                            sampling=sampling,
+                            **output,
+                        )
             finally:
                 inference_tracker.leave()
                 slots.release()
@@ -905,58 +1288,77 @@ def make_handler(engine, config=None):
             model_id,
             messages,
             max_tokens,
+            n=1,
             sampling=None,
             stop=(),
             logprobs=None,
         ):
-            """Collect one completion and return token usage or a sanitized error."""
-            pieces = []
-            entries = []
-            stats = None
-            try:
-                with closing(self._generation(
-                    model_id, messages, max_tokens, sampling, stop, logprobs
-                )) as generation:
-                    for text, final_stats, *extra in generation:
-                        if time.monotonic() > self._deadline:
-                            raise TimeoutError
-                        pieces.append(text)
-                        if extra:
-                            entries.extend(extra[0])
-                        if final_stats is not None:
-                            stats = final_stats
-            except (TimeoutError, socket.timeout):
-                self._error("inference request timed out", 504, "timeout_error")
-                return
-            except Exception:
-                logging.exception("inference request failed")
-                self._error("internal inference error", 500, "server_error")
-                return
-            stats = stats or {}
-            finish_reason = stats.get("finish_reason", "stop")
+            """Collect one or more chat completions and return token usage or a sanitized error."""
+            start_time = time.monotonic()
+            choices = []
+            total_stats = {"prompt_tokens": 0, "generated_tokens": 0}
+            last_stats = {}
+            for i in range(n):
+                pieces = []
+                entries = []
+                stats = None
+                try:
+                    with closing(self._generation(
+                        model_id, messages, max_tokens, sampling, stop, logprobs
+                    )) as generation:
+                        for text, final_stats, *extra in generation:
+                            if time.monotonic() > self._deadline:
+                                raise TimeoutError
+                            pieces.append(text)
+                            if extra:
+                                entries.extend(extra[0])
+                            if final_stats is not None:
+                                stats = final_stats
+                except (TimeoutError, socket.timeout):
+                    self._error("inference request timed out", 504, "timeout_error")
+                    return
+                except Exception:
+                    logging.exception("inference request failed")
+                    self._error("internal inference error", 500, "server_error")
+                    return
+                stats = stats or {}
+                last_stats = stats
+                total_stats["prompt_tokens"] += stats.get("prompt_tokens", 0)
+                total_stats["generated_tokens"] += stats.get("generated_tokens", 0)
+                if "cached_prompt_tokens" in stats:
+                    total_stats["cached_prompt_tokens"] = total_stats.get("cached_prompt_tokens", 0) + stats["cached_prompt_tokens"]
+                finish_reason = stats.get("finish_reason", "stop")
+                choices.append(
+                    {
+                        "index": i,
+                        "message": {
+                            "role": "assistant",
+                            "content": "".join(pieces),
+                        },
+                        "logprobs": (
+                            None
+                            if logprobs is None
+                            else {"content": entries}
+                        ),
+                        "finish_reason": finish_reason,
+                    }
+                )
+            metrics.record_inference(
+                model_id,
+                prompt_tokens=total_stats["prompt_tokens"],
+                generated_tokens=total_stats["generated_tokens"],
+                duration_seconds=time.monotonic() - start_time,
+            )
+            metrics.record_request("/v1/chat/completions", 200)
             self._json(
                 {
                     "id": _completion_id(),
                     "object": "chat.completion",
                     "created": int(time.time()),
                     "model": model_id,
-                    "choices": [
-                        {
-                            "index": 0,
-                            "message": {
-                                "role": "assistant",
-                                "content": "".join(pieces),
-                            },
-                            "logprobs": (
-                                None
-                                if logprobs is None
-                                else {"content": entries}
-                            ),
-                            "finish_reason": finish_reason,
-                        }
-                    ],
-                    "usage": _usage(stats),
-                    "x_hawkpoint_stats": stats,
+                    "choices": choices,
+                    "usage": _usage(total_stats),
+                    "x_hawkpoint_stats": last_stats,
                 }
             )
 
@@ -965,12 +1367,14 @@ def make_handler(engine, config=None):
             model_id,
             messages,
             max_tokens,
+            n=1,
             sampling=None,
             include_usage=False,
             stop=(),
             logprobs=None,
         ):
             """Emit SSE chunks, optional usage, and a success or error terminator."""
+            start_time = time.monotonic()
             completion_id = _completion_id()
             created = int(time.time())
             self._headers(200, "text/event-stream")
@@ -984,87 +1388,336 @@ def make_handler(engine, config=None):
                 self.wfile.flush()
 
             try:
-                send(
-                    {
-                        "id": completion_id,
-                        "object": "chat.completion.chunk",
-                        "created": created,
-                        "model": model_id,
-                        "choices": [
-                            {
-                                "index": 0,
-                                "delta": {"role": "assistant"},
-                                "finish_reason": None,
-                            }
-                        ],
-                    }
-                )
-                stats = None
-                with closing(self._generation(
-                    model_id, messages, max_tokens, sampling, stop, logprobs
-                )) as generation:
-                    for text, final_stats, *extra in generation:
-                        if time.monotonic() > self._deadline:
-                            raise TimeoutError
-                        entries = extra[0] if extra else []
-                        if text or entries:
-                            choice = {
-                                "index": 0,
-                                "delta": {"content": text},
-                                "finish_reason": None,
-                            }
-                            if logprobs is not None:
-                                choice["logprobs"] = {"content": entries}
-                            send(
+                total_stats = {"prompt_tokens": 0, "generated_tokens": 0}
+                for choice_idx in range(n):
+                    send(
+                        {
+                            "id": completion_id,
+                            "object": "chat.completion.chunk",
+                            "created": created,
+                            "model": model_id,
+                            "choices": [
                                 {
-                                    "id": completion_id,
-                                    "object": "chat.completion.chunk",
-                                    "created": created,
-                                    "model": model_id,
-                                    "choices": [choice],
+                                    "index": choice_idx,
+                                    "delta": {"role": "assistant"},
+                                    "finish_reason": None,
                                 }
-                            )
-                        if final_stats is not None:
-                            stats = final_stats
-                send(
-                    {
-                        "id": completion_id,
-                        "object": "chat.completion.chunk",
-                        "created": created,
-                        "model": model_id,
-                        "choices": [
-                            {
-                                "index": 0,
-                                "delta": {},
-                                "finish_reason": (stats or {}).get(
-                                    "finish_reason", "stop"
-                                ),
-                            }
-                        ],
-                        "x_hawkpoint_stats": stats or {},
-                    }
-                )
+                            ],
+                        }
+                    )
+                    stats = None
+                    with closing(self._generation(
+                        model_id, messages, max_tokens, sampling, stop, logprobs
+                    )) as generation:
+                        for text, final_stats, *extra in generation:
+                            if time.monotonic() > self._deadline:
+                                raise TimeoutError
+                            entries = extra[0] if extra else []
+                            if text or entries:
+                                choice = {
+                                    "index": choice_idx,
+                                    "delta": {"content": text},
+                                    "finish_reason": None,
+                                }
+                                if logprobs is not None:
+                                    choice["logprobs"] = {"content": entries}
+                                send(
+                                    {
+                                        "id": completion_id,
+                                        "object": "chat.completion.chunk",
+                                        "created": created,
+                                        "model": model_id,
+                                        "choices": [choice],
+                                    }
+                                )
+                            if final_stats is not None:
+                                stats = final_stats
+                    stats = stats or {}
+                    total_stats["prompt_tokens"] += stats.get("prompt_tokens", 0)
+                    total_stats["generated_tokens"] += stats.get("generated_tokens", 0)
+                    if "cached_prompt_tokens" in stats:
+                        total_stats["cached_prompt_tokens"] = total_stats.get("cached_prompt_tokens", 0) + stats["cached_prompt_tokens"]
+                    send(
+                        {
+                            "id": completion_id,
+                            "object": "chat.completion.chunk",
+                            "created": created,
+                            "model": model_id,
+                            "choices": [
+                                {
+                                    "index": choice_idx,
+                                    "delta": {},
+                                    "finish_reason": (stats or {}).get(
+                                        "finish_reason", "stop"
+                                    ),
+                                }
+                            ],
+                            "x_hawkpoint_stats": stats or {},
+                        }
+                    )
                 if include_usage:
-                    send({
-                        "id": completion_id,
-                        "object": "chat.completion.chunk",
-                        "created": created,
-                        "model": model_id,
-                        "choices": [],
-                        "usage": _usage(stats or {}),
-                    })
+                    send(
+                        {
+                            "id": completion_id,
+                            "object": "chat.completion.chunk",
+                            "created": created,
+                            "model": model_id,
+                            "choices": [],
+                            "usage": _usage(total_stats),
+                        }
+                    )
+                metrics.record_inference(
+                    model_id,
+                    prompt_tokens=total_stats["prompt_tokens"],
+                    generated_tokens=total_stats["generated_tokens"],
+                    duration_seconds=time.monotonic() - start_time,
+                )
+                metrics.record_request("/v1/chat/completions", 200)
                 self.wfile.write(b"data: [DONE]\n\n")
                 self.wfile.flush()
             except (BrokenPipeError, ConnectionResetError):
                 pass
             except Exception as exc:
                 logging.exception("streaming inference request failed")
-                timed_out = isinstance(exc, TimeoutError)
+                timed_out = isinstance(exc, (TimeoutError, socket.timeout))
                 try:
-                    send({"error": {
-                        "message": "inference request timed out" if timed_out else "internal inference error",
-                        "type": "timeout_error" if timed_out else "server_error",
-                    }})
+                    send(
+                        {
+                            "error": {
+                                "message": (
+                                    "inference request timed out"
+                                    if timed_out
+                                    else "internal inference error"
+                                ),
+                                "type": (
+                                    "timeout_error"
+                                    if timed_out
+                                    else "server_error"
+                                ),
+                            }
+                        }
+                    )
+                except (BrokenPipeError, ConnectionResetError, socket.timeout):
+                    pass
+
+        def _complete_text(
+            self,
+            model_id,
+            prompt,
+            max_tokens,
+            n=1,
+            sampling=None,
+            stop=(),
+            logprobs=None,
+            echo=False,
+        ):
+            """Collect one or more text completions and return OpenAI-shaped response."""
+            start_time = time.monotonic()
+            choices = []
+            total_stats = {"prompt_tokens": 0, "generated_tokens": 0}
+            last_stats = {}
+            for i in range(n):
+                pieces = []
+                entries = []
+                stats = None
+                try:
+                    with closing(self._generation(
+                        model_id, prompt, max_tokens, sampling, stop, logprobs
+                    )) as generation:
+                        for text, final_stats, *extra in generation:
+                            if time.monotonic() > self._deadline:
+                                raise TimeoutError
+                            pieces.append(text)
+                            if extra:
+                                entries.extend(extra[0])
+                            if final_stats is not None:
+                                stats = final_stats
+                except (TimeoutError, socket.timeout):
+                    self._error("inference request timed out", 504, "timeout_error")
+                    return
+                except Exception:
+                    logging.exception("inference request failed")
+                    self._error("internal inference error", 500, "server_error")
+                    return
+                stats = stats or {}
+                last_stats = stats
+                total_stats["prompt_tokens"] += stats.get("prompt_tokens", 0)
+                total_stats["generated_tokens"] += stats.get("generated_tokens", 0)
+                if "cached_prompt_tokens" in stats:
+                    total_stats["cached_prompt_tokens"] = total_stats.get("cached_prompt_tokens", 0) + stats["cached_prompt_tokens"]
+                finish_reason = stats.get("finish_reason", "stop")
+                text_logprobs = None
+                if logprobs is not None:
+                    text_logprobs = {
+                        "tokens": [e.get("token", "") for e in entries],
+                        "token_logprobs": [e.get("logprob", 0.0) for e in entries],
+                        "top_logprobs": [e.get("top_logprobs") for e in entries],
+                    }
+                content_text = (prompt + "".join(pieces)) if echo else "".join(pieces)
+                choices.append(
+                    {
+                        "index": i,
+                        "text": content_text,
+                        "logprobs": text_logprobs,
+                        "finish_reason": finish_reason,
+                    }
+                )
+            metrics.record_inference(
+                model_id,
+                prompt_tokens=total_stats["prompt_tokens"],
+                generated_tokens=total_stats["generated_tokens"],
+                duration_seconds=time.monotonic() - start_time,
+            )
+            metrics.record_request("/v1/completions", 200)
+            self._json(
+                {
+                    "id": f"cmpl-{uuid.uuid4().hex}",
+                    "object": "text_completion",
+                    "created": int(time.time()),
+                    "model": model_id,
+                    "choices": choices,
+                    "usage": _usage(total_stats),
+                    "x_hawkpoint_stats": last_stats,
+                }
+            )
+
+        def _stream_text(
+            self,
+            model_id,
+            prompt,
+            max_tokens,
+            n=1,
+            sampling=None,
+            include_usage=False,
+            stop=(),
+            logprobs=None,
+            echo=False,
+        ):
+            """Emit SSE chunks for text completions."""
+            start_time = time.monotonic()
+            completion_id = f"cmpl-{uuid.uuid4().hex}"
+            created = int(time.time())
+            self._headers(200, "text/event-stream")
+
+            def send(payload):
+                if include_usage and "choices" in payload:
+                    payload.setdefault("usage", None)
+                data = json.dumps(payload, separators=(",", ":"))
+                self.wfile.write(f"data: {data}\n\n".encode())
+                self.wfile.flush()
+
+            try:
+                total_stats = {"prompt_tokens": 0, "generated_tokens": 0}
+                for choice_idx in range(n):
+                    if echo:
+                        send(
+                            {
+                                "id": completion_id,
+                                "object": "text_completion",
+                                "created": created,
+                                "model": model_id,
+                                "choices": [
+                                    {
+                                        "index": choice_idx,
+                                        "text": prompt,
+                                        "finish_reason": None,
+                                    }
+                                ],
+                            }
+                        )
+                    stats = None
+                    with closing(self._generation(
+                        model_id, prompt, max_tokens, sampling, stop, logprobs
+                    )) as generation:
+                        for text, final_stats, *extra in generation:
+                            if time.monotonic() > self._deadline:
+                                raise TimeoutError
+                            entries = extra[0] if extra else []
+                            if text:
+                                choice = {
+                                    "index": choice_idx,
+                                    "text": text,
+                                    "finish_reason": None,
+                                }
+                                if logprobs is not None:
+                                    choice["logprobs"] = {
+                                        "tokens": [e.get("token", "") for e in entries],
+                                        "token_logprobs": [e.get("logprob", 0.0) for e in entries],
+                                    }
+                                send(
+                                    {
+                                        "id": completion_id,
+                                        "object": "text_completion",
+                                        "created": created,
+                                        "model": model_id,
+                                        "choices": [choice],
+                                    }
+                                )
+                            if final_stats is not None:
+                                stats = final_stats
+                    stats = stats or {}
+                    total_stats["prompt_tokens"] += stats.get("prompt_tokens", 0)
+                    total_stats["generated_tokens"] += stats.get("generated_tokens", 0)
+                    if "cached_prompt_tokens" in stats:
+                        total_stats["cached_prompt_tokens"] = total_stats.get("cached_prompt_tokens", 0) + stats["cached_prompt_tokens"]
+                    send(
+                        {
+                            "id": completion_id,
+                            "object": "text_completion",
+                            "created": created,
+                            "model": model_id,
+                            "choices": [
+                                {
+                                    "index": choice_idx,
+                                    "text": "",
+                                    "finish_reason": stats.get("finish_reason", "stop"),
+                                }
+                            ],
+                            "x_hawkpoint_stats": stats,
+                        }
+                    )
+                if include_usage:
+                    send(
+                        {
+                            "id": completion_id,
+                            "object": "text_completion",
+                            "created": created,
+                            "model": model_id,
+                            "choices": [],
+                            "usage": _usage(total_stats),
+                        }
+                    )
+                metrics.record_inference(
+                    model_id,
+                    prompt_tokens=total_stats["prompt_tokens"],
+                    generated_tokens=total_stats["generated_tokens"],
+                    duration_seconds=time.monotonic() - start_time,
+                )
+                metrics.record_request("/v1/completions", 200)
+                self.wfile.write(b"data: [DONE]\n\n")
+                self.wfile.flush()
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+            except Exception as exc:
+                logging.exception("streaming text inference request failed")
+                timed_out = isinstance(exc, (TimeoutError, socket.timeout))
+                try:
+                    send(
+                        {
+                            "error": {
+                                "message": (
+                                    "inference request timed out"
+                                    if timed_out
+                                    else "internal inference error"
+                                ),
+                                "type": (
+                                    "timeout_error"
+                                    if timed_out
+                                    else "server_error"
+                                ),
+                            }
+                        }
+                    )
                 except (BrokenPipeError, ConnectionResetError, socket.timeout):
                     pass
 

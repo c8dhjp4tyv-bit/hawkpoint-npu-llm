@@ -1038,6 +1038,25 @@ class NPUDecoder:
         prompt_ids, truncation = self.tokenizer.encode_chat_window(
             messages, self.context_length - max_new_tokens
         )
+        yield from self._generate_tokens_core(
+            prompt_ids,
+            truncation,
+            max_new_tokens,
+            sampler,
+            stop_matcher,
+            top_logprobs,
+        )
+
+    def _generate_tokens_core(
+        self,
+        prompt_ids,
+        truncation,
+        max_new_tokens,
+        sampler,
+        stop_matcher,
+        top_logprobs,
+    ):
+        """Core token generation loop from prepared prompt token IDs."""
         # Penalties are scored against the prompt as well as the generated text,
         # matching llama.cpp and vLLM.
         history = list(prompt_ids)
@@ -1177,6 +1196,44 @@ class NPUDecoder:
             yield "", stats
         else:
             yield "", stats, []
+
+    def generate_text(
+        self,
+        prompt,
+        max_new_tokens=16,
+        sampling=None,
+        *,
+        stop=None,
+        logprobs=None,
+    ):
+        """Generate a response for a raw prompt without ChatML turn scaffolding."""
+        if not 0 < max_new_tokens < self.context_length:
+            raise ValueError(
+                f"max_new_tokens must be between 1 and {self.context_length - 1}"
+            )
+        if sampling is None:
+            params = GREEDY
+        elif isinstance(sampling, SamplingParams):
+            params = sampling
+        else:
+            params = SamplingParams.from_dict(sampling)
+        stop_matcher = StopMatcher(normalize_stop(stop))
+        top_logprobs = normalize_logprobs(logprobs)
+        sampler = Sampler(params)
+        if getattr(self, "_profile_enabled", False):
+            self._phase_totals = {}
+        prompt_ids, truncated = self.tokenizer.encode_prompt_window(
+            prompt, self.context_length - max_new_tokens
+        )
+        truncation = {"truncated_prompt": truncated}
+        yield from self._generate_tokens_core(
+            prompt_ids,
+            truncation,
+            max_new_tokens,
+            sampler,
+            stop_matcher,
+            top_logprobs,
+        )
 
     def generate(
         self,
