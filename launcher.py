@@ -2,6 +2,7 @@
 """Launch either the local API or API + Open WebUI."""
 
 import argparse
+import glob
 import os
 from pathlib import Path
 import secrets
@@ -53,6 +54,18 @@ def wait_for_api(process, timeout=120):
     raise TimeoutError("API server did not become ready within 120 seconds")
 
 
+def openwebui_environment(api_key):
+    """Provide Compose device GIDs even when only its UI service is enabled."""
+    env = {**os.environ, "HAWKPOINT_API_KEY": api_key}
+    for variable, pattern in [("HAWKPOINT_ACCEL_GID", "/dev/accel/accel*"),
+                              ("HAWKPOINT_DRI_GID", "/dev/dri/renderD*")]:
+        if not env.get(variable):
+            nodes = sorted(glob.glob(pattern))
+            # The API profile is inactive here; no device is mapped without it.
+            env[variable] = str(os.stat(nodes[0]).st_gid if nodes else os.getgid())
+    return env
+
+
 def run_openwebui(api_key, models_dir=None, npu_layers=None, npu_percent=None):
     if shutil.which("docker") is None:
         raise RuntimeError("Docker is required for the Open WebUI option")
@@ -70,9 +83,9 @@ def run_openwebui(api_key, models_dir=None, npu_layers=None, npu_percent=None):
         wait_for_api(api)
         print("Open WebUI will be available at http://localhost:3000")
         subprocess.run(
-            ["docker", "compose", "up", "--pull", "missing"],
+            ["docker", "compose", "up", "--pull", "missing", "open-webui"],
             cwd=ROOT,
-            env={**os.environ, "HAWKPOINT_API_KEY": api_key},
+            env=openwebui_environment(api_key),
             check=True,
         )
     finally:
@@ -98,13 +111,13 @@ def main():
     parser.add_argument(
         "--api-key",
         default=os.environ.get("HAWKPOINT_API_KEY"),
-        help="API bearer token; a random token is generated when omitted",
+        help="API bearer token; reads HAWKPOINT_API_KEY; server modes generate one if omitted",
     )
     offload = parser.add_mutually_exclusive_group()
     offload.add_argument("--npu-layers", type=int)
     offload.add_argument("--npu-percent", type=float)
     args = parser.parse_args()
-    api_key = args.api_key or secrets.token_urlsafe(32)
+    api_key = args.api_key
     mode = args.mode
     if mode is None:
         print("1) OpenAI-compatible API server (localhost:8000)")
@@ -130,6 +143,12 @@ def main():
         else:
             mode = "api"
 
+    if mode in {"api", "openwebui"} and not api_key:
+        api_key = secrets.token_urlsafe(32)
+    client_env = dict(os.environ)
+    if api_key:
+        client_env["HAWKPOINT_API_KEY"] = api_key
+
     if mode == "doctor":
         doctor_script = ROOT / "scripts/doctor.py"
         cmd = [sys.executable, str(doctor_script)]
@@ -140,23 +159,20 @@ def main():
     elif mode == "inspect":
         inspect_script = ROOT / "npu_llm/tools/inspect_model.py"
         cmd = [sys.executable, str(inspect_script)]
-        if args.models_dir:
-            cmd.extend(["--model", str(args.models_dir)])
+        if not args.models_dir:
+            parser.error("inspect requires --models-dir")
+        cmd.append(str(args.models_dir))
         ret = subprocess.run(cmd, cwd=ROOT)
         sys.exit(ret.returncode)
     elif mode == "benchmark":
         bench_script = ROOT / "scripts/benchmark_api.py"
         cmd = [sys.executable, str(bench_script)]
-        if api_key:
-            cmd.extend(["--api-key", api_key])
-        ret = subprocess.run(cmd, cwd=ROOT)
+        ret = subprocess.run(cmd, cwd=ROOT, env=client_env)
         sys.exit(ret.returncode)
     elif mode == "eval":
         eval_script = ROOT / "npu_llm/tools/eval_model.py"
         cmd = [sys.executable, str(eval_script)]
-        if api_key:
-            cmd.extend(["--api-key", api_key])
-        ret = subprocess.run(cmd, cwd=ROOT)
+        ret = subprocess.run(cmd, cwd=ROOT, env=client_env)
         sys.exit(ret.returncode)
     elif mode == "api":
         print(f"API bearer token: {api_key}")
@@ -180,11 +196,8 @@ def main():
             cmd.extend(["--npu-layers", str(args.npu_layers)])
         if args.npu_percent is not None:
             cmd.extend(["--npu-percent", str(args.npu_percent)])
-        subprocess.run(
-            cmd,
-            cwd=ROOT,
-            env={**os.environ, "HAWKPOINT_API_KEY": api_key},
-        )
+        ret = subprocess.run(cmd, cwd=ROOT, env=client_env)
+        sys.exit(ret.returncode)
     else:
         run_openwebui(
             api_key,

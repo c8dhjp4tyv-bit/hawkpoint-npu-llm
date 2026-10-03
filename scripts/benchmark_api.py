@@ -18,6 +18,8 @@ import urllib.request
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
+from npu_llm.http_client import open_api_request
+
 
 @dataclass
 class RequestBenchmarkResult:
@@ -28,18 +30,17 @@ class RequestBenchmarkResult:
     prompt_tokens: int
     tokens_per_second: float
     error: str | None = None
+    token_count_known: bool = True
 
 
 def fetch_metrics(base_url: str, api_key: str | None = None) -> dict[str, float]:
     """Fetch and parse current Prometheus metrics from /metrics."""
     url = f"{base_url.rstrip('/')}/metrics"
     headers = {}
-    if api_key:
-        headers["Authorization"] = f"Bearer {api_key}"
     req = urllib.request.Request(url, headers=headers, method="GET")
     metrics: dict[str, float] = {}
     try:
-        with urllib.request.urlopen(req, timeout=5) as resp:
+        with open_api_request(req, api_key, timeout=5) as resp:
             for line in resp.read().decode("utf-8").splitlines():
                 line = line.strip()
                 if not line or line.startswith("#"):
@@ -85,8 +86,6 @@ def execute_single_request(
         payload["stream_options"] = {"include_usage": True}
 
     headers = {"Content-Type": "application/json"}
-    if api_key:
-        headers["Authorization"] = f"Bearer {api_key}"
 
     req = urllib.request.Request(
         url,
@@ -99,9 +98,10 @@ def execute_single_request(
     first_token_time: float | None = None
     generated_tokens = 0
     prompt_tokens = 0
+    token_count_known = stream
 
     try:
-        with urllib.request.urlopen(req, timeout=120) as resp:
+        with open_api_request(req, api_key, timeout=120) as resp:
             status_code = resp.status
             if stream:
                 for raw_line in resp:
@@ -115,6 +115,8 @@ def execute_single_request(
                         data = json.loads(data_str)
                     except json.JSONDecodeError:
                         continue
+                    if "error" in data:
+                        raise RuntimeError(f"API stream failed: {data['error']}")
                     if "choices" in data and data["choices"]:
                         choice = data["choices"][0]
                         delta = choice.get("delta") or choice
@@ -131,8 +133,9 @@ def execute_single_request(
                             prompt_tokens = u["prompt_tokens"]
             else:
                 body = json.loads(resp.read().decode("utf-8"))
-                usage = body.get("usage", {})
-                generated_tokens = usage.get("completion_tokens", max_tokens)
+                usage = body.get("usage") or {}
+                token_count_known = "completion_tokens" in usage
+                generated_tokens = usage.get("completion_tokens", 0)
                 prompt_tokens = usage.get("prompt_tokens", 0)
 
         end_time = time.monotonic()
@@ -148,6 +151,7 @@ def execute_single_request(
             generated_tokens=generated_tokens,
             prompt_tokens=prompt_tokens,
             tokens_per_second=tps,
+            token_count_known=token_count_known,
         )
 
     except urllib.error.HTTPError as exc:
@@ -245,6 +249,7 @@ def run_benchmark(
             "success_rate_percent": (len(successful) / num_requests * 100) if num_requests else 0.0,
             "wall_time_seconds": round(wall_duration, 3),
             "total_generated_tokens": total_tokens,
+            "unknown_token_count_requests": sum(not r.token_count_known for r in successful),
             "aggregate_tokens_per_second": round(aggregate_tps, 2),
         },
         "latency_seconds": {

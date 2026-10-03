@@ -57,7 +57,8 @@ def check_os_and_cpu() -> dict:
         status = CheckStatus.FAIL
         issues.append(f"Host architecture must be x86_64; detected {arch}")
     if not has_avx2:
-        status = CheckStatus.WARN
+        if status == CheckStatus.OK:
+            status = CheckStatus.WARN
         issues.append("CPU missing AVX2 flags; CPU fallback operations will run slowly")
 
     return {
@@ -154,7 +155,7 @@ def check_xrt_runtime() -> dict:
 
 def check_python_dependencies() -> dict:
     """Verify required Python packages are installed in the environment."""
-    required_packages = ["numpy", "tokenizers", "safetensors", "huggingface_hub"]
+    required_packages = ["numpy", "tokenizers", "safetensors", "huggingface_hub", "ml_dtypes"]
     installed = {}
     missing = []
 
@@ -181,7 +182,17 @@ def check_python_dependencies() -> dict:
 def check_models_directory(models_dir: Path) -> dict:
     """Verify converted model catalog in storage path."""
     models_dir = Path(models_dir)
-    discovered = discover_models(models_dir) if models_dir.is_dir() else {}
+    try:
+        discovered = discover_models(models_dir) if models_dir.is_dir() else {}
+    except RuntimeError as exc:
+        return {
+            "status": CheckStatus.FAIL,
+            "models_dir": str(models_dir),
+            "models_count": 0,
+            "available_models": [],
+            "issues": [str(exc)],
+            "remediation": ["Remove duplicate model IDs or correct metadata.json in the model directories"],
+        }
 
     status = CheckStatus.OK if discovered else CheckStatus.WARN
     issues = []
@@ -234,9 +245,12 @@ def check_network_and_services(port: int = 8000) -> dict:
                 pass
 
     docker_installed = shutil.which("docker") is not None
+    conflict = in_use and not api_server_running
 
     return {
-        "status": CheckStatus.OK,
+        "status": CheckStatus.FAIL if conflict else CheckStatus.OK,
+        "issues": [f"Port {port} is occupied by an unrecognized service"] if conflict else [],
+        "remediation": [f"Stop the service using port {port} or configure a different API port"] if conflict else [],
         "port_8000_in_use": in_use,
         "api_server_active": api_server_running,
         "api_server_ready": api_ready,

@@ -10,11 +10,10 @@ services:
       - /dev/accel/accel0:/dev/accel/accel0
       - /dev/dri:/dev/dri
     group_add:
-      - "render"
-      - "video"
+      - "${HAWKPOINT_ACCEL_GID:?Set HAWKPOINT_ACCEL_GID to the host accel device GID}"
+      - "${HAWKPOINT_DRI_GID:?Set HAWKPOINT_DRI_GID to the host DRI render device GID}"
     environment:
       - HAWKPOINT_API_KEY=${HAWKPOINT_API_KEY:?Set HAWKPOINT_API_KEY to a dedicated high-entropy key}
-      - HAWKPOINT_MODELS_DIR=/app/models
     volumes:
       - ./npu_llm/models:/app/models
     profiles:

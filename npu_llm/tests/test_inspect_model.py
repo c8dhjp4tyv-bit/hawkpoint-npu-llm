@@ -33,7 +33,7 @@ def _create_mock_model_dir(dir_path: Path, corrupt_size: bool = False, corrupt_h
 
     weight_hash = hashlib.sha256(weight_data).hexdigest()
     recorded_size = len(weight_data) + (10 if corrupt_size else 0)
-    recorded_hash = "wronghash" if corrupt_hash else weight_hash
+    recorded_hash = "0" * 64 if corrupt_hash else weight_hash
 
     manifest = {
         "format": "xdna1-w8a16",
@@ -108,6 +108,7 @@ def test_inspect_model_and_formats():
         report = inspect_model(model_dir, verify_checksums=True)
         assert report["model_id"] == "mock-smollm"
         assert report["hardware_demands"]["xdna1_supported"] is True
+        assert report["hardware_demands"]["kv_cache_kib"] == 1440.0
 
         text_out = format_text(report)
         assert "Model Inspection: mock-smollm" in text_out

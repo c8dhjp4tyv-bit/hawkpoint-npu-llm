@@ -296,7 +296,7 @@ OPENAPI_SPEC = {
                                 "type": "object",
                                 "properties": {
                                     "model": {"type": "string"},
-                                    "prompt": {"oneOf": [{"type": "string"}, {"type": "array", "items": {"type": "string"}}]},
+                                    "prompt": {"oneOf": [{"type": "string"}, {"type": "array", "items": {"type": "string"}, "minItems": 1, "maxItems": 1}]},
                                     "stream": {"type": "boolean", "default": False},
                                     "max_tokens": {"type": "integer"},
                                     "temperature": {"type": "number"},
@@ -305,7 +305,6 @@ OPENAPI_SPEC = {
                                     "seed": {"type": "integer"},
                                     "n": {"type": "integer", "default": 1},
                                     "echo": {"type": "boolean", "default": False},
-                                    "suffix": {"type": "string"},
                                     "best_of": {"type": "integer"},
                                     "stream_options": {"type": "object"},
                                 },
@@ -1324,10 +1323,10 @@ def make_handler(engine, config=None, metrics=None):
                     return
                 stats = stats or {}
                 last_stats = stats
-                total_stats["prompt_tokens"] = stats.get("prompt_tokens", 0)
+                total_stats["prompt_tokens"] += stats.get("prompt_tokens", 0)
                 total_stats["generated_tokens"] += stats.get("generated_tokens", 0)
                 if "cached_prompt_tokens" in stats:
-                    total_stats["cached_prompt_tokens"] = stats["cached_prompt_tokens"]
+                    total_stats["cached_prompt_tokens"] = total_stats.get("cached_prompt_tokens", 0) + stats["cached_prompt_tokens"]
                 finish_reason = stats.get("finish_reason", "stop")
                 choices.append(
                     {
@@ -1434,10 +1433,10 @@ def make_handler(engine, config=None, metrics=None):
                             if final_stats is not None:
                                 stats = final_stats
                     stats = stats or {}
-                    total_stats["prompt_tokens"] = stats.get("prompt_tokens", 0)
+                    total_stats["prompt_tokens"] += stats.get("prompt_tokens", 0)
                     total_stats["generated_tokens"] += stats.get("generated_tokens", 0)
                     if "cached_prompt_tokens" in stats:
-                        total_stats["cached_prompt_tokens"] = stats["cached_prompt_tokens"]
+                        total_stats["cached_prompt_tokens"] = total_stats.get("cached_prompt_tokens", 0) + stats["cached_prompt_tokens"]
                     send(
                         {
                             "id": completion_id,
@@ -1542,10 +1541,10 @@ def make_handler(engine, config=None, metrics=None):
                     return
                 stats = stats or {}
                 last_stats = stats
-                total_stats["prompt_tokens"] = stats.get("prompt_tokens", 0)
+                total_stats["prompt_tokens"] += stats.get("prompt_tokens", 0)
                 total_stats["generated_tokens"] += stats.get("generated_tokens", 0)
                 if "cached_prompt_tokens" in stats:
-                    total_stats["cached_prompt_tokens"] = stats["cached_prompt_tokens"]
+                    total_stats["cached_prompt_tokens"] = total_stats.get("cached_prompt_tokens", 0) + stats["cached_prompt_tokens"]
                 finish_reason = stats.get("finish_reason", "stop")
                 text_logprobs = None
                 if logprobs is not None:
@@ -1657,10 +1656,10 @@ def make_handler(engine, config=None, metrics=None):
                             if final_stats is not None:
                                 stats = final_stats
                     stats = stats or {}
-                    total_stats["prompt_tokens"] = stats.get("prompt_tokens", 0)
+                    total_stats["prompt_tokens"] += stats.get("prompt_tokens", 0)
                     total_stats["generated_tokens"] += stats.get("generated_tokens", 0)
                     if "cached_prompt_tokens" in stats:
-                        total_stats["cached_prompt_tokens"] = stats["cached_prompt_tokens"]
+                        total_stats["cached_prompt_tokens"] = total_stats.get("cached_prompt_tokens", 0) + stats["cached_prompt_tokens"]
                     send(
                         {
                             "id": completion_id,

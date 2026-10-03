@@ -56,6 +56,7 @@ jobs:
           python tests/test_doctor.py
           python tests/test_launcher.py
           python npu_llm/tests/test_eval_model.py
+          python tests/test_review_regressions.py
 
   ollama-patch:
     runs-on: ubuntu-latest

@@ -75,14 +75,34 @@ def compute_parameter_breakdown(metadata: dict) -> dict:
 
 def verify_model_files(model_dir: Path, manifest: dict, verify_checksums: bool = False) -> dict:
     """Check existence, sizes, and optional SHA-256 checksums of model files."""
-    files_manifest = manifest.get("files", {})
+    files_manifest = manifest.get("files")
+    inventory_errors = []
+    if not isinstance(files_manifest, dict) or not files_manifest:
+        inventory_errors.append("Missing, empty, or malformed files inventory")
+        files_manifest = {}
+    if not any(isinstance(name, str) and name.endswith(".bin") for name in files_manifest):
+        inventory_errors.append("Files inventory contains no model weights")
     verified_files = []
     missing_files = []
     size_mismatches = []
     checksum_failures = []
 
     for name, expected in files_manifest.items():
+        if not isinstance(name, str) or not name or not isinstance(expected, dict):
+            inventory_errors.append(f"Invalid inventory entry: {name}")
+            continue
         path = model_dir / name
+        try:
+            path.resolve().relative_to(model_dir.resolve())
+        except ValueError:
+            inventory_errors.append(f"Inventory path escapes model directory: {name}")
+            continue
+        size = expected.get("size")
+        digest = expected.get("sha256")
+        if (type(size) is not int or size < 0 or not isinstance(digest, str)
+                or len(digest) != 64 or any(c not in "0123456789abcdef" for c in digest)):
+            inventory_errors.append(f"Invalid size or SHA-256 for: {name}")
+            continue
         if not path.is_file():
             missing_files.append(name)
             continue
@@ -117,7 +137,8 @@ def verify_model_files(model_dir: Path, manifest: dict, verify_checksums: bool =
     tokenizer_present = (model_dir / "tokenizer.json").is_file()
 
     valid = (
-        len(missing_files) == 0
+        not inventory_errors
+        and len(missing_files) == 0
         and len(size_mismatches) == 0
         and len(checksum_failures) == 0
         and tokenizer_present
@@ -125,6 +146,7 @@ def verify_model_files(model_dir: Path, manifest: dict, verify_checksums: bool =
 
     return {
         "valid": valid,
+        "inventory_errors": inventory_errors,
         "total_manifest_files": len(files_manifest),
         "verified_files_count": len(verified_files),
         "missing_files": missing_files,
@@ -159,7 +181,7 @@ def inspect_model(model_dir: Path, verify_checksums: bool = False) -> dict:
     # KV Cache memory per token sequence (BF16 = 2 bytes per element)
     kv_heads = int(manifest.get("kv_heads", 3))
     head_dim = int(manifest.get("head_dim", 64))
-    kv_cache_bytes = 2 * layers * 2 * kv_heads * head_dim * context_length * 2  # 2 for K and V, 2 bytes/BF16
+    kv_cache_bytes = 2 * layers * kv_heads * head_dim * context_length * 2  # 2 for K and V, 2 bytes/BF16
     kv_cache_kib = kv_cache_bytes / 1024
 
     return {
@@ -217,13 +239,14 @@ def format_text(report: dict) -> str:
         "Parameters & Footprint:",
         f"  Total Parameters:   {params['total_parameters_millions']}M ({params['total_parameters']:,} params)",
         f"  Weight Footprint:   {params['estimated_weights_mib']} MiB",
-        f"  KV Cache (64 ctx):  {hw['kv_cache_kib']} KiB",
+        f"  KV Cache ({report['context_length']} ctx):  {hw['kv_cache_kib']} KiB",
         f"  BW @ 75 tok/s:      {hw['streaming_bandwidth_gbps_at_75_tps']} GB/s",
         f"  XDNA1 Compatible:   {'YES' if hw['xdna1_supported'] else 'NO'}",
         "--------------------------------------------------",
         f"Files Verified:       {integ['verified_files_count']}/{integ['total_manifest_files']}",
         f"Tokenizer:            {'Present' if integ['tokenizer_present'] else 'Missing'}",
     ]
+    lines.extend(f"Inventory Error:      {error}" for error in integ["inventory_errors"])
     if integ["missing_files"]:
         lines.append(f"Missing Files:        {', '.join(integ['missing_files'])}")
     if integ["size_mismatches"]:
@@ -262,6 +285,7 @@ def format_markdown(report: dict) -> str:
         f"| **XDNA1 Hardware Ready** | `{'Yes' if hw['xdna1_supported'] else 'No'}` |",
         "",
     ]
+    lines.extend(f"- Inventory error: {error}" for error in integ["inventory_errors"])
     return "\n".join(lines)
 
 

@@ -78,9 +78,17 @@ scrape_configs:
   - job_name: 'hawkpoint-npu'
     scrape_interval: 10s
     metrics_path: /metrics
+    authorization:
+      type: Bearer
+      credentials_file: /etc/prometheus/secrets/hawkpoint_api_key
     static_configs:
       - targets: ['127.0.0.1:8000']
 ```
+
+Place the same `HAWKPOINT_API_KEY` used by the server in the credentials file.
+Keep it readable only by the Prometheus service account, mount it read-only in
+containers, and do not commit it. For remote targets, configure HTTPS at the
+server or reverse proxy and scrape that HTTPS endpoint.
 
 ### Metrics Catalog
 
@@ -109,7 +117,7 @@ groups:
           description: "NPU inference worker restarted {{ $value }} times in 5 minutes."
 
       - alert: NpuHighRequestQueue
-        expr: hawkpoint_api_active_requests > 4
+        expr: hawkpoint_api_active_requests >= 3
         for: 2m
         labels:
           severity: warning
@@ -182,3 +190,17 @@ A public release should not be described as validated unless all are true:
 5. A rollback candidate and the previous known-good artifacts remain available.
 
 See `SECURITY.md` for disclosure and network-boundary requirements.
+
+### Container device permissions
+
+Before starting the API Compose profile, set the numeric supplementary groups
+from the actual host device nodes (adjust the render node for your host):
+
+```bash
+export HAWKPOINT_ACCEL_GID=$(stat -c '%g' /dev/accel/accel0)
+export HAWKPOINT_DRI_GID=$(stat -c '%g' /dev/dri/renderD128)
+docker compose --profile full up -d
+```
+
+The container keeps its unprivileged `app` user. Host device GIDs must match
+`group_add`; image-local `render` and `video` names need not match the host.

@@ -231,7 +231,9 @@
                         "type": "array",
                         "items": {
                           "type": "string"
-                        }
+                        },
+                        "minItems": 1,
+                        "maxItems": 1
                       }
                     ]
                   },
@@ -261,9 +263,6 @@
                   "echo": {
                     "type": "boolean",
                     "default": false
-                  },
-                  "suffix": {
-                    "type": "string"
                   },
                   "best_of": {
                     "type": "integer"

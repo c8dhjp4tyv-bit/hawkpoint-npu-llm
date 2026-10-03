@@ -13,16 +13,19 @@ from dataclasses import asdict, dataclass
 from http.server import BaseHTTPRequestHandler, HTTPServer
 import json
 import math
+import os
 from pathlib import Path
 import sys
 import threading
 import time
 from urllib.error import HTTPError, URLError
-from urllib.request import Request, urlopen
+from urllib.request import Request
 
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
+
+from npu_llm.http_client import open_api_request
 
 
 DEFAULT_EVAL_DATASET = [
@@ -83,10 +86,12 @@ class EvalItemResult:
     matched: bool
     tokens: list[str]
     token_logprobs: list[float]
-    cross_entropy: float
-    perplexity: float
-    ttft_ms: float
+    cross_entropy: float | None
+    perplexity: float | None
+    per_token_latency_ms: float
     decode_tokens_per_second: float
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
 
 
 @dataclass
@@ -97,9 +102,9 @@ class EvalReport:
     total_items: int
     matched_items: int
     accuracy: float
-    mean_cross_entropy: float
-    perplexity: float
-    mean_ttft_ms: float
+    mean_cross_entropy: float | None
+    perplexity: float | None
+    mean_per_token_latency_ms: float
     mean_tokens_per_second: float
     total_prompt_tokens: int
     total_completion_tokens: int
@@ -109,15 +114,15 @@ class EvalReport:
 
 def compute_cross_entropy_and_perplexity(
     token_logprobs: list[float],
-) -> tuple[float, float]:
+) -> tuple[float | None, float | None]:
     """Calculate mean negative log-likelihood (cross-entropy) and perplexity."""
     valid_logprobs = [
         lp
         for lp in token_logprobs
-        if lp is not None and isinstance(lp, (int, float)) and math.isfinite(lp)
+        if lp is not None and type(lp) in (int, float) and math.isfinite(lp) and lp <= 0
     ]
     if not valid_logprobs:
-        return 0.0, 1.0
+        return None, None
     mean_neg_ll = -sum(valid_logprobs) / len(valid_logprobs)
     clamped_loss = min(max(mean_neg_ll, 0.0), 100.0)
     perplexity = math.exp(clamped_loss)
@@ -142,12 +147,11 @@ def evaluate_single_item(
         "prompt": prompt,
         "max_tokens": max_tokens,
         "temperature": 0.0,
-        "logprobs": 1,
+        "logprobs": True,
     }
 
     headers = {
         "Content-Type": "application/json",
-        "Authorization": f"Bearer {api_key}",
     }
 
     req = Request(
@@ -157,9 +161,9 @@ def evaluate_single_item(
     )
 
     start_time = time.monotonic()
-    with urlopen(req, timeout=timeout) as resp:
-        duration = time.monotonic() - start_time
+    with open_api_request(req, api_key, timeout=timeout) as resp:
         data = json.loads(resp.read().decode("utf-8"))
+    duration = time.monotonic() - start_time
 
     choices = data.get("choices", [])
     if not choices:
@@ -179,9 +183,10 @@ def evaluate_single_item(
     norm_gen = generated_text.strip().lower()
     matched = norm_expected in norm_gen
 
-    num_tokens = len(tokens) if tokens else max(1, len(generated_text.split()))
+    usage = data.get("usage") or {}
+    num_tokens = usage.get("completion_tokens", len(tokens))
     tps = num_tokens / duration if duration > 0 else 0.0
-    ttft_ms = duration * 1000.0 / max(1, num_tokens)
+    per_token_latency_ms = duration * 1000.0 / max(1, num_tokens)
 
     return EvalItemResult(
         item_id=item.get("id", "unknown"),
@@ -194,8 +199,10 @@ def evaluate_single_item(
         token_logprobs=token_logprobs,
         cross_entropy=cross_entropy,
         perplexity=ppl,
-        ttft_ms=ttft_ms,
+        per_token_latency_ms=per_token_latency_ms,
         decode_tokens_per_second=tps,
+        prompt_tokens=usage.get("prompt_tokens", 0),
+        completion_tokens=num_tokens,
     )
 
 
@@ -224,11 +231,11 @@ def run_evaluation(
     matched = sum(1 for r in results if r.matched)
     accuracy = (matched / total) if total > 0 else 0.0
 
-    all_losses = [r.cross_entropy for r in results if math.isfinite(r.cross_entropy)]
-    mean_loss = sum(all_losses) / len(all_losses) if all_losses else 0.0
-    overall_ppl = math.exp(min(max(mean_loss, 0.0), 100.0))
+    all_losses = [r.cross_entropy for r in results if r.cross_entropy is not None and math.isfinite(r.cross_entropy)]
+    mean_loss = sum(all_losses) / len(all_losses) if all_losses else None
+    overall_ppl = math.exp(min(max(mean_loss, 0.0), 100.0)) if mean_loss is not None else None
 
-    mean_ttft = sum(r.ttft_ms for r in results) / total if total > 0 else 0.0
+    mean_per_token_latency = sum(r.per_token_latency_ms for r in results) / total if total > 0 else 0.0
     mean_tps = (
         sum(r.decode_tokens_per_second for r in results) / total
         if total > 0
@@ -242,17 +249,17 @@ def run_evaluation(
         cat_items = [r for r in results if r.category == c]
         cat_total = len(cat_items)
         cat_matched = sum(1 for r in cat_items if r.matched)
-        cat_losses = [r.cross_entropy for r in cat_items]
-        cat_mean_loss = sum(cat_losses) / cat_total if cat_total > 0 else 0.0
+        cat_losses = [r.cross_entropy for r in cat_items if r.cross_entropy is not None and math.isfinite(r.cross_entropy)]
+        cat_mean_loss = sum(cat_losses) / len(cat_losses) if cat_losses else None
         categories[c] = {
             "total": cat_total,
             "matched": cat_matched,
             "accuracy": cat_matched / cat_total if cat_total > 0 else 0.0,
             "cross_entropy": cat_mean_loss,
-            "perplexity": math.exp(min(max(cat_mean_loss, 0.0), 100.0)),
+            "perplexity": math.exp(min(max(cat_mean_loss, 0.0), 100.0)) if cat_mean_loss is not None else None,
         }
 
-    total_tokens = sum(len(r.tokens) for r in results)
+    total_tokens = sum(r.completion_tokens for r in results)
 
     return EvalReport(
         model=model,
@@ -261,13 +268,17 @@ def run_evaluation(
         accuracy=accuracy,
         mean_cross_entropy=mean_loss,
         perplexity=overall_ppl,
-        mean_ttft_ms=mean_ttft,
+        mean_per_token_latency_ms=mean_per_token_latency,
         mean_tokens_per_second=mean_tps,
-        total_prompt_tokens=0,
+        total_prompt_tokens=sum(r.prompt_tokens for r in results),
         total_completion_tokens=total_tokens,
         categories=categories,
         items=results,
     )
+
+
+def format_optional(value, spec):
+    return "N/A" if value is None else format(value, spec)
 
 
 def format_text_report(report: EvalReport) -> str:
@@ -278,9 +289,9 @@ def format_text_report(report: EvalReport) -> str:
         "=" * 78,
         f"  Items Evaluated:   {report.total_items}",
         f"  Answer Accuracy:   {report.accuracy * 100:.1f}% ({report.matched_items}/{report.total_items})",
-        f"  Cross-Entropy:     {report.mean_cross_entropy:.4f} nats/token",
-        f"  Perplexity (PPL):  {report.perplexity:.2f}",
-        f"  Mean TTFT:         {report.mean_ttft_ms:.1f} ms",
+        f"  Cross-Entropy:     {format_optional(report.mean_cross_entropy, ".4f")} nats/token",
+        f"  Perplexity (PPL):  {format_optional(report.perplexity, ".2f")}",
+        f"  Mean Per-Token Latency:         {report.mean_per_token_latency_ms:.1f} ms",
         f"  Mean Throughput:   {report.mean_tokens_per_second:.1f} tok/s",
         "-" * 78,
         "  Category Breakdown:",
@@ -290,7 +301,7 @@ def format_text_report(report: EvalReport) -> str:
     for cat, stats in report.categories.items():
         lines.append(
             f"  {cat:<16} {stats['accuracy'] * 100:>5.1f}% ({stats['matched']}/{int(stats['total'])})   "
-            f"{stats['cross_entropy']:>6.4f}     {stats['perplexity']:>7.2f}"
+            f"{format_optional(stats['cross_entropy'], ">6.4f")}     {format_optional(stats['perplexity'], ">7.2f")}"
         )
     lines.extend([
         "-" * 78,
@@ -302,7 +313,7 @@ def format_text_report(report: EvalReport) -> str:
         status = "PASS" if it.matched else "FAIL"
         clean_out = it.generated_text.replace("\n", "\\n")[:24]
         lines.append(
-            f"  {it.item_id:<20} {it.category:<14} {status:<10} {it.cross_entropy:>6.3f}  {it.perplexity:>6.2f}  {clean_out}"
+            f"  {it.item_id:<20} {it.category:<14} {status:<10} {format_optional(it.cross_entropy, ">6.3f")}  {format_optional(it.perplexity, ">6.2f")}  {clean_out}"
         )
     lines.append("=" * 78)
     return "\n".join(lines)
@@ -320,9 +331,9 @@ def format_markdown_report(report: EvalReport) -> str:
         f"| **Model** | `{report.model}` |",
         f"| **Total Evaluated Items** | {report.total_items} |",
         f"| **Answer Accuracy** | **{report.accuracy * 100:.1f}%** ({report.matched_items}/{report.total_items}) |",
-        f"| **Mean Cross-Entropy** | {report.mean_cross_entropy:.4f} nats/token |",
-        f"| **Perplexity (PPL)** | **{report.perplexity:.2f}** |",
-        f"| **Mean TTFT** | {report.mean_ttft_ms:.1f} ms |",
+        f"| **Mean Cross-Entropy** | {format_optional(report.mean_cross_entropy, ".4f")} nats/token |",
+        f"| **Perplexity (PPL)** | **{format_optional(report.perplexity, ".2f")}** |",
+        f"| **Mean Per-Token Latency** | {report.mean_per_token_latency_ms:.1f} ms |",
         f"| **Mean Decode Speed** | {report.mean_tokens_per_second:.1f} tok/s |",
         "",
         "## Category Performance",
@@ -333,7 +344,7 @@ def format_markdown_report(report: EvalReport) -> str:
     for cat, stats in report.categories.items():
         lines.append(
             f"| `{cat}` | {int(stats['total'])} | {int(stats['matched'])} | "
-            f"{stats['accuracy'] * 100:.1f}% | {stats['cross_entropy']:.4f} | {stats['perplexity']:.2f} |"
+            f"{stats['accuracy'] * 100:.1f}% | {format_optional(stats['cross_entropy'], ".4f")} | {format_optional(stats['perplexity'], ".2f")} |"
         )
     lines.extend([
         "",
@@ -348,7 +359,7 @@ def format_markdown_report(report: EvalReport) -> str:
         clean_gen = it.generated_text.replace("\n", " ").replace("|", "\\|")
         lines.append(
             f"| `{it.item_id}` | `{it.category}` | {status} | `{clean_exp}` | `{clean_gen}` | "
-            f"{it.cross_entropy:.3f} | {it.perplexity:.2f} |"
+            f"{format_optional(it.cross_entropy, ".3f")} | {format_optional(it.perplexity, ".2f")} |"
         )
     lines.append("")
     return "\n".join(lines)
@@ -364,6 +375,9 @@ class MockEvalServer(BaseHTTPRequestHandler):
         length = int(self.headers.get("Content-Length", 0))
         body = json.loads(self.rfile.read(length).decode("utf-8")) if length else {}
 
+        if body.get("logprobs") is not True:
+            self.send_error(400, "logprobs must be a boolean")
+            return
         prompt = body.get("prompt", "")
         # Return deterministic expected answers matching prompt expectations
         if "capital of France" in prompt:
@@ -472,8 +486,8 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument(
         "--api-key",
-        default="test-key",
-        help="Bearer token for API authorization",
+        default=os.environ.get("HAWKPOINT_API_KEY"),
+        help="Bearer token; reads HAWKPOINT_API_KEY when omitted",
     )
     parser.add_argument(
         "--model",
@@ -540,12 +554,12 @@ def main(argv: list[str] | None = None) -> int:
             model=args.model,
             dataset=dataset,
         )
-    except (URLError, HTTPError, OSError) as exc:
+    except (URLError, HTTPError, OSError, ValueError, RuntimeError) as exc:
         print(f"Error: failed to connect to API server at {args.api_url}: {exc}", file=sys.stderr)
         return 1
 
     if args.format == "json":
-        output_str = json.dumps(asdict(report), indent=2)
+        output_str = json.dumps(asdict(report), indent=2, allow_nan=False)
     elif args.format == "markdown":
         output_str = format_markdown_report(report)
     else:
@@ -559,9 +573,11 @@ def main(argv: list[str] | None = None) -> int:
 
     # Check SLA gates
     failed_slas = []
-    if args.max_perplexity is not None and report.perplexity > args.max_perplexity:
+    if args.max_perplexity is not None and report.perplexity is None:
+        failed_slas.append("Perplexity is unavailable: the API returned no valid token logprobs")
+    elif args.max_perplexity is not None and report.perplexity > args.max_perplexity:
         failed_slas.append(
-            f"Perplexity {report.perplexity:.2f} exceeded threshold {args.max_perplexity:.2f}"
+            f"Perplexity {format_optional(report.perplexity, ".2f")} exceeded threshold {args.max_perplexity:.2f}"
         )
     if args.min_accuracy is not None and report.accuracy < args.min_accuracy:
         failed_slas.append(

@@ -54,7 +54,7 @@ def test_launcher_subcommand_dispatch():
         mock_exit.assert_called_once_with(0)
 
     # Inspect mode dispatch
-    with patch("sys.argv", ["launcher.py", "inspect"]), \
+    with patch("sys.argv", ["launcher.py", "inspect", "--models-dir", "/custom/model"]), \
          patch("subprocess.run") as mock_run, \
          patch("sys.exit") as mock_exit:
         mock_run.return_value = MagicMock(returncode=0)
@@ -73,8 +73,9 @@ def test_launcher_subcommand_dispatch():
         mock_run.assert_called_once()
         cmd = mock_run.call_args[0][0]
         assert "benchmark_api.py" in str(cmd[1])
-        assert "--api-key" in cmd
-        assert "test-key" in cmd
+        assert "--api-key" not in cmd
+        assert "test-key" not in cmd
+        assert mock_run.call_args.kwargs["env"]["HAWKPOINT_API_KEY"] == "test-key"
         mock_exit.assert_called_once_with(0)
 
     # Eval mode dispatch
@@ -86,8 +87,9 @@ def test_launcher_subcommand_dispatch():
         mock_run.assert_called_once()
         cmd = mock_run.call_args[0][0]
         assert "eval_model.py" in str(cmd[1])
-        assert "--api-key" in cmd
-        assert "test-key" in cmd
+        assert "--api-key" not in cmd
+        assert "test-key" not in cmd
+        assert mock_run.call_args.kwargs["env"]["HAWKPOINT_API_KEY"] == "test-key"
         mock_exit.assert_called_once_with(0)
 
 
@@ -100,7 +102,7 @@ def test_launcher_interactive_menu_selection():
         "7": "eval_model.py",
     }
     for choice, expected_script in choices_to_script.items():
-        with patch("sys.argv", ["launcher.py"]), \
+        with patch("sys.argv", ["launcher.py", "--models-dir", "/custom/model"]), \
              patch("builtins.input", return_value=choice), \
              patch("subprocess.run") as mock_run, \
              patch("sys.exit") as mock_exit:

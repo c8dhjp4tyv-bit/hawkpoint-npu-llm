@@ -7,6 +7,7 @@ import json
 from pathlib import Path
 import sys
 import tempfile
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
@@ -95,10 +96,9 @@ def test_run_diagnostics_and_format():
 
 
 def test_main_cli():
-    with tempfile.TemporaryDirectory() as tmpdir:
-        code = main(["--models-dir", tmpdir, "--json"])
-        # WARN or OK should return code <= 1
-        assert code in (0, 1)
+    for status, expected in [(CheckStatus.OK, 0), (CheckStatus.WARN, 1), (CheckStatus.FAIL, 2)]:
+        with patch("scripts.doctor.run_diagnostics", return_value={"overall_status": status}):
+            assert main(["--json"]) == expected
 
 
 if __name__ == "__main__":

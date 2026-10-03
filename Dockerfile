@@ -6,9 +6,6 @@ LABEL description="Containerized runtime environment for Hawk Point XDNA1 NPU LL
 
 ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \
-    HAWKPOINT_HOST=0.0.0.0 \
-    HAWKPOINT_PORT=8000 \
-    HAWKPOINT_MODELS_DIR=/app/models \
     PATH="/app/venv/bin:$PATH"
 
 # Install system dependencies
@@ -48,4 +45,4 @@ HEALTHCHECK --interval=15s --timeout=5s --start-period=10s --retries=3 \
     CMD curl -f http://127.0.0.1:8000/health || exit 1
 
 ENTRYPOINT ["python3"]
-CMD ["launcher.py", "--api-only", "--host", "0.0.0.0", "--port", "8000"]
+CMD ["npu_llm/api_server.py", "--host", "0.0.0.0", "--port", "8000", "--models-dir", "/app/models"]

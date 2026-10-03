@@ -2,7 +2,7 @@
 
 PYTHON ?= python3
 ROOT_DIR := $(shell pwd)
-MODELS_DIR ?= $(ROOT_DIR)/npu_llm/models
+MODEL_DIR ?= $(ROOT_DIR)/npu_llm/models/SmolLM2-135M-Instruct-xdna1-w8a16
 
 .PHONY: help test doctor inspect benchmark eval chat api openwebui docker-build docker-up docker-down lint clean
 
@@ -45,16 +45,17 @@ test:
 	$(PYTHON) npu_llm/tests/test_eval_model.py
 	$(PYTHON) tests/test_release_gates.py
 	$(PYTHON) tests/test_api_server.py
+	$(PYTHON) tests/test_review_regressions.py
 	@echo "All tests passed successfully!"
 
 doctor:
 	$(PYTHON) scripts/doctor.py
 
 inspect:
-	@if [ -d "$(MODELS_DIR)/SmolLM2-135M-Instruct-xdna1-w8a16" ]; then \
-		$(PYTHON) npu_llm/tools/inspect_model.py "$(MODELS_DIR)/SmolLM2-135M-Instruct-xdna1-w8a16"; \
+	@if [ -d "$(MODEL_DIR)" ]; then \
+		$(PYTHON) npu_llm/tools/inspect_model.py "$(MODEL_DIR)"; \
 	else \
-		echo "Default model not found. Specify path: make inspect MODELS_DIR=/path/to/model"; \
+		echo "Model not found. Specify path: make inspect MODEL_DIR=/path/to/model"; exit 1; \
 	fi
 
 benchmark:

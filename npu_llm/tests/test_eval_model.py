@@ -29,8 +29,8 @@ def test_cross_entropy_and_perplexity_calculation():
     """Verify loss and perplexity math under normal and boundary conditions."""
     # Empty list
     loss, ppl = compute_cross_entropy_and_perplexity([])
-    assert loss == 0.0
-    assert ppl == 1.0
+    assert loss is None
+    assert ppl is None
 
     # Single logprob of ln(0.5) ~ -0.693147 -> PPL should be 2.0
     logprob_half = math.log(0.5)
@@ -62,7 +62,7 @@ def test_format_reports():
         token_logprobs=[-0.05],
         cross_entropy=0.05,
         perplexity=1.051,
-        ttft_ms=12.5,
+        per_token_latency_ms=12.5,
         decode_tokens_per_second=80.0,
     )
     report = EvalReport(
@@ -72,7 +72,7 @@ def test_format_reports():
         accuracy=1.0,
         mean_cross_entropy=0.05,
         perplexity=1.051,
-        mean_ttft_ms=12.5,
+        mean_per_token_latency_ms=12.5,
         mean_tokens_per_second=80.0,
         total_prompt_tokens=0,
         total_completion_tokens=1,

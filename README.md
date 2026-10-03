@@ -276,7 +276,7 @@ python launcher.py chat
 python launcher.py doctor
 
 # Model architecture, parameter breakdown, and checksum inspector
-python launcher.py inspect
+python launcher.py inspect --models-dir npu_llm/models/SmolLM2-135M-Instruct-xdna1-w8a16
 
 # Automated API load and latency benchmark
 python launcher.py benchmark
@@ -446,7 +446,7 @@ The project includes `npu_llm/tools/eval_model.py` for automated evaluation of m
 
 ```bash
 # Evaluate active model on standard multi-domain QA, logic, and coding prompts:
-python npu_llm/tools/eval_model.py --api-url http://127.0.0.1:8000 --api-key $HAWKPOINT_API_KEY
+python npu_llm/tools/eval_model.py --api-url http://127.0.0.1:8000
 
 # Export structured Markdown report with quality and latency SLAs:
 python npu_llm/tools/eval_model.py --format markdown -o eval_report.md --min-accuracy 0.8 --max-perplexity 30.0
@@ -454,6 +454,12 @@ python npu_llm/tools/eval_model.py --format markdown -o eval_report.md --min-acc
 # Run in-process self-test (used in CI without live hardware or server):
 python npu_llm/tools/eval_model.py --self-test
 ```
+
+The evaluator reads `HAWKPOINT_API_KEY`. Authenticated remote URLs require HTTPS;
+loopback HTTP is supported, and authenticated redirects are rejected. Evaluation
+latency is total request time per generated token, not streaming TTFT. Missing
+logprobs appear as `null`/`N/A` and fail a requested perplexity SLA. Perplexity
+here describes generated tokens, not teacher-forced scoring of reference text.
 
 ### Sampling
 
@@ -605,6 +611,10 @@ and keep the backend private.
 Run the containerized API server with hardware NPU access (`/dev/accel/accel0` and `/dev/dri`):
 
 ```bash
+# Set a dedicated HAWKPOINT_API_KEY in your environment first.
+export HAWKPOINT_ACCEL_GID=$(stat -c '%g' /dev/accel/accel0)
+export HAWKPOINT_DRI_GID=$(stat -c '%g' /dev/dri/renderD128)
+
 # Build and run the standalone NPU API container
 docker compose --profile api up -d
 

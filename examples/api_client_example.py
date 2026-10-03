@@ -16,6 +16,7 @@ import argparse
 from http.server import BaseHTTPRequestHandler, HTTPServer
 import json
 import os
+from pathlib import Path
 import sys
 import threading
 import time
@@ -23,14 +24,16 @@ import urllib.error
 import urllib.request
 
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from npu_llm.http_client import open_api_request
+
+
 def list_models(base_url: str, api_key: str | None = None) -> list[dict]:
     """Retrieve the list of installed NPU models."""
     url = f"{base_url.rstrip('/')}/v1/models"
     req = urllib.request.Request(url, headers={"User-Agent": "HawkPoint-Example-Client/1.0"})
-    if api_key:
-        req.add_header("Authorization", f"Bearer {api_key}")
 
-    with urllib.request.urlopen(req, timeout=10.0) as resp:
+    with open_api_request(req, api_key, timeout=10.0) as resp:
         data = json.loads(resp.read().decode("utf-8"))
         return data.get("data", [])
 
@@ -63,8 +66,6 @@ def stream_chat(
             "User-Agent": "HawkPoint-Example-Client/1.0",
         },
     )
-    if api_key:
-        req.add_header("Authorization", f"Bearer {api_key}")
 
     start_time = time.perf_counter()
     ttft = None
@@ -75,7 +76,7 @@ def stream_chat(
     print(f"\n[Prompt]: {prompt}")
     print("[Assistant]: ", end="", flush=True)
 
-    with urllib.request.urlopen(req, timeout=60.0) as resp:
+    with open_api_request(req, api_key, timeout=60.0) as resp:
         for line_bytes in resp:
             line = line_bytes.decode("utf-8", errors="replace").strip()
             if not line.startswith("data:"):
@@ -89,15 +90,16 @@ def stream_chat(
             except json.JSONDecodeError:
                 continue
 
-            # Record Time to First Token
-            if ttft is None:
-                ttft = time.perf_counter() - start_time
+            if "error" in chunk:
+                raise RuntimeError(f"API stream failed: {chunk['error']}")
 
             choices = chunk.get("choices", [])
             if choices:
                 delta = choices[0].get("delta", {})
                 content = delta.get("content", "")
                 if content:
+                    if ttft is None:
+                        ttft = time.perf_counter() - start_time
                     print(content, end="", flush=True)
                     accumulated_text.append(content)
                     generated_tokens += 1
@@ -150,10 +152,8 @@ def complete_text(
             "User-Agent": "HawkPoint-Example-Client/1.0",
         },
     )
-    if api_key:
-        req.add_header("Authorization", f"Bearer {api_key}")
 
-    with urllib.request.urlopen(req, timeout=30.0) as resp:
+    with open_api_request(req, api_key, timeout=30.0) as resp:
         data = json.loads(resp.read().decode("utf-8"))
         choices = data.get("choices", [])
         return choices[0]["text"] if choices else ""

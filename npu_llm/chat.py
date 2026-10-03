@@ -14,6 +14,9 @@ import urllib.request
 
 ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT))
+sys.path.insert(0, str(ROOT.parent))
+
+from npu_llm.http_client import open_api_request, validate_api_url
 
 from runtime.sampling import GREEDY, SamplingParams
 
@@ -50,8 +53,6 @@ def stream_chat_api(
                 payload[key] = params_dict[key]
 
     headers = {"Content-Type": "application/json"}
-    if api_key:
-        headers["Authorization"] = f"Bearer {api_key}"
 
     req = urllib.request.Request(
         url,
@@ -66,7 +67,7 @@ def stream_chat_api(
     prompt_tokens = 0
 
     try:
-        with urllib.request.urlopen(req, timeout=120) as resp:
+        with open_api_request(req, api_key, timeout=120) as resp:
             for raw_line in resp:
                 line = raw_line.decode("utf-8").strip()
                 if not line or not line.startswith("data: "):
@@ -78,6 +79,10 @@ def stream_chat_api(
                     data = json.loads(data_str)
                 except json.JSONDecodeError:
                     continue
+                if "error" in data:
+                    error = data["error"]
+                    message = error.get("message", str(error)) if isinstance(error, dict) else str(error)
+                    raise RuntimeError(f"API stream failed: {message}")
                 if "choices" in data and data["choices"]:
                     delta = data["choices"][0].get("delta", {})
                     content = delta.get("content")
@@ -95,6 +100,8 @@ def stream_chat_api(
     except urllib.error.HTTPError as exc:
         err_msg = exc.read().decode("utf-8", errors="replace")
         raise RuntimeError(f"API request failed with HTTP {exc.code}: {err_msg}") from exc
+    except RuntimeError:
+        raise
     except Exception as exc:
         raise RuntimeError(f"Connection to API failed: {exc}") from exc
 
@@ -117,11 +124,10 @@ def list_api_models(base_url: str, api_key: str | None) -> list[str]:
     """Fetch installed model identifiers from the API server."""
     url = f"{base_url.rstrip('/')}/v1/models"
     headers = {}
-    if api_key:
-        headers["Authorization"] = f"Bearer {api_key}"
+    validate_api_url(url, api_key)
     req = urllib.request.Request(url, headers=headers, method="GET")
     try:
-        with urllib.request.urlopen(req, timeout=3) as resp:
+        with open_api_request(req, api_key, timeout=3) as resp:
             data = json.loads(resp.read().decode("utf-8"))
             return [m["id"] for m in data.get("data", [])]
     except Exception:
@@ -303,7 +309,7 @@ def main(argv: list[str] | None = None) -> int:
                 models = list_api_models(api_url, args.api_key)
                 print("Available models:", ", ".join(models) if models else "none found")
             else:
-                print(f"Current local model: {args.model}")
+                print(f"Current local model: {model_path}")
             continue
         last_stats = complete(prompt)
 
