@@ -85,7 +85,11 @@ def run_openwebui(api_key, models_dir=None, npu_layers=None, npu_percent=None):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("mode", nargs="?", choices=["api", "openwebui", "chat", "doctor"])
+    parser.add_argument(
+        "mode",
+        nargs="?",
+        choices=["api", "openwebui", "chat", "doctor", "inspect", "benchmark", "eval"],
+    )
     parser.add_argument(
         "--models-dir",
         type=Path,
@@ -107,12 +111,21 @@ def main():
         print("2) API server + Open WebUI (localhost:3000)")
         print("3) Interactive terminal chat")
         print("4) System preflight diagnostics (doctor)")
-        choice = input("Choose [1/2/3/4]: ").strip()
-        if choice == "4":
+        print("5) Model weights and architecture inspector (inspect)")
+        print("6) API load and latency benchmark (benchmark)")
+        print("7) Model quality and perplexity evaluation (eval)")
+        choice = input("Choose [1/2/3/4/5/6/7]: ").strip().lower()
+        if choice in ("7", "eval"):
+            mode = "eval"
+        elif choice in ("6", "benchmark"):
+            mode = "benchmark"
+        elif choice in ("5", "inspect"):
+            mode = "inspect"
+        elif choice in ("4", "doctor"):
             mode = "doctor"
-        elif choice == "3":
+        elif choice in ("3", "chat"):
             mode = "chat"
-        elif choice == "2":
+        elif choice in ("2", "openwebui"):
             mode = "openwebui"
         else:
             mode = "api"
@@ -122,6 +135,27 @@ def main():
         cmd = [sys.executable, str(doctor_script)]
         if args.models_dir:
             cmd.extend(["--models-dir", str(args.models_dir)])
+        ret = subprocess.run(cmd, cwd=ROOT)
+        sys.exit(ret.returncode)
+    elif mode == "inspect":
+        inspect_script = ROOT / "npu_llm/tools/inspect_model.py"
+        cmd = [sys.executable, str(inspect_script)]
+        if args.models_dir:
+            cmd.extend(["--model", str(args.models_dir)])
+        ret = subprocess.run(cmd, cwd=ROOT)
+        sys.exit(ret.returncode)
+    elif mode == "benchmark":
+        bench_script = ROOT / "scripts/benchmark_api.py"
+        cmd = [sys.executable, str(bench_script)]
+        if api_key:
+            cmd.extend(["--api-key", api_key])
+        ret = subprocess.run(cmd, cwd=ROOT)
+        sys.exit(ret.returncode)
+    elif mode == "eval":
+        eval_script = ROOT / "npu_llm/tools/eval_model.py"
+        cmd = [sys.executable, str(eval_script)]
+        if api_key:
+            cmd.extend(["--api-key", api_key])
         ret = subprocess.run(cmd, cwd=ROOT)
         sys.exit(ret.returncode)
     elif mode == "api":

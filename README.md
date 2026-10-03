@@ -269,10 +269,20 @@ python launcher.py api
 # API + Open WebUI: http://localhost:3000
 python launcher.py openwebui
 
+# Interactive terminal chat client
+python launcher.py chat
+
 # System preflight diagnostics: check driver, device nodes, permissions, XRT
 python launcher.py doctor
-# Or run standalone:
-python scripts/doctor.py
+
+# Model architecture, parameter breakdown, and checksum inspector
+python launcher.py inspect
+
+# Automated API load and latency benchmark
+python launcher.py benchmark
+
+# Automated model quality, accuracy, and perplexity evaluation
+python launcher.py eval
 
 # Models stored on another disk
 python launcher.py openwebui --models-dir /path/to/storage
@@ -428,6 +438,21 @@ python scripts/benchmark_api.py --url http://127.0.0.1:8000 --requests 10 --conc
 
 # Generate a GitHub Markdown report and enforce a minimum throughput SLA:
 python scripts/benchmark_api.py --format markdown --output benchmark.md --min-tps 40.0
+```
+
+### Automated Model Quality & Perplexity Evaluation
+
+The project includes `npu_llm/tools/eval_model.py` for automated evaluation of model answer accuracy, negative log-likelihood cross-entropy loss, and perplexity (PPL) using token log probabilities:
+
+```bash
+# Evaluate active model on standard multi-domain QA, logic, and coding prompts:
+python npu_llm/tools/eval_model.py --api-url http://127.0.0.1:8000 --api-key $HAWKPOINT_API_KEY
+
+# Export structured Markdown report with quality and latency SLAs:
+python npu_llm/tools/eval_model.py --format markdown -o eval_report.md --min-accuracy 0.8 --max-perplexity 30.0
+
+# Run in-process self-test (used in CI without live hardware or server):
+python npu_llm/tools/eval_model.py --self-test
 ```
 
 ### Sampling

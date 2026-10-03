@@ -4,7 +4,7 @@ PYTHON ?= python3
 ROOT_DIR := $(shell pwd)
 MODELS_DIR ?= $(ROOT_DIR)/npu_llm/models
 
-.PHONY: help test doctor inspect benchmark chat api openwebui docker-build docker-up docker-down lint clean
+.PHONY: help test doctor inspect benchmark eval chat api openwebui docker-build docker-up docker-down lint clean
 
 help:
 	@echo "HawkPoint NPU LLM - Development and Operational Targets"
@@ -20,6 +20,7 @@ help:
 	@echo "  doctor       Run preflight host environment diagnostics (XDNA, XRT, drivers)"
 	@echo "  inspect      Inspect and validate converted model weights and architecture"
 	@echo "  benchmark    Run automated API latency and TTFT benchmark suite"
+	@echo "  eval         Run automated model accuracy and perplexity evaluation"
 	@echo ""
 	@echo "Testing & Quality:"
 	@echo "  test         Run all automated unit and integration test suites"
@@ -40,6 +41,8 @@ test:
 	$(PYTHON) npu_llm/tests/test_visualizer.py
 	$(PYTHON) tests/offline_benchmark_harness.py
 	$(PYTHON) tests/test_offline_benchmark_harness.py
+	$(PYTHON) tests/test_launcher.py
+	$(PYTHON) npu_llm/tests/test_eval_model.py
 	$(PYTHON) tests/test_release_gates.py
 	$(PYTHON) tests/test_api_server.py
 	@echo "All tests passed successfully!"
@@ -56,6 +59,9 @@ inspect:
 
 benchmark:
 	$(PYTHON) scripts/benchmark_api.py --requests 10 --concurrency 2
+
+eval:
+	$(PYTHON) npu_llm/tools/eval_model.py --self-test
 
 chat:
 	$(PYTHON) npu_llm/chat.py

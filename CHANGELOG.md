@@ -1,7 +1,11 @@
 # Changelog
 
-- Harden API server against Prometheus metric cardinality exhaustion by normalizing unmapped
-  request endpoints to `/unknown` on 404 errors.
+- Add automated model quality, answer accuracy, and perplexity evaluation tool (`npu_llm/tools/eval_model.py`)
+  supporting multi-domain prompt benchmarks, per-token cross-entropy and perplexity calculation via token
+  logprobs, category breakdowns, quality SLA gates (`--min-accuracy`, `--max-perplexity`), and text/JSON/Markdown reports.
+- Add `inspect`, `benchmark`, and `eval` modes to `launcher.py` and interactive selector menu (options 1 through 7).
+- Add dedicated unit test suites `npu_llm/tests/test_eval_model.py` and `tests/test_launcher.py`.
+- Add `make eval` target to `Makefile` and include new test suites in CI workflow.
 - Require Bearer token authentication on OpenMetrics endpoint `GET /metrics` and declare security
   requirement in OpenAPI 3.1.0 specification.
 - Explicitly reject unsupported `suffix` and unsupported `best_of` (`best_of != n`) in `/v1/completions`.
