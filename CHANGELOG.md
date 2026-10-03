@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- Add model inspection and validation tool (`npu_llm/tools/inspect_model.py`)
+  supporting parameter breakdown analysis, weight binary size and SHA-256 verification,
+  streaming memory bandwidth estimations, and text/JSON/Markdown reporting.
+- Add system preflight diagnostics doctor tool (`scripts/doctor.py`) and launcher integration
+  (`launcher.py doctor`) verifying Linux kernel, CPU vector extensions (AVX2), `/dev/accel`
+  permissions, `amdxdna` kernel module, XRT userspace libraries, and port availability
+  with actionable remediation guidance.
 - Add interactive and remote OpenAI HTTP API streaming client mode to `npu_llm/chat.py`
   with automatic local API server discovery, live token streaming, latency and TTFT
   telemetry, and interactive session commands (`/reset`, `/stats`, `/models`, `/exit`).

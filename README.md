@@ -269,6 +269,11 @@ python launcher.py api
 # API + Open WebUI: http://localhost:3000
 python launcher.py openwebui
 
+# System preflight diagnostics: check driver, device nodes, permissions, XRT
+python launcher.py doctor
+# Or run standalone:
+python scripts/doctor.py
+
 # Models stored on another disk
 python launcher.py openwebui --models-dir /path/to/storage
 
@@ -625,6 +630,18 @@ approximately 1.7 GiB. The format retains BF16 decoder weights for numerically
 stable generation and per-output-channel INT8 weights for W8/BF16 kernels.
 The runtime verifies package sizes and SHA-256 hashes before memory mapping
 weights; packages created by an older converter must be reconverted.
+
+## Inspect and validate a model
+
+Inspect architecture parameters, parameter count breakdown, weight files integrity, and hardware bandwidth requirements for any converted checkpoint:
+
+```bash
+# Validate weights integrity, parameter breakdown, and hardware memory requirements:
+python npu_llm/tools/inspect_model.py npu_llm/models/SmolLM2-135M-Instruct-xdna1-w8a16
+
+# Verify all SHA-256 binary checksums and export GitHub Markdown:
+python npu_llm/tools/inspect_model.py npu_llm/models/SmolLM2-135M-Instruct-xdna1-w8a16 --verify-checksums --format markdown -o docs/reports/smollm2_spec.md
+```
 
 ## Tests
 

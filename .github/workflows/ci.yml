@@ -49,6 +49,10 @@ jobs:
           python npu_llm/tests/test_visualizer.py
           python tests/offline_benchmark_harness.py
           python tests/test_offline_benchmark_harness.py
+      - name: Test developer tools, model inspector, and system doctor
+        run: |
+          python npu_llm/tests/test_inspect_model.py
+          python tests/test_doctor.py
 
   ollama-patch:
     runs-on: ubuntu-latest

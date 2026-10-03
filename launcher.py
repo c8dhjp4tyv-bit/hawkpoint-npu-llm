@@ -85,7 +85,7 @@ def run_openwebui(api_key, models_dir=None, npu_layers=None, npu_percent=None):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("mode", nargs="?", choices=["api", "openwebui", "chat"])
+    parser.add_argument("mode", nargs="?", choices=["api", "openwebui", "chat", "doctor"])
     parser.add_argument(
         "--models-dir",
         type=Path,
@@ -106,15 +106,25 @@ def main():
         print("1) OpenAI-compatible API server (localhost:8000)")
         print("2) API server + Open WebUI (localhost:3000)")
         print("3) Interactive terminal chat")
-        choice = input("Choose [1/2/3]: ").strip()
-        if choice == "3":
+        print("4) System preflight diagnostics (doctor)")
+        choice = input("Choose [1/2/3/4]: ").strip()
+        if choice == "4":
+            mode = "doctor"
+        elif choice == "3":
             mode = "chat"
         elif choice == "2":
             mode = "openwebui"
         else:
             mode = "api"
 
-    if mode == "api":
+    if mode == "doctor":
+        doctor_script = ROOT / "scripts/doctor.py"
+        cmd = [sys.executable, str(doctor_script)]
+        if args.models_dir:
+            cmd.extend(["--models-dir", str(args.models_dir)])
+        ret = subprocess.run(cmd, cwd=ROOT)
+        sys.exit(ret.returncode)
+    elif mode == "api":
         print(f"API bearer token: {api_key}")
         subprocess.run(
             api_command(
