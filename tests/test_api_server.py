@@ -545,7 +545,8 @@ def test_sampling_parameters_reach_the_decoder():
             {"repetition_penalty": 0},
             {"presence_penalty": 99},
             {"seed": -1},
-            {"n": 2},
+            {"n": 0},
+            {"n": 9},
         ):
             request = payload()
             request.update(invalid)
@@ -969,6 +970,184 @@ def test_cancelled_process_generation_recovers():
     finally:
         engine.close()
 
+def test_multiple_choices_generation():
+    """Ensure n > 1 produces multiple indexed choices in chat and streaming."""
+    decoder = FakeDecoder()
+    server, thread, base = start_server({"smollm2-135m-xdna1": decoder})
+    try:
+        # Non-streaming n=2
+        status, body, _ = fetch(
+            f"{base}/v1/chat/completions", {**payload(), "n": 2}
+        )
+        assert status == 200
+        data = json.loads(body)
+        assert len(data["choices"]) == 2
+        assert data["choices"][0]["index"] == 0
+        assert data["choices"][1]["index"] == 1
+        assert data["choices"][0]["message"]["content"] == "Hello!"
+        assert data["choices"][1]["message"]["content"] == "Hello!"
+        assert data["usage"]["completion_tokens"] == 4
+
+        # Streaming n=2
+        status, body, _ = fetch(
+            f"{base}/v1/chat/completions", {**payload(), "n": 2, "stream": True}
+        )
+        assert status == 200
+        events = [
+            json.loads(line.removeprefix("data: "))
+            for line in body.splitlines()
+            if line.startswith("data: {")
+        ]
+        indices = {
+            ev["choices"][0]["index"]
+            for ev in events
+            if ev.get("choices") and ev["choices"][0].get("index") is not None
+        }
+        assert indices == {0, 1}
+        assert "[DONE]" in body
+    finally:
+        stop_server(server, thread)
+
+
+def test_completions_endpoint():
+    """Validate POST /v1/completions with text prompts, streaming, and error checks."""
+    decoder = FakeDecoder()
+    server, thread, base = start_server({"smollm2-135m-xdna1": decoder})
+    try:
+        # Standard text completion
+        req = {"model": "smollm2-135m-xdna1", "prompt": "Hello", "max_tokens": 5}
+        status, body, _ = fetch(f"{base}/v1/completions", req)
+        assert status == 200
+        data = json.loads(body)
+        assert data["object"] == "text_completion"
+        assert len(data["choices"]) == 1
+        assert data["choices"][0]["index"] == 0
+        assert data["choices"][0]["text"] == "Hello!"
+        assert data["choices"][0]["finish_reason"] == "length"
+        assert data["usage"]["completion_tokens"] == 2
+
+        # Array prompt
+        req_arr = {"model": "smollm2-135m-xdna1", "prompt": ["Hello"], "max_tokens": 5}
+        status, body, _ = fetch(f"{base}/v1/completions", req_arr)
+        assert status == 200
+
+        # Text completion with n=2
+        status, body, _ = fetch(f"{base}/v1/completions", {**req, "n": 2})
+        assert status == 200
+        data_n2 = json.loads(body)
+        assert len(data_n2["choices"]) == 2
+        assert data_n2["choices"][0]["index"] == 0
+        assert data_n2["choices"][1]["index"] == 1
+        assert data_n2["choices"][0]["text"] == "Hello!"
+
+        # Streaming text completion
+        status, body, _ = fetch(f"{base}/v1/completions", {**req, "stream": True})
+        assert status == 200
+        assert "text_completion" in body
+        assert "[DONE]" in body
+
+        # Echo parameter test (non-streaming)
+        status, body, _ = fetch(f"{base}/v1/completions", {**req, "echo": True})
+        assert status == 200
+        data_echo = json.loads(body)
+        assert data_echo["choices"][0]["text"] == "HelloHello!"
+
+        # Echo parameter test (streaming)
+        status, body, _ = fetch(f"{base}/v1/completions", {**req, "echo": True, "stream": True})
+        assert status == 200
+        assert '"text":"Hello"' in body
+
+        # Validation errors
+        for bad_prompt in (
+            {},
+            {"prompt": ""},
+            {"prompt": None},
+            {"prompt": 123},
+            {"prompt": []},
+            {"prompt": [123]},
+            {"prompt": ["first", "second"]},
+            {"echo": "yes"},
+            {"suffix": 123},
+            {"suffix": "fill-in-the-middle"},
+            {"best_of": "two"},
+            {"best_of": 0},
+            {"best_of": 2},
+            {"n": 2, "best_of": 1},
+        ):
+            status, _, _ = fetch(f"{base}/v1/completions", {"model": "smollm2-135m-xdna1", **bad_prompt})
+            assert status == 400
+    finally:
+        stop_server(server, thread)
+
+
+def test_metrics_and_health_probes():
+    """Verify Prometheus /metrics and k8s liveness/readiness probe aliases."""
+    decoder = FakeDecoder()
+    server, thread, base = start_server({"smollm2-135m-xdna1": decoder})
+    try:
+        # Root informational endpoint
+        status, body, _ = fetch(f"{base}/")
+        assert status == 200
+        root_data = json.loads(body)
+        assert root_data["service"] == "hawkpoint-npu-api"
+        assert "/metrics" in root_data["endpoints"]
+        assert "/openapi.json" in root_data["endpoints"]
+        assert "/v1/chat/completions" in root_data["endpoints"]
+
+        # OpenAPI specification route
+        status, body, _ = fetch(f"{base}/openapi.json")
+        assert status == 200
+        spec = json.loads(body)
+        assert spec["openapi"] == "3.1.0"
+        assert "/v1/chat/completions" in spec["paths"]
+        assert "/v1/completions" in spec["paths"]
+
+        # Liveness probe alias
+        status, body, _ = fetch(f"{base}/health/live")
+        assert status == 200
+        assert json.loads(body)["status"] == "ok"
+
+        # Readiness probe alias
+        status, body, _ = fetch(f"{base}/health/ready")
+        assert status == 200
+        assert json.loads(body)["status"] == "ready"
+
+        # Unauthenticated request to /metrics must be rejected
+        unauth_status, _, _ = fetch(f"{base}/metrics", api_key=None)
+        assert unauth_status == 401
+
+        # Unknown route must record to /unknown instead of leaking arbitrary path label
+        unknown_status, _, _ = fetch(f"{base}/nonexistent-route-path", api_key=None)
+        assert unknown_status == 404
+
+        # Send an authenticated chat completion request
+        req = {
+            "model": "smollm2-135m-xdna1",
+            "messages": [{"role": "user", "content": "Hello"}],
+            "max_tokens": 5,
+        }
+        status, _, _ = fetch(f"{base}/v1/chat/completions", req)
+        assert status == 200
+
+        # Fetch Prometheus metrics with valid bearer token
+        status, body, headers = fetch(f"{base}/metrics")
+        assert status == 200
+        content_type = headers.get("Content-Type", "")
+        assert "text/plain" in content_type
+        assert "version=0.0.4" in content_type
+        assert "# TYPE hawkpoint_api_requests_total counter" in body
+        assert 'hawkpoint_api_requests_total{endpoint="/v1/chat/completions",status="200"} 1' in body
+        assert 'hawkpoint_api_requests_total{endpoint="/unknown",status="404"} 1' in body
+        assert 'hawkpoint_api_requests_total{endpoint="/metrics",status="401"} 1' in body
+        assert "hawkpoint_api_active_requests 0" in body
+        assert "hawkpoint_worker_restarts_total 0" in body
+        assert 'hawkpoint_tokens_generated_total{model="smollm2-135m-xdna1"} 2' in body
+        assert 'hawkpoint_inference_duration_seconds_count{model="smollm2-135m-xdna1"} 1' in body
+        assert body.endswith("# EOF\n")
+    finally:
+        stop_server(server, thread)
+
+
 def main():
     """Validate CLI settings, create the worker and HTTP server, and serve traffic."""
     test_shutdown_deadline_cancels_worker()
@@ -991,6 +1170,9 @@ def main():
     test_worker_error_forces_restart()
     test_inference_error_recreates_worker()
     test_model_switch_releases_previous_decoder()
+    test_multiple_choices_generation()
+    test_completions_endpoint()
+    test_metrics_and_health_probes()
     print("PASS API security and protocol")
 
 

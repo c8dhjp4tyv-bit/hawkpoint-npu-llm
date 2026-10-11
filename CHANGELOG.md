@@ -1,7 +1,66 @@
 # Changelog
 
-## Unreleased
-
+- Add automated model quality, answer accuracy, and perplexity evaluation tool (`npu_llm/tools/eval_model.py`)
+  supporting multi-domain prompt benchmarks, per-token cross-entropy and perplexity calculation via token
+  logprobs, category breakdowns, quality SLA gates (`--min-accuracy`, `--max-perplexity`), and text/JSON/Markdown reports.
+- Add `inspect`, `benchmark`, and `eval` modes to `launcher.py` and interactive selector menu (options 1 through 7).
+- Add dedicated unit test suites `npu_llm/tests/test_eval_model.py` and `tests/test_launcher.py`.
+- Add `make eval` target to `Makefile` and include new test suites in CI workflow.
+- Require Bearer token authentication on OpenMetrics endpoint `GET /metrics` and declare security
+  requirement in OpenAPI 3.1.0 specification.
+- Explicitly reject unsupported `suffix` and unsupported `best_of` (`best_of != n`) in `/v1/completions`.
+- Add `render` and `video` groups to `compose.yaml` for host `/dev/accel` non-root container permissions.
+- Improve SVG architecture diagrams with channel routing detours avoiding intermediate GEMV tiles.
+- Add finite and positive validation for `margin_threshold` and fix text format file writing in offline harness.
+- Serve live OpenAPI 3.1.0 specification at `GET /openapi.json` and export static schema
+  at `docs/openapi.json` covering all authenticated completions, model discovery, probes, and telemetry.
+- Add zero-dependency Python API client demonstration (`examples/api_client_example.py`)
+  supporting real-time SSE streaming, TTFT/TPS calculation, text completions, and mock self-testing.
+- Add developer `Makefile` with canonical targets (`test`, `doctor`, `inspect`, `benchmark`,
+  `chat`, `api`, `openwebui`, `docker-build`, `lint`, and `clean`).
+- Add model inspection and validation tool (`npu_llm/tools/inspect_model.py`)
+  supporting parameter breakdown analysis, weight binary size and SHA-256 verification,
+  streaming memory bandwidth estimations, and text/JSON/Markdown reporting.
+- Add system preflight diagnostics doctor tool (`scripts/doctor.py`) and launcher integration
+  (`launcher.py doctor`) verifying Linux kernel, CPU vector extensions (AVX2), `/dev/accel`
+  permissions, `amdxdna` kernel module, XRT userspace libraries, and port availability
+  with actionable remediation guidance.
+- Add interactive and remote OpenAI HTTP API streaming client mode to `npu_llm/chat.py`
+  with automatic local API server discovery, live token streaming, latency and TTFT
+  telemetry, and interactive session commands (`/reset`, `/stats`, `/models`, `/exit`).
+- Add `chat` mode selection to `launcher.py` for direct interactive terminal chat sessions.
+- Add root informational endpoint `GET /` to `api_server.py` reporting service readiness
+  and discoverable endpoint route paths.
+- Add automated API benchmark tool (`scripts/benchmark_api.py`) measuring latency percentiles
+  (min, p50, p95, p99), streaming Time To First Token (TTFT), decode tokens/second,
+  Prometheus metrics deltas, and exporting text, JSON, and GitHub Markdown reports with SLA checks.
+- Add comprehensive Prometheus scrape configuration, alert rules, Kubernetes probe YAML
+  manifests, and API benchmarking guides to `docs/OPERATIONS.md`.
+- Add Prometheus / OpenMetrics monitoring endpoint (`GET /metrics`) tracking
+  total requests, active concurrent requests, generated and prompt token counters,
+  inference duration summaries, and worker restarts.
+- Add Kubernetes probe aliases (`GET /health/live` and `GET /health/ready`).
+- Add support and validation for `echo`, `suffix`, and `best_of` parameters in
+  OpenAI-compatible text completions (`POST /v1/completions`).
+- Add structured JSON (`--format json`) and terminal ASCII grid (`--format text`)
+  exports to the IRON AIE2 Array and ObjectFifo dataflow visualizer (`visualize_graph.py`).
+- Add Markdown summary table reporting (`--format markdown`) and reproducible
+  random seed control (`--seed`) to the offline cross-placement logit agreement harness.
+- Add OpenAI-compatible text completions endpoint (`POST /v1/completions`)
+  supporting raw string and array prompts with prompt window truncation
+  (`encode_prompt_window`) and direct text generation (`generate_text`).
+- Support multiple candidate choices generation (`n` parameter between 1 and 8)
+  for both `/v1/chat/completions` and `/v1/completions`, including non-streaming
+  and SSE streaming indexed choices.
+- Add containerized runtime environment via `Dockerfile` and multi-service
+  `compose.yaml` with hardware NPU accel device mapping and Open WebUI service orchestration.
+- Add IRON AIE2 Array and ObjectFifo dataflow visualizer tool
+  (`npu_llm/tools/visualize_graph.py`) exporting standalone responsive SVGs and
+  Graphviz DOT representations for SmolLM, Qwen2.5, and chunked decoders.
+- Add offline simulation and evaluation benchmark harness
+  (`tests/offline_benchmark_harness.py`) for teacher-forced cross-placement logit
+  agreement verification across CPU, GPU, and NPU without requiring physical hardware.
+- Integrate visualizer and offline benchmark harness test coverage into GitHub Actions CI.
 - Fix shutdown past the drain deadline by cancelling the worker independently
   of the generation lock; prevent queued work from restarting a closed engine.
 - Check quick-test model coverage against the real checkpoint catalog.

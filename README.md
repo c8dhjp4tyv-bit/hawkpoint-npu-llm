@@ -145,13 +145,18 @@ analysis](docs/PERFORMANCE-ANALYSIS.md).
 - A single-dispatch SmolLM decoder engine that streams weights over six
   parallel NPU channels
 - Configurable NPU/CPU layer offload for hybrid execution
-- OpenAI-compatible `GET /v1/models`
-- OpenAI-compatible `POST /v1/chat/completions`
-- Streaming chat completions over server-sent events
+- OpenAI-compatible `GET /v1/models` and `GET /v1/models/{model_id}`
+- OpenAI-compatible `POST /v1/chat/completions` and `POST /v1/completions`
+- Multiple candidate choices generation (`n` parameter up to 8)
+- Streaming chat and text completions over server-sent events
 - Temperature, top-k, top-p, penalty, and seed sampling (greedy by default)
 - Stop sequences and per-token log probabilities
 - Prompt-prefix reuse across turns, so a follow-up message only prefills its
   new tokens
+- Containerized runtime environment via Dockerfile and multi-service Docker Compose
+- Prometheus / OpenMetrics metrics endpoint (`GET /metrics`) and Kubernetes probe aliases (`/health/live`, `/health/ready`)
+- IRON AIE2 Array and ObjectFifo dataflow visualizer (SVG, DOT, JSON, and ASCII grid)
+- Offline cross-placement logit agreement simulation harness (with Markdown and JSON reporting)
 - One-command API or API + Open WebUI launcher
 - Weight converter and hardware component/acceptance tests
 - AIE2 C++ kernels and IRON graph definitions
@@ -264,6 +269,21 @@ python launcher.py api
 # API + Open WebUI: http://localhost:3000
 python launcher.py openwebui
 
+# Interactive terminal chat client
+python launcher.py chat
+
+# System preflight diagnostics: check driver, device nodes, permissions, XRT
+python launcher.py doctor
+
+# Model architecture, parameter breakdown, and checksum inspector
+python launcher.py inspect --models-dir npu_llm/models/SmolLM2-135M-Instruct-xdna1-w8a16
+
+# Automated API load and latency benchmark
+python launcher.py benchmark
+
+# Automated model quality, accuracy, and perplexity evaluation
+python launcher.py eval
+
 # Models stored on another disk
 python launcher.py openwebui --models-dir /path/to/storage
 
@@ -280,13 +300,26 @@ every installed checkpoint returned by `/v1/models`. Its data is kept in a
 Docker volume, and the launcher gives it the same randomly generated API key
 as the native server.
 
-Run the terminal chatbot:
+Run the interactive chatbot (supports both direct NPU execution and connecting to a running API server):
 
 ```bash
+# Direct NPU execution (or via launcher choice 3)
+python launcher.py chat
+
+# Or run npu_llm/chat.py directly:
 python npu_llm/chat.py
+
+# Connect to a running API server (e.g. localhost:8000 or remote host):
+python npu_llm/chat.py --api-url http://localhost:8000 --api-key $HAWKPOINT_API_KEY
 ```
 
-Example one-shot invocation:
+Interactive commands inside the chat session:
+- `/reset`: Clear conversation context and start fresh.
+- `/stats`: Display latency, tokens generated, decode throughput (tok/s), and TTFT.
+- `/models`: List models installed on the connected API server.
+- `/exit`: Terminate session.
+
+Example one-shot prompt invocation:
 
 ```bash
 python npu_llm/chat.py \
@@ -322,6 +355,18 @@ curl http://localhost:8000/v1/chat/completions \
   }'
 ```
 
+```bash
+curl http://localhost:8000/v1/completions \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $HAWKPOINT_API_KEY" \
+  -d '{
+    "model": "smollm2-135m-xdna1",
+    "prompt": "The primary mechanism of Rayleigh scattering is",
+    "max_tokens": 16,
+    "stream": false
+  }'
+```
+
 For streaming output, set `"stream": true`. Add
 `"stream_options": {"include_usage": true}` to receive a final chunk with
 `choices: []` and token counts in `usage`, immediately before `[DONE]`.
@@ -335,11 +380,15 @@ success `[DONE]` marker. Clients should treat a disconnected stream without
 
 `max_tokens` or its modern alias `max_completion_tokens` must be a positive
 JSON integer (then capped to the hardware context); supplying both is rejected.
-`n` must be integer `1`, and `stream` must be a JSON boolean.
+`n` can be an integer between `1` and `8` (default `1`) to generate multiple
+indexed candidate choices, and `stream` must be a JSON boolean.
+`echo` is accepted for `/v1/completions` (JSON boolean) to prepend the prompt
+to the resulting text. `suffix` is unsupported; a supplied `best_of` must be
+a JSON integer equal to `n`. Other values return `400` for text completions.
 `stream_options` is only accepted with streaming enabled. Invalid types return
 `400` before inference admission. Header and body reads are also bounded by
 `--request-timeout`; a stalled body receives `408` when the connection remains
-writable. Inference timeouts return `504` for non-streaming requests.
+`writable`. Inference timeouts return `504` for non-streaming requests.
 
 Responses include a unique `X-Request-ID`, `Cache-Control: no-store`, and
 `X-Content-Type-Options: nosniff`. Streaming responses additionally disable
@@ -353,10 +402,64 @@ which is particularly important under systemd and container supervisors.
 During shutdown, newly arriving completions receive `503` while already
 admitted inference drains for up to `--graceful-shutdown-timeout` seconds
 (130 by default, slightly longer than the request deadline).
-`GET /ready` switches to `503` immediately and reports `draining` plus the
+`GET /ready` (and `/health/ready`) switches to `503` immediately and reports `draining` plus the
 active request count, allowing a reverse proxy or service manager to stop
-routing new work before process exit. Access logs include the same request ID
+routing new work before process exit. `GET /health` (and `/health/live`) reports
+HTTP process liveness. Access logs include the same request ID
 returned to the client for correlation.
+
+### Telemetry and Monitoring
+
+The server exposes Prometheus and OpenMetrics compatible telemetry at `GET /metrics`:
+
+```bash
+curl http://localhost:8000/metrics \
+  -H "Authorization: Bearer $HAWKPOINT_API_KEY"
+```
+
+Exposed metrics include:
+- `hawkpoint_api_requests_total{endpoint,status}`: Total API requests segmented by route and status code.
+- `hawkpoint_api_active_requests`: Current number of in-flight inference requests.
+- `hawkpoint_tokens_generated_total{model}`: Cumulative tokens generated by model.
+- `hawkpoint_prompt_tokens_total{model}`: Cumulative prompt tokens ingested by model.
+- `hawkpoint_inference_duration_seconds`: Request latency summary (sum, count) per model.
+- `hawkpoint_worker_restarts_total`: Count of NPU worker process restarts.
+
+For Kubernetes deployments, configure container probes against `/health/live` (liveness)
+and `/health/ready` (readiness). A root informational endpoint `GET /` reports overall service readiness and available endpoint paths.
+
+### Automated API Benchmarking
+
+The project includes `scripts/benchmark_api.py` for measuring API server latency percentiles, Time To First Token (TTFT), and decode tokens/second:
+
+```bash
+# Benchmark local API server with 10 streaming requests:
+python scripts/benchmark_api.py --url http://127.0.0.1:8000 --requests 10 --concurrency 1
+
+# Generate a GitHub Markdown report and enforce a minimum throughput SLA:
+python scripts/benchmark_api.py --format markdown --output benchmark.md --min-tps 40.0
+```
+
+### Automated Model Quality & Perplexity Evaluation
+
+The project includes `npu_llm/tools/eval_model.py` for automated evaluation of model answer accuracy, negative log-likelihood cross-entropy loss, and perplexity (PPL) using token log probabilities:
+
+```bash
+# Evaluate active model on standard multi-domain QA, logic, and coding prompts:
+python npu_llm/tools/eval_model.py --api-url http://127.0.0.1:8000
+
+# Export structured Markdown report with quality and latency SLAs:
+python npu_llm/tools/eval_model.py --format markdown -o eval_report.md --min-accuracy 0.8 --max-perplexity 30.0
+
+# Run in-process self-test (used in CI without live hardware or server):
+python npu_llm/tools/eval_model.py --self-test
+```
+
+The evaluator reads `HAWKPOINT_API_KEY`. Authenticated remote URLs require HTTPS;
+loopback HTTP is supported, and authenticated redirects are rejected. Evaluation
+latency is total request time per generated token, not streaming TTFT. Missing
+logprobs appear as `null`/`N/A` and fail a requested perplexity SLA. Perplexity
+here describes generated tokens, not teacher-forced scoring of reference text.
 
 ### Sampling
 
@@ -503,6 +606,84 @@ localhost. To run the server directly with TLS, pass `--tls-cert CERT.pem
 --tls-key KEY.pem`. For non-local deployment, use a trusted TLS reverse proxy
 and keep the backend private.
 
+## Docker and Compose deployment
+
+Run the containerized API server with hardware NPU access (`/dev/accel/accel0` and `/dev/dri`).
+The host-networked API binds to `127.0.0.1:8000` by default. For remote access,
+place a trusted TLS reverse proxy in front of that loopback endpoint:
+
+```bash
+# Set a dedicated HAWKPOINT_API_KEY in your environment first.
+export HAWKPOINT_ACCEL_GID=$(stat -c '%g' /dev/accel/accel0)
+export HAWKPOINT_DRI_GID=$(stat -c '%g' /dev/dri/renderD128)
+
+# Build and run the standalone NPU API container
+docker compose --profile api up -d
+
+# Or run both the NPU API server and Open WebUI
+docker compose --profile full up -d
+```
+
+## Developer Makefile targets
+
+Standard development and operational tasks are accessible via `make`:
+
+```bash
+make help         # View all available targets
+make doctor       # Run preflight host environment diagnostics
+make test         # Run all unit, integration, and release gate test suites
+make api          # Launch the API server
+make chat         # Launch interactive terminal chat
+make benchmark    # Run automated API latency and TTFT benchmark suite
+make docker-build # Build local container image
+```
+
+## Python API client example
+
+A runnable zero-dependency client demonstration is available in `examples/api_client_example.py`:
+
+```bash
+# Run against a live server on localhost:8000
+python examples/api_client_example.py
+
+# Run standalone self-test with built-in mock server
+python examples/api_client_example.py --self-test
+```
+
+## OpenAPI 3.1.0 Specification
+
+The complete API schema is served live at `GET /openapi.json` and saved in `docs/openapi.json`. You can load this file directly into Swagger UI, Postman, Insomnia, or LangChain clients.
+
+## IRON AIE2 Array and Dataflow Visualizer
+
+Generate visual architecture and ObjectFifo dataflow representations for the single-dispatch SmolLM and Qwen2.5 engines:
+
+```bash
+# Export standalone responsive SVG diagrams
+python npu_llm/tools/visualize_graph.py --design smollm --format svg -o docs/images/smollm_engine_dataflow.svg
+python npu_llm/tools/visualize_graph.py --design qwen --format svg -o docs/images/qwen_engine_dataflow.svg
+
+# Export Graphviz DOT representations
+python npu_llm/tools/visualize_graph.py --design smollm --format dot -o docs/images/smollm_engine_dataflow.dot
+
+# Export structured JSON or inspect ASCII array grid in terminal
+python npu_llm/tools/visualize_graph.py --design smollm --format text
+python npu_llm/tools/visualize_graph.py --design smollm --format json -o docs/images/smollm_engine.json
+```
+
+## Offline cross-placement logit agreement harness
+
+Simulate teacher-forced multi-backend (CPU, GPU, NPU) logit distributions and evaluate agreement gates offline without requiring physical hardware:
+
+```bash
+# Run all scenarios with terminal summary
+python tests/offline_benchmark_harness.py --scenario all
+
+# Export formatted Markdown evaluation table or JSON report
+python tests/offline_benchmark_harness.py --scenario all --format markdown -o docs/reports/placement_agreement.md
+python tests/offline_benchmark_harness.py --scenario all --format json -o docs/reports/placement_agreement.json
+```
+
 ## Convert a model manually
 
 ```bash
@@ -516,6 +697,18 @@ approximately 1.7 GiB. The format retains BF16 decoder weights for numerically
 stable generation and per-output-channel INT8 weights for W8/BF16 kernels.
 The runtime verifies package sizes and SHA-256 hashes before memory mapping
 weights; packages created by an older converter must be reconverted.
+
+## Inspect and validate a model
+
+Inspect architecture parameters, parameter count breakdown, weight files integrity, and hardware bandwidth requirements for any converted checkpoint:
+
+```bash
+# Validate weights integrity, parameter breakdown, and hardware memory requirements:
+python npu_llm/tools/inspect_model.py npu_llm/models/SmolLM2-135M-Instruct-xdna1-w8a16
+
+# Verify all SHA-256 binary checksums and export GitHub Markdown:
+python npu_llm/tools/inspect_model.py npu_llm/models/SmolLM2-135M-Instruct-xdna1-w8a16 --verify-checksums --format markdown -o docs/reports/smollm2_spec.md
+```
 
 ## Tests
 
@@ -532,6 +725,8 @@ python npu_llm/tests/test_decode_loop.py
 python npu_llm/tests/test_engine_layout.py
 python npu_llm/tests/test_cpu_backend.py
 python tests/test_api_server.py
+python npu_llm/tests/test_visualizer.py
+python tests/offline_benchmark_harness.py
 ```
 
 `test_sampling.py`, `test_stopping.py`, `test_tokenizer.py`, and
@@ -676,8 +871,9 @@ generation.
 - **Greedy by default, with opt-in sampling**. `temperature`, `top_p`,
   `top_k`, `repetition_penalty`, `presence_penalty`, `frequency_penalty`, and
   `seed` are supported. A request that sets none of them decodes greedily and
-  reproduces the checked-in acceptance sequences exactly. Stop sequences and
-  `logprobs` are supported; `n > 1` and beam search are not.
+  reproduces the checked-in acceptance sequences exactly. Stop sequences,
+  `logprobs`, and multiple candidate choices (`1 <= n <= 8`) are supported;
+  beam search is not.
 
 ### Performance
 

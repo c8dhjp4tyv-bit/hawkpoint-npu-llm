@@ -205,6 +205,28 @@ def test_stream_detokenizer_flushes_an_incomplete_character(tokenizer):
     assert stream.flush() == ""
 
 
+def test_encode_prompt_window(tokenizer):
+    text = "The quick brown fox jumps over the lazy dog."
+    full_ids = tokenizer._encode_text(text)
+    assert len(full_ids) > 5
+
+    # Fits entirely
+    ids, truncated = tokenizer.encode_prompt_window(text, len(full_ids) + 5)
+    assert ids == full_ids
+    assert not truncated
+
+    # Exact fit
+    ids, truncated = tokenizer.encode_prompt_window(text, len(full_ids))
+    assert ids == full_ids
+    assert not truncated
+
+    # Truncated window keeps the latest suffix
+    budget = 4
+    ids, truncated = tokenizer.encode_prompt_window(text, budget)
+    assert ids == full_ids[-budget:]
+    assert truncated
+
+
 def main():
     tests = [
         value

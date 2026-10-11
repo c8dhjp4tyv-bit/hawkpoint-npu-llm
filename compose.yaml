@@ -1,4 +1,25 @@
 services:
+  npu-api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: hawkpoint-npu-api
+    restart: unless-stopped
+    network_mode: host
+    devices:
+      - /dev/accel/accel0:/dev/accel/accel0
+      - /dev/dri:/dev/dri
+    group_add:
+      - "${HAWKPOINT_ACCEL_GID:?Set HAWKPOINT_ACCEL_GID to the host accel device GID}"
+      - "${HAWKPOINT_DRI_GID:?Set HAWKPOINT_DRI_GID to the host DRI render device GID}"
+    environment:
+      - HAWKPOINT_API_KEY=${HAWKPOINT_API_KEY:?Set HAWKPOINT_API_KEY to a dedicated high-entropy key}
+    volumes:
+      - ./npu_llm/models:/app/models
+    profiles:
+      - full
+      - api
+
   open-webui:
     image: ghcr.io/open-webui/open-webui:v0.11.0@sha256:72c0ba641ba75e7aa52655cb242570906ececd09b1140fb736483038a22b3228
     container_name: hawkpoint-npu-open-webui
@@ -8,7 +29,7 @@ services:
       HOST: "127.0.0.1"
       PORT: "3000"
       OPENAI_API_BASE_URLS: "http://127.0.0.1:8000/v1"
-      OPENAI_API_KEYS: "${HAWKPOINT_API_KEY:?HAWKPOINT_API_KEY must be set}"
+      OPENAI_API_KEYS: "${HAWKPOINT_API_KEY:?Set HAWKPOINT_API_KEY to a dedicated high-entropy key}"
     volumes:
       - open-webui-data:/app/backend/data
 
