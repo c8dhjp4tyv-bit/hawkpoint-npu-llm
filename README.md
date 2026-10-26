@@ -902,8 +902,14 @@ generation.
 
 - Requires a working **XRT + firmware + amdxdna + MLIR-AIE combination**. The
   exact stack in `release-pins.json` is the reproducible release certificate,
-  not a runtime kernel pin. Run `python scripts/verify_hardware_versions.py`
-  for capability-based compatibility validation; the release workflow adds
+  not a runtime kernel pin. Run the capability-based compatibility check:
+
+  ```bash
+  python scripts/verify_hardware_versions.py \
+    --report /tmp/hawkpoint-hardware-compatibility.json
+  ```
+
+  The release workflow adds
   `--strict-release` to enforce the certified version strings as well. A
   compatible kernel/driver must still pass device open, hardware-context,
   buffer sync, xclbin load, and minimal kernel-submission checks.
