@@ -193,7 +193,9 @@ accepted.
 - Docker with Compose support, only for the Open WebUI option
 
 This project was validated with NPU firmware `1.5.5.391`. Driver, firmware,
-XRT, Peano, and MLIR-AIE versions must be mutually compatible.
+XRT, Peano, and MLIR-AIE versions must be mutually compatible. For failures
+observed on Ubuntu 24.04 with kernel 7.0, see
+[docs/OPERATIONS.md](docs/OPERATIONS.md#ubuntu-2404-with-kernel-70).
 
 ## Set up
 

@@ -49,6 +49,28 @@ curl --fail http://127.0.0.1:8000/ready
 Finally, make an authenticated model-list and small completion request. A
 successful health check alone does not prove that the NPU can execute.
 
+## Ubuntu 24.04 with kernel 7.0
+
+These observations come from one host and are independent compatibility
+evidence, not part of the certified stack in `release-pins.json`: Ubuntu
+24.04.5, kernel `7.0.0-38-generic` with its in-tree amdxdna driver, Ryzen 9
+PRO 8945HS. They do not establish an affected or fixed kernel-version range;
+qualify a host with the compatibility check above.
+
+- **Legacy firmware.** The host's installed `linux-firmware-amd-misc`
+  (`20240318.git3b128b60-0ubuntu3.1`) provided only the legacy
+  `amdnpu/1502_00/npu.sbin` (1.5.2.380) and no `npu_7.sbin`. `xrt-smi examine`
+  still worked, but the tested NPU execution attempts failed with
+  `Message callback ret -22` in `dmesg`. Upstream linux-firmware maps
+  `npu_7.sbin` to `npu.sbin.1.5.5.391`; installing that file as
+  `/lib/firmware/updates/amdnpu/1502_00/npu_7.sbin` and reloading the module
+  (`sudo rmmod amdxdna && sudo modprobe amdxdna`) fixed it.
+- **Command-buffer size.** XRT `8bf2fc4` allocates 4 MiB execution buffers;
+  this driver rejects command buffers above 32 KiB, so submissions using those
+  buffers failed with `Cmd bo is too big 4194304` in `dmesg`. An XRT build
+  with upstream commit `4f7258f0ac82` (which removes the 1024x size
+  multiplier) fixed it. The patched build still reports the `8bf2fc4` hash.
+
 ## Capacity and timeouts
 
 One physical NPU context serializes inference. Tune these controls together:
