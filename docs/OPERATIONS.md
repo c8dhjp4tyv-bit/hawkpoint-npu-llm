@@ -23,7 +23,8 @@ hardware acceptance evidence.
 Run compatibility checks before starting a newly provisioned host:
 
 ```bash
-python scripts/verify_hardware_versions.py
+python scripts/verify_hardware_versions.py \
+  --report /tmp/hawkpoint-hardware-compatibility.json
 ```
 
 Start with an explicit key and conservative admission settings:
