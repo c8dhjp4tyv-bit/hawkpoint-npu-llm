@@ -269,6 +269,8 @@ OPENAPI_SPEC = {
                                     "repetition_penalty": {"type": "number"},
                                     "logit_bias": {
                                         "type": "object",
+                                        "propertyNames": {"pattern": "^[0-9]+$"},
+                                        "maxProperties": 1024,
                                         "additionalProperties": {"type": "number", "minimum": -100, "maximum": 100},
                                         "description": "Per-token additive logit bias keyed by token id.",
                                     },
@@ -309,6 +311,8 @@ OPENAPI_SPEC = {
                                     "repetition_penalty": {"type": "number"},
                                     "logit_bias": {
                                         "type": "object",
+                                        "propertyNames": {"pattern": "^[0-9]+$"},
+                                        "maxProperties": 1024,
                                         "additionalProperties": {"type": "number", "minimum": -100, "maximum": 100},
                                         "description": "Per-token additive logit bias keyed by token id.",
                                     },

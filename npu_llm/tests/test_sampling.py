@@ -2,6 +2,7 @@
 """Host-side sampling tests. Pure NumPy: no NPU, no converted model."""
 
 from pathlib import Path
+import json
 import sys
 
 import numpy as np
@@ -221,10 +222,27 @@ def test_logit_bias_is_validated_and_round_trips():
     params = SamplingParams.from_request({"logit_bias": {"3": 1.5, "0": 0}})
     assert params.logit_bias == {3: 1.5}
     assert params.to_dict()["logit_bias"] == {3: 1.5}
+    assert json.loads(json.dumps(params.to_dict()))["logit_bias"] == {"3": 1.5}
     assert SamplingParams.from_dict(params.to_dict()) == params
     # A zero-only map is the same request as the greedy defaults.
     assert SamplingParams.build(logit_bias={"3": 0}) == GREEDY
     assert SamplingParams.build(logit_bias={}) == GREEDY
+    # A later duplicate key wins even when it disables the bias.
+    assert SamplingParams.build(logit_bias={"1": 100, "01": 0}).logit_bias == {}
+    assert SamplingParams.build(logit_bias={"1": 100, "01": 5}).logit_bias == {
+        1: 5.0
+    }
+    # Validation is not a one-time promise: the stored map is immutable.
+    for mutate in (
+        lambda: params.logit_bias.__setitem__(3, 9.0),
+        lambda: params.logit_bias.update({3: 9.0}),
+        lambda: params.logit_bias.pop(3),
+    ):
+        try:
+            mutate()
+        except TypeError:
+            continue
+        raise AssertionError("logit_bias accepted a post-validation mutation")
 
     rejected = [
         {"logit_bias": []},
@@ -235,6 +253,7 @@ def test_logit_bias_is_validated_and_round_trips():
         {"logit_bias": {True: 1}},
         {"logit_bias": {"1": 101}},
         {"logit_bias": {"1": float("nan")}},
+        {"logit_bias": {"1": 10**400}},
         {
             "logit_bias": {
                 str(index): 1.0
@@ -248,6 +267,18 @@ def test_logit_bias_is_validated_and_round_trips():
         except SamplingError:
             continue
         raise AssertionError(f"{request!r} was accepted")
+
+
+def test_out_of_vocabulary_bias_keeps_the_greedy_shortcut():
+    oov = SamplingParams.build(temperature=1.0, top_k=1, logit_bias={99: 10.0})
+    assert not oov.greedy
+    # Once the vocabulary is known, an ignored entry cannot reorder anything.
+    sampler = Sampler(oov, vocab_size=len(LOGITS))
+    assert sampler.greedy
+    assert sampler.select(LOGITS) == int(np.argmax(LOGITS))
+    assert sampler.stats()["mode"] == "greedy"
+    # Without a vocabulary the conservative answer is still "sampled".
+    assert not Sampler(oov).greedy
 
 
 def main():

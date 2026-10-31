@@ -94,6 +94,7 @@ class SplitCharacterTokenizer(FakeTokenizer):
 def build_decoder(prompt_ids, logits_for, *, context_length=64, tokenizer=None):
     """An NPUDecoder whose decode step is a pure function of the input token."""
     decoder = object.__new__(NPUDecoder)
+    decoder.model = types.SimpleNamespace(metadata={"vocab_size": VOCAB})
     decoder.context_length = context_length
     decoder.tokenizer = (tokenizer or FakeTokenizer)(prompt_ids)
     decoder.npu_layers = 0

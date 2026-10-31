@@ -1032,7 +1032,7 @@ class NPUDecoder:
             params = SamplingParams.from_dict(sampling)
         stop_matcher = StopMatcher(normalize_stop(stop))
         top_logprobs = normalize_logprobs(logprobs)
-        sampler = Sampler(params)
+        sampler = Sampler(params, vocab_size=self.model.metadata["vocab_size"])
         if getattr(self, "_profile_enabled", False):
             self._phase_totals = {}
         prompt_ids, truncation = self.tokenizer.encode_chat_window(
@@ -1219,7 +1219,7 @@ class NPUDecoder:
             params = SamplingParams.from_dict(sampling)
         stop_matcher = StopMatcher(normalize_stop(stop))
         top_logprobs = normalize_logprobs(logprobs)
-        sampler = Sampler(params)
+        sampler = Sampler(params, vocab_size=self.model.metadata["vocab_size"])
         if getattr(self, "_profile_enabled", False):
             self._phase_totals = {}
         prompt_ids, truncated = self.tokenizer.encode_prompt_window(

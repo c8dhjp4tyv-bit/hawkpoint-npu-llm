@@ -172,6 +172,10 @@
                   },
                   "logit_bias": {
                     "type": "object",
+                    "propertyNames": {
+                      "pattern": "^[0-9]+$"
+                    },
+                    "maxProperties": 1024,
                     "additionalProperties": {
                       "type": "number",
                       "minimum": -100,
@@ -264,6 +268,10 @@
                   },
                   "logit_bias": {
                     "type": "object",
+                    "propertyNames": {
+                      "pattern": "^[0-9]+$"
+                    },
+                    "maxProperties": 1024,
                     "additionalProperties": {
                       "type": "number",
                       "minimum": -100,
