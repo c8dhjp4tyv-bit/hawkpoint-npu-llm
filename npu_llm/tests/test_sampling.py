@@ -2,6 +2,7 @@
 """Host-side sampling tests. Pure NumPy: no NPU, no converted model."""
 
 from pathlib import Path
+import json
 import sys
 
 import numpy as np
@@ -12,9 +13,11 @@ sys.path.insert(0, str(ROOT))
 
 from runtime.sampling import (  # noqa: E402
     GREEDY,
+    MAX_LOGIT_BIAS_ENTRIES,
     Sampler,
     SamplingError,
     SamplingParams,
+    apply_logit_bias,
     apply_penalties,
     filter_top_k,
     filter_top_p,
@@ -196,6 +199,86 @@ def test_stats_report_the_effective_configuration():
     assert stats["seed"] == 5
     assert stats["temperature"] == 0.9
     assert stats["top_p"] == 0.8
+
+
+def test_logit_bias_reorders_greedy_selection():
+    forced = SamplingParams.build(logit_bias={3: 10.0})
+    assert not forced.greedy  # the raw argmax is no longer the selected token
+    assert forced.deterministic
+    assert Sampler(forced).select(LOGITS) == 3
+
+    banned = SamplingParams.build(logit_bias={1: -100.0})
+    assert Sampler(banned).select(LOGITS) == 3
+
+    biased = apply_logit_bias(LOGITS.copy(), {1: 2.0, 3: -1.0})
+    assert biased[1] == 5.0
+    assert biased[3] == 1.0
+    # Out-of-range ids never index from the end of the vector.
+    ignored = apply_logit_bias(LOGITS.copy(), {-1: 9.0, 99: 9.0})
+    assert ignored.tolist() == LOGITS.tolist()
+
+
+def test_logit_bias_is_validated_and_round_trips():
+    params = SamplingParams.from_request({"logit_bias": {"3": 1.5, "0": 0}})
+    assert params.logit_bias == {3: 1.5}
+    assert params.to_dict()["logit_bias"] == {3: 1.5}
+    assert json.loads(json.dumps(params.to_dict()))["logit_bias"] == {"3": 1.5}
+    assert SamplingParams.from_dict(params.to_dict()) == params
+    # A zero-only map is the same request as the greedy defaults.
+    assert SamplingParams.build(logit_bias={"3": 0}) == GREEDY
+    assert SamplingParams.build(logit_bias={}) == GREEDY
+    # A later duplicate key wins even when it disables the bias.
+    assert SamplingParams.build(logit_bias={"1": 100, "01": 0}).logit_bias == {}
+    assert SamplingParams.build(logit_bias={"1": 100, "01": 5}).logit_bias == {
+        1: 5.0
+    }
+    # Validation is not a one-time promise: the stored map is immutable.
+    for mutate in (
+        lambda: params.logit_bias.__setitem__(3, 9.0),
+        lambda: params.logit_bias.update({3: 9.0}),
+        lambda: params.logit_bias.pop(3),
+    ):
+        try:
+            mutate()
+        except TypeError:
+            continue
+        raise AssertionError("logit_bias accepted a post-validation mutation")
+
+    rejected = [
+        {"logit_bias": []},
+        {"logit_bias": "3"},
+        {"logit_bias": {"x": 1}},
+        {"logit_bias": {"1.0": 1}},
+        {"logit_bias": {"-1": 1}},
+        {"logit_bias": {True: 1}},
+        {"logit_bias": {"1": 101}},
+        {"logit_bias": {"1": float("nan")}},
+        {"logit_bias": {"1": 10**400}},
+        {
+            "logit_bias": {
+                str(index): 1.0
+                for index in range(MAX_LOGIT_BIAS_ENTRIES + 1)
+            }
+        },
+    ]
+    for request in rejected:
+        try:
+            SamplingParams.from_request(request)
+        except SamplingError:
+            continue
+        raise AssertionError(f"{request!r} was accepted")
+
+
+def test_out_of_vocabulary_bias_keeps_the_greedy_shortcut():
+    oov = SamplingParams.build(temperature=1.0, top_k=1, logit_bias={99: 10.0})
+    assert not oov.greedy
+    # Once the vocabulary is known, an ignored entry cannot reorder anything.
+    sampler = Sampler(oov, vocab_size=len(LOGITS))
+    assert sampler.greedy
+    assert sampler.select(LOGITS) == int(np.argmax(LOGITS))
+    assert sampler.stats()["mode"] == "greedy"
+    # Without a vocabulary the conservative answer is still "sampled".
+    assert not Sampler(oov).greedy
 
 
 def main():

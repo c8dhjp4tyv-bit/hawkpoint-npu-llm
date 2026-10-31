@@ -49,7 +49,7 @@ release gates are unaffected.
 `stop` (up to four strings, never emitted) and OpenAI-style `logprobs` /
 `top_logprobs` are supported by the runtime and the API.
 
-Still missing from the completion API: `n > 1` and beam search.
+Still missing from the completion API: beam search.
 
 ### Prompt-prefix reuse
 A prompt that starts with the tokens already in the K/V cache resumes prefill

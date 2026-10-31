@@ -8,16 +8,17 @@ tested without hardware.
 Selection order matches the convention used by llama.cpp and vLLM:
 
 1. repetition, presence, and frequency penalties over the token history,
-2. temperature scaling,
-3. top-k truncation,
-4. top-p (nucleus) truncation,
-5. a multinomial draw from the remaining renormalized distribution.
+2. the request's ``logit_bias`` adjustments,
+3. temperature scaling,
+4. top-k truncation,
+5. top-p (nucleus) truncation,
+6. a multinomial draw from the remaining renormalized distribution.
 
 ``temperature == 0`` means greedy decoding and is the default, so the existing
 exact-token release gates keep selecting ``argmax`` unless a request opts in.
 """
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 import secrets
 
 import numpy as np
@@ -31,17 +32,51 @@ TEMPERATURE_RANGE = (0.0, 2.0)
 TOP_P_RANGE = (0.0, 1.0)
 REPETITION_PENALTY_RANGE = (0.1, 2.0)
 PENALTY_RANGE = (-2.0, 2.0)
+LOGIT_BIAS_RANGE = (-100.0, 100.0)
 SEED_RANGE = (0, 2**63 - 1)
+# A request body is already size-capped, but a per-token bias loop runs once
+# per decode step; keep the map small enough that this cannot become a
+# denial-of-service vector.
+MAX_LOGIT_BIAS_ENTRIES = 1024
 
 
 class SamplingError(ValueError):
     """An invalid sampling parameter was supplied."""
 
 
+class _FrozenBias(dict):
+    """A validated ``logit_bias`` map that refuses further mutation.
+
+    ``dict`` stays the base class so ``dataclasses.asdict`` and ``json.dumps``
+    can serialize the field without a custom encoder. The immutable view keeps
+    a caller from writing a NaN or an out-of-range value after validation.
+    """
+
+    def _read_only(self, *args, **kwargs):
+        raise TypeError("logit_bias is immutable")
+
+    __setitem__ = _read_only
+    __delitem__ = _read_only
+    clear = _read_only
+    pop = _read_only
+    popitem = _read_only
+    setdefault = _read_only
+    update = _read_only
+
+    def __copy__(self):
+        return self
+
+    def __deepcopy__(self, memo):
+        return self
+
+
 def _number(value, name):
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise SamplingError(f"{name} must be a number")
-    value = float(value)
+    try:
+        value = float(value)
+    except OverflowError:
+        raise SamplingError(f"{name} must be finite") from None
     if not np.isfinite(value):
         raise SamplingError(f"{name} must be finite")
     return value
@@ -58,6 +93,51 @@ def _bounded(value, name, bounds, *, exclusive_low=False):
     return value
 
 
+def _normalize_logit_bias(value):
+    """Validate an OpenAI ``logit_bias`` map and return ``{token_id: bias}``.
+
+    JSON object keys are always strings, while callers that build parameters
+    directly use integers. Both forms are accepted, normalized to integers, and
+    a bias of exactly zero is dropped so an all-zero map still compares equal to
+    the greedy defaults.
+    """
+    if value is None:
+        return _FrozenBias()
+    if not isinstance(value, dict):
+        raise SamplingError("logit_bias must be an object")
+    if len(value) > MAX_LOGIT_BIAS_ENTRIES:
+        raise SamplingError(
+            f"logit_bias accepts at most {MAX_LOGIT_BIAS_ENTRIES} entries"
+        )
+    normalized = {}
+    for key, raw_bias in value.items():
+        if isinstance(key, bool):
+            raise SamplingError("logit_bias keys must be token ids")
+        if isinstance(key, int):
+            token_id = key
+        elif isinstance(key, str):
+            if not key.isascii() or not key.isdigit():
+                raise SamplingError(
+                    f"logit_bias key {key!r} is not a token id"
+                )
+            token_id = int(key, 10)
+        else:
+            raise SamplingError("logit_bias keys must be token ids")
+        if token_id < 0:
+            raise SamplingError("logit_bias token ids cannot be negative")
+        bias = _bounded(
+            raw_bias, f"logit_bias[{token_id}]", LOGIT_BIAS_RANGE
+        )
+        if bias != 0.0:
+            normalized[token_id] = bias
+        else:
+            # A later duplicate key that normalizes to the same token id wins
+            # even when its value is zero, so an explicit no-op removes the
+            # earlier entry instead of silently keeping it.
+            normalized.pop(token_id, None)
+    return _FrozenBias(normalized)
+
+
 @dataclass(frozen=True)
 class SamplingParams:
     """Validated sampling configuration for one completion request."""
@@ -68,21 +148,45 @@ class SamplingParams:
     repetition_penalty: float = 1.0
     presence_penalty: float = 0.0
     frequency_penalty: float = 0.0
+    logit_bias: dict[int, float] = field(default_factory=_FrozenBias)
     seed: int | None = None
+
+    def __post_init__(self):
+        # Direct construction bypasses ``build``; normalize here as well so a
+        # ``SamplingParams`` instance is always validated and immutable.
+        object.__setattr__(
+            self, "logit_bias", _normalize_logit_bias(self.logit_bias)
+        )
+
+    def _reorder_free(self):
+        """True when nothing before top-k/top-p can change the logit order."""
+        return (
+            self.repetition_penalty == 1.0
+            and self.presence_penalty == 0.0
+            and self.frequency_penalty == 0.0
+            and (self.temperature == 0.0 or self.top_k == 1)
+        )
 
     @property
     def greedy(self):
         """True when the parameters cannot change the argmax selection.
 
         ``top_k == 1`` collapses the candidate set to the highest-scoring token,
-        but only when no penalty can reorder the logits first.
+        but only when no penalty or logit bias can reorder the logits first.
         """
-        penalized = (
-            self.repetition_penalty != 1.0
-            or self.presence_penalty != 0.0
-            or self.frequency_penalty != 0.0
+        return self._reorder_free() and not self.logit_bias
+
+    def greedy_for(self, vocab_size):
+        """Like :attr:`greedy`, ignoring bias entries outside the vocabulary.
+
+        ``apply_logit_bias`` skips out-of-range token ids, so a map that only
+        names such ids cannot reorder anything and must keep the argmax path.
+        """
+        if not self._reorder_free():
+            return False
+        return not any(
+            0 <= token_id < vocab_size for token_id in self.logit_bias
         )
-        return not penalized and (self.temperature == 0.0 or self.top_k == 1)
 
     @property
     def deterministic(self):
@@ -120,6 +224,7 @@ class SamplingParams:
         repetition_penalty=None,
         presence_penalty=None,
         frequency_penalty=None,
+        logit_bias=None,
         seed=None,
     ):
         """Validate raw request values, treating ``None`` as "use the default"."""
@@ -169,6 +274,7 @@ class SamplingParams:
             repetition_penalty=repetition_penalty,
             presence_penalty=presence_penalty,
             frequency_penalty=frequency_penalty,
+            logit_bias=logit_bias,
             seed=seed,
         )
 
@@ -182,6 +288,7 @@ class SamplingParams:
             repetition_penalty=request.get("repetition_penalty"),
             presence_penalty=request.get("presence_penalty"),
             frequency_penalty=request.get("frequency_penalty"),
+            logit_bias=request.get("logit_bias"),
             seed=request.get("seed"),
         )
 
@@ -226,6 +333,23 @@ def apply_penalties(logits, history, params):
     selected = selected - params.frequency_penalty * counts
     selected = selected - params.presence_penalty
     logits[tokens] = selected
+    return logits
+
+
+def apply_logit_bias(logits, logit_bias):
+    """Add the request's per-token bias to ``logits`` in place.
+
+    OpenAI semantics are a plain addition to the logit, so a bias of ``-100``
+    effectively bans a token and ``+100`` forces it. Token ids outside the
+    model vocabulary are ignored rather than wrapping through negative indexing
+    or raising, matching how penalties treat out-of-range history.
+    """
+    if not logit_bias:
+        return logits
+    for token_id, bias in logit_bias.items():
+        token_id = int(token_id)
+        if 0 <= token_id < logits.shape[0]:
+            logits[token_id] += bias
     return logits
 
 
@@ -279,23 +403,27 @@ class Sampler:
     reports the seed it actually used.
     """
 
-    def __init__(self, params=GREEDY):
+    def __init__(self, params=GREEDY, vocab_size=None):
         self.params = params
+        self.vocab_size = vocab_size
         self.seed = params.seed
-        if not params.greedy and self.seed is None:
+        if not self.greedy and self.seed is None:
             self.seed = secrets.randbelow(SEED_RANGE[1] + 1)
-        self._rng = None if params.greedy else np.random.default_rng(self.seed)
+        self._rng = None if self.greedy else np.random.default_rng(self.seed)
 
     @property
     def greedy(self):
-        return self.params.greedy
+        if self.vocab_size is None:
+            return self.params.greedy
+        return self.params.greedy_for(self.vocab_size)
 
     def select(self, logits, history=()):
         """Return the next token id for ``logits`` given the tokens so far."""
         scores = np.asarray(logits, dtype=np.float32)
-        if self.params.greedy:
+        if self.greedy:
             return int(np.argmax(scores))
         scores = apply_penalties(scores.copy(), history, self.params)
+        scores = apply_logit_bias(scores, self.params.logit_bias)
         if self.params.temperature == 0.0:
             return int(np.argmax(scores))
         scores = scores / self.params.temperature
@@ -310,7 +438,7 @@ class Sampler:
     def stats(self):
         """Sampling metadata reported alongside generation statistics."""
         return {
-            "mode": "greedy" if self.params.greedy else "sampled",
+            "mode": "greedy" if self.greedy else "sampled",
             "seed": self.seed,
             **self.params.to_dict(),
         }

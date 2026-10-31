@@ -47,6 +47,7 @@ def stream_chat_api(
             "repetition_penalty",
             "presence_penalty",
             "frequency_penalty",
+            "logit_bias",
             "seed",
         ):
             if key in params_dict:
@@ -134,6 +135,23 @@ def list_api_models(base_url: str, api_key: str | None) -> list[str]:
         return []
 
 
+def parse_logit_bias(values):
+    """Parse repeated ``TOKEN=BIAS`` CLI options into a ``logit_bias`` map.
+
+    Token-id and range validation stays in :class:`SamplingParams`, so the CLI
+    and HTTP API reject the same values with the same messages.
+    """
+    if not values:
+        return None
+    parsed = {}
+    for item in values:
+        token, separator, bias = item.partition("=")
+        if not separator or not token:
+            raise ValueError(f"logit bias must be TOKEN=BIAS: {item!r}")
+        parsed[token] = float(bias)
+    return parsed
+
+
 def is_local_api_available(url: str = "http://127.0.0.1:8000") -> bool:
     """Check if the local API server responds to health checks."""
     try:
@@ -177,6 +195,12 @@ def main(argv: list[str] | None = None) -> int:
     sampling.add_argument("--presence-penalty", type=float)
     sampling.add_argument("--frequency-penalty", type=float)
     sampling.add_argument(
+        "--logit-bias",
+        action="append",
+        metavar="TOKEN=BIAS",
+        help="per-token additive bias in -100..100; may be repeated",
+    )
+    sampling.add_argument(
         "--seed",
         type=int,
         help="reproduce a sampled run; ignored when decoding greedily",
@@ -191,6 +215,7 @@ def main(argv: list[str] | None = None) -> int:
             repetition_penalty=args.repetition_penalty,
             presence_penalty=args.presence_penalty,
             frequency_penalty=args.frequency_penalty,
+            logit_bias=parse_logit_bias(args.logit_bias),
             seed=args.seed,
         )
     except ValueError as exc:

@@ -94,6 +94,7 @@ class SplitCharacterTokenizer(FakeTokenizer):
 def build_decoder(prompt_ids, logits_for, *, context_length=64, tokenizer=None):
     """An NPUDecoder whose decode step is a pure function of the input token."""
     decoder = object.__new__(NPUDecoder)
+    decoder.model = types.SimpleNamespace(metadata={"vocab_size": VOCAB})
     decoder.context_length = context_length
     decoder.tokenizer = (tokenizer or FakeTokenizer)(prompt_ids)
     decoder.npu_layers = 0
@@ -215,6 +216,27 @@ def test_repetition_penalty_sees_prompt_and_generated_history():
         sampling=SamplingParams.build(repetition_penalty=2.0),
     )
     assert prompt_penalized["generated_token_ids"] == [5]
+
+
+def test_logit_bias_reaches_the_decode_loop():
+    # Token 4 wins on raw logits; a bias on token 6 must override it even
+    # though the request stays deterministic at the default temperature.
+    def sticky(token_id):
+        logits = np.zeros(VOCAB, dtype=np.float32)
+        logits[4] = 4.0
+        logits[6] = 1.0
+        return logits
+
+    _, greedy = run(build_decoder([1], sticky), max_new_tokens=2)
+    assert greedy["generated_token_ids"] == [4, 4]
+
+    _, biased = run(
+        build_decoder([1], sticky),
+        max_new_tokens=2,
+        sampling=SamplingParams.build(logit_bias={6: 10.0}),
+    )
+    assert biased["generated_token_ids"] == [6, 6]
+    assert biased["sampling"]["logit_bias"] == {6: 10.0}
 
 
 def test_eos_stops_a_sampled_generation():

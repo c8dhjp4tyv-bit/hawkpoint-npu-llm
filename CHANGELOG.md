@@ -1,5 +1,13 @@
 # Changelog
 
+- Add OpenAI-compatible `logit_bias` support to the sampling runtime, both
+  completion endpoints, and the terminal chat (`--logit-bias TOKEN=BIAS`): a
+  per-token additive bias in `-100`–`100` (at most 1024 entries) applied after
+  penalties and before temperature, so biased requests stay deterministic at
+  `temperature: 0`. Invalid maps are rejected with `400 invalid_request_error`
+  before inference admission, and the live OpenAPI schema plus
+  `docs/openapi.json` document the field.
+
 - Add automated model quality, answer accuracy, and perplexity evaluation tool (`npu_llm/tools/eval_model.py`)
   supporting multi-domain prompt benchmarks, per-token cross-entropy and perplexity calculation via token
   logprobs, category breakdowns, quality SLA gates (`--min-accuracy`, `--max-perplexity`), and text/JSON/Markdown reports.
