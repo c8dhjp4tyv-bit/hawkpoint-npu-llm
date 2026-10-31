@@ -12,9 +12,11 @@ sys.path.insert(0, str(ROOT))
 
 from runtime.sampling import (  # noqa: E402
     GREEDY,
+    MAX_LOGIT_BIAS_ENTRIES,
     Sampler,
     SamplingError,
     SamplingParams,
+    apply_logit_bias,
     apply_penalties,
     filter_top_k,
     filter_top_p,
@@ -196,6 +198,56 @@ def test_stats_report_the_effective_configuration():
     assert stats["seed"] == 5
     assert stats["temperature"] == 0.9
     assert stats["top_p"] == 0.8
+
+
+def test_logit_bias_reorders_greedy_selection():
+    forced = SamplingParams.build(logit_bias={3: 10.0})
+    assert not forced.greedy  # the raw argmax is no longer the selected token
+    assert forced.deterministic
+    assert Sampler(forced).select(LOGITS) == 3
+
+    banned = SamplingParams.build(logit_bias={1: -100.0})
+    assert Sampler(banned).select(LOGITS) == 3
+
+    biased = apply_logit_bias(LOGITS.copy(), {1: 2.0, 3: -1.0})
+    assert biased[1] == 5.0
+    assert biased[3] == 1.0
+    # Out-of-range ids never index from the end of the vector.
+    ignored = apply_logit_bias(LOGITS.copy(), {-1: 9.0, 99: 9.0})
+    assert ignored.tolist() == LOGITS.tolist()
+
+
+def test_logit_bias_is_validated_and_round_trips():
+    params = SamplingParams.from_request({"logit_bias": {"3": 1.5, "0": 0}})
+    assert params.logit_bias == {3: 1.5}
+    assert params.to_dict()["logit_bias"] == {3: 1.5}
+    assert SamplingParams.from_dict(params.to_dict()) == params
+    # A zero-only map is the same request as the greedy defaults.
+    assert SamplingParams.build(logit_bias={"3": 0}) == GREEDY
+    assert SamplingParams.build(logit_bias={}) == GREEDY
+
+    rejected = [
+        {"logit_bias": []},
+        {"logit_bias": "3"},
+        {"logit_bias": {"x": 1}},
+        {"logit_bias": {"1.0": 1}},
+        {"logit_bias": {"-1": 1}},
+        {"logit_bias": {True: 1}},
+        {"logit_bias": {"1": 101}},
+        {"logit_bias": {"1": float("nan")}},
+        {
+            "logit_bias": {
+                str(index): 1.0
+                for index in range(MAX_LOGIT_BIAS_ENTRIES + 1)
+            }
+        },
+    ]
+    for request in rejected:
+        try:
+            SamplingParams.from_request(request)
+        except SamplingError:
+            continue
+        raise AssertionError(f"{request!r} was accepted")
 
 
 def main():

@@ -522,6 +522,18 @@ def test_sampling_parameters_reach_the_decoder():
         assert forwarded["repetition_penalty"] == 1.0
         assert json.loads(body)["x_hawkpoint_stats"]["sampling"] == forwarded
 
+        biased = payload()
+        biased["logit_bias"] = {"1": 5.0, "2": -5.0}
+        status, body, _ = fetch(f"{base}/v1/chat/completions", biased)
+        assert status == 200
+        forwarded = decoder.calls[-1]
+        assert forwarded["logit_bias"] == {1: 5.0, 2: -5.0}
+        # Token ids cross JSON as strings and are normalized to integers.
+        assert (
+            json.loads(body)["x_hawkpoint_stats"]["sampling"]["logit_bias"]
+            == {"1": 5.0, "2": -5.0}
+        )
+
         # Streaming takes the same path.
         streaming = payload()
         streaming.update({"stream": True, "temperature": 1.0})
@@ -544,6 +556,10 @@ def test_sampling_parameters_reach_the_decoder():
             {"top_k": -3},
             {"repetition_penalty": 0},
             {"presence_penalty": 99},
+            {"logit_bias": "nope"},
+            {"logit_bias": {"x": 1}},
+            {"logit_bias": {"1": 101}},
+            {"logit_bias": {"-1": 1}},
             {"seed": -1},
             {"n": 0},
             {"n": 9},

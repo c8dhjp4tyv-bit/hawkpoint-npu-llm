@@ -267,6 +267,11 @@ OPENAPI_SPEC = {
                                     "temperature": {"type": "number"},
                                     "top_p": {"type": "number"},
                                     "repetition_penalty": {"type": "number"},
+                                    "logit_bias": {
+                                        "type": "object",
+                                        "additionalProperties": {"type": "number", "minimum": -100, "maximum": 100},
+                                        "description": "Per-token additive logit bias keyed by token id.",
+                                    },
                                     "seed": {"type": "integer"},
                                     "n": {"type": "integer", "default": 1},
                                     "stream_options": {"type": "object"},
@@ -302,6 +307,11 @@ OPENAPI_SPEC = {
                                     "temperature": {"type": "number"},
                                     "top_p": {"type": "number"},
                                     "repetition_penalty": {"type": "number"},
+                                    "logit_bias": {
+                                        "type": "object",
+                                        "additionalProperties": {"type": "number", "minimum": -100, "maximum": 100},
+                                        "description": "Per-token additive logit bias keyed by token id.",
+                                    },
                                     "seed": {"type": "integer"},
                                     "n": {"type": "integer", "default": 1},
                                     "echo": {"type": "boolean", "default": False},

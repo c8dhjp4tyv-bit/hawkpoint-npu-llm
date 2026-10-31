@@ -477,12 +477,13 @@ sequences intact.
 | `repetition_penalty` | `1.0` | `0.1`–`2.0` |
 | `presence_penalty` | `0` | `-2.0`–`2.0` |
 | `frequency_penalty` | `0` | `-2.0`–`2.0` |
+| `logit_bias` | `{}` | token id → `-100`–`100`, at most 1024 entries |
 | `seed` | none | `0`–`2^63 - 1` |
 
-Filters are applied in the order penalties, temperature, `top_k`, `top_p`, and
-then a multinomial draw. Penalties are scored over the prompt tokens as well as
-the generated ones. An out-of-range value is rejected with `400
-invalid_request_error` and never reaches the NPU worker.
+Filters are applied in the order penalties, `logit_bias`, temperature, `top_k`,
+`top_p`, and then a multinomial draw. Penalties are scored over the prompt
+tokens as well as the generated ones. An out-of-range value is rejected with
+`400 invalid_request_error` and never reaches the NPU worker.
 
 ```bash
 curl http://localhost:8000/v1/chat/completions \
@@ -504,6 +505,13 @@ sampled request draws a seed and reports it, so a run can be replayed:
 `x_hawkpoint_stats.sampling` carries the effective mode, seed, and every
 resolved parameter.
 
+`logit_bias` maps token ids to an additive bias, using OpenAI's semantics: a
+bias of `-100` effectively bans a token and `+100` forces it. JSON keys are
+token-id strings; they are normalized to integers and validated before
+admission. Bias is applied after penalties and before temperature, so a biased
+request still selects the biased token with the default `temperature: 0`.
+Token ids outside the model vocabulary are ignored.
+
 ### Stop sequences and log probabilities
 
 `stop` accepts a string or up to four strings. Generation ends as soon as the
@@ -514,7 +522,8 @@ become a stop sequence.
 `logprobs: true` returns OpenAI-style `choices[].logprobs.content` entries
 (`token`, `logprob`, `bytes`, `top_logprobs`); `top_logprobs` (`0`–`20`) sets
 how many alternatives each entry lists. Values come from the model's raw
-distribution, before penalties, temperature, and top-k/top-p filtering.
+distribution, before penalties, `logit_bias`, temperature, and top-k/top-p
+filtering.
 Requesting log probabilities never changes which tokens are selected.
 
 ```bash
@@ -551,6 +560,9 @@ python npu_llm/chat.py \
   --prompt "Write one sentence about rain." \
   --temperature 0.8 --top-p 0.95 --repetition-penalty 1.1 --seed 1234
 ```
+
+`--logit-bias TOKEN=BIAS` may be repeated and uses the same token-id and range
+validation as the HTTP API, for example `--logit-bias 42=-100`.
 
 Select another installed model by changing the request's `model` field:
 
@@ -871,11 +883,11 @@ generation.
   SmolLM2-360M, SmolLM2-1.7B, larger Qwen variants, and non-Llama architectures
   fail at conversion time, not silently at runtime.
 - **Greedy by default, with opt-in sampling**. `temperature`, `top_p`,
-  `top_k`, `repetition_penalty`, `presence_penalty`, `frequency_penalty`, and
-  `seed` are supported. A request that sets none of them decodes greedily and
-  reproduces the checked-in acceptance sequences exactly. Stop sequences,
-  `logprobs`, and multiple candidate choices (`1 <= n <= 8`) are supported;
-  beam search is not.
+  `top_k`, `repetition_penalty`, `presence_penalty`, `frequency_penalty`,
+  `logit_bias`, and `seed` are supported. A request that sets none of them
+  decodes greedily and reproduces the checked-in acceptance sequences exactly.
+  Stop sequences, `logprobs`, and multiple candidate choices (`1 <= n <= 8`)
+  are supported; beam search is not.
 
 ### Performance
 

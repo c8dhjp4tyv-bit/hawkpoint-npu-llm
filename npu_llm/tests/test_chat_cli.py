@@ -13,7 +13,13 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "npu_llm"))
 
-from npu_llm.chat import is_local_api_available, list_api_models, main, stream_chat_api  # noqa: E402
+from npu_llm.chat import (  # noqa: E402
+    is_local_api_available,
+    list_api_models,
+    main,
+    parse_logit_bias,
+    stream_chat_api,
+)
 from runtime.sampling import SamplingParams  # noqa: E402
 
 
@@ -112,6 +118,17 @@ def test_is_local_api_available():
         server.shutdown()
 
 
+def test_parse_logit_bias():
+    assert parse_logit_bias(None) is None
+    assert parse_logit_bias(["1=5", "2=-100"]) == {"1": 5.0, "2": -100.0}
+    for invalid in (["1"], ["=1"], ["1="], ["token=high"]):
+        try:
+            parse_logit_bias(invalid)
+        except ValueError:
+            continue
+        raise AssertionError(f"{invalid!r} was accepted")
+
+
 def test_stream_chat_api():
     server, base_url = run_mock_server()
     try:
@@ -164,6 +181,7 @@ def test_main_cli_single_prompt(capsys=None):
 if __name__ == "__main__":
     test_list_api_models()
     test_is_local_api_available()
+    test_parse_logit_bias()
     test_stream_chat_api()
     test_main_cli_single_prompt()
-    print("PASS 4 chat CLI tests")
+    print("PASS 5 chat CLI tests")

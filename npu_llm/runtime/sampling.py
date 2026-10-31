@@ -8,16 +8,17 @@ tested without hardware.
 Selection order matches the convention used by llama.cpp and vLLM:
 
 1. repetition, presence, and frequency penalties over the token history,
-2. temperature scaling,
-3. top-k truncation,
-4. top-p (nucleus) truncation,
-5. a multinomial draw from the remaining renormalized distribution.
+2. the request's ``logit_bias`` adjustments,
+3. temperature scaling,
+4. top-k truncation,
+5. top-p (nucleus) truncation,
+6. a multinomial draw from the remaining renormalized distribution.
 
 ``temperature == 0`` means greedy decoding and is the default, so the existing
 exact-token release gates keep selecting ``argmax`` unless a request opts in.
 """
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 import secrets
 
 import numpy as np
@@ -31,7 +32,12 @@ TEMPERATURE_RANGE = (0.0, 2.0)
 TOP_P_RANGE = (0.0, 1.0)
 REPETITION_PENALTY_RANGE = (0.1, 2.0)
 PENALTY_RANGE = (-2.0, 2.0)
+LOGIT_BIAS_RANGE = (-100.0, 100.0)
 SEED_RANGE = (0, 2**63 - 1)
+# A request body is already size-capped, but a per-token bias loop runs once
+# per decode step; keep the map small enough that this cannot become a
+# denial-of-service vector.
+MAX_LOGIT_BIAS_ENTRIES = 1024
 
 
 class SamplingError(ValueError):
@@ -58,6 +64,46 @@ def _bounded(value, name, bounds, *, exclusive_low=False):
     return value
 
 
+def _normalize_logit_bias(value):
+    """Validate an OpenAI ``logit_bias`` map and return ``{token_id: bias}``.
+
+    JSON object keys are always strings, while callers that build parameters
+    directly use integers. Both forms are accepted, normalized to integers, and
+    a bias of exactly zero is dropped so an all-zero map still compares equal to
+    the greedy defaults.
+    """
+    if value is None:
+        return {}
+    if not isinstance(value, dict):
+        raise SamplingError("logit_bias must be an object")
+    if len(value) > MAX_LOGIT_BIAS_ENTRIES:
+        raise SamplingError(
+            f"logit_bias accepts at most {MAX_LOGIT_BIAS_ENTRIES} entries"
+        )
+    normalized = {}
+    for key, raw_bias in value.items():
+        if isinstance(key, bool):
+            raise SamplingError("logit_bias keys must be token ids")
+        if isinstance(key, int):
+            token_id = key
+        elif isinstance(key, str):
+            if not key.isascii() or not key.isdigit():
+                raise SamplingError(
+                    f"logit_bias key {key!r} is not a token id"
+                )
+            token_id = int(key, 10)
+        else:
+            raise SamplingError("logit_bias keys must be token ids")
+        if token_id < 0:
+            raise SamplingError("logit_bias token ids cannot be negative")
+        bias = _bounded(
+            raw_bias, f"logit_bias[{token_id}]", LOGIT_BIAS_RANGE
+        )
+        if bias != 0.0:
+            normalized[token_id] = bias
+    return normalized
+
+
 @dataclass(frozen=True)
 class SamplingParams:
     """Validated sampling configuration for one completion request."""
@@ -68,6 +114,7 @@ class SamplingParams:
     repetition_penalty: float = 1.0
     presence_penalty: float = 0.0
     frequency_penalty: float = 0.0
+    logit_bias: dict[int, float] = field(default_factory=dict)
     seed: int | None = None
 
     @property
@@ -75,14 +122,18 @@ class SamplingParams:
         """True when the parameters cannot change the argmax selection.
 
         ``top_k == 1`` collapses the candidate set to the highest-scoring token,
-        but only when no penalty can reorder the logits first.
+        but only when no penalty or logit bias can reorder the logits first.
         """
         penalized = (
             self.repetition_penalty != 1.0
             or self.presence_penalty != 0.0
             or self.frequency_penalty != 0.0
         )
-        return not penalized and (self.temperature == 0.0 or self.top_k == 1)
+        return (
+            not penalized
+            and not self.logit_bias
+            and (self.temperature == 0.0 or self.top_k == 1)
+        )
 
     @property
     def deterministic(self):
@@ -120,6 +171,7 @@ class SamplingParams:
         repetition_penalty=None,
         presence_penalty=None,
         frequency_penalty=None,
+        logit_bias=None,
         seed=None,
     ):
         """Validate raw request values, treating ``None`` as "use the default"."""
@@ -155,6 +207,7 @@ class SamplingParams:
             if frequency_penalty is None
             else _bounded(frequency_penalty, "frequency_penalty", PENALTY_RANGE)
         )
+        logit_bias = _normalize_logit_bias(logit_bias)
         if seed is not None:
             if isinstance(seed, bool) or not isinstance(seed, int):
                 raise SamplingError("seed must be an integer")
@@ -169,6 +222,7 @@ class SamplingParams:
             repetition_penalty=repetition_penalty,
             presence_penalty=presence_penalty,
             frequency_penalty=frequency_penalty,
+            logit_bias=logit_bias,
             seed=seed,
         )
 
@@ -182,6 +236,7 @@ class SamplingParams:
             repetition_penalty=request.get("repetition_penalty"),
             presence_penalty=request.get("presence_penalty"),
             frequency_penalty=request.get("frequency_penalty"),
+            logit_bias=request.get("logit_bias"),
             seed=request.get("seed"),
         )
 
@@ -226,6 +281,23 @@ def apply_penalties(logits, history, params):
     selected = selected - params.frequency_penalty * counts
     selected = selected - params.presence_penalty
     logits[tokens] = selected
+    return logits
+
+
+def apply_logit_bias(logits, logit_bias):
+    """Add the request's per-token bias to ``logits`` in place.
+
+    OpenAI semantics are a plain addition to the logit, so a bias of ``-100``
+    effectively bans a token and ``+100`` forces it. Token ids outside the
+    model vocabulary are ignored rather than wrapping through negative indexing
+    or raising, matching how penalties treat out-of-range history.
+    """
+    if not logit_bias:
+        return logits
+    for token_id, bias in logit_bias.items():
+        token_id = int(token_id)
+        if 0 <= token_id < logits.shape[0]:
+            logits[token_id] += bias
     return logits
 
 
@@ -296,6 +368,7 @@ class Sampler:
         if self.params.greedy:
             return int(np.argmax(scores))
         scores = apply_penalties(scores.copy(), history, self.params)
+        scores = apply_logit_bias(scores, self.params.logit_bias)
         if self.params.temperature == 0.0:
             return int(np.argmax(scores))
         scores = scores / self.params.temperature
