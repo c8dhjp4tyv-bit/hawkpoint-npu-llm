@@ -390,7 +390,11 @@ a JSON integer equal to `n`. Other values return `400` for text completions.
 `stream_options` is only accepted with streaming enabled. Invalid types return
 `400` before inference admission. Header and body reads are also bounded by
 `--request-timeout`; a stalled body receives `408` when the connection remains
-`writable`. Inference timeouts return `504` for non-streaming requests.
+writable. Once inference is admitted, one `--request-timeout` budget covers
+waiting for the worker and generating all `n` choices. A request that expires
+while queued does not interrupt the active request; a worker stalled during its
+own inference is terminated and recreated for a subsequent request. Inference
+timeouts return `504` for non-streaming requests.
 
 Responses include a unique `X-Request-ID`, `Cache-Control: no-store`, and
 `X-Content-Type-Options: nosniff`. Streaming responses additionally disable
