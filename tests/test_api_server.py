@@ -148,6 +148,24 @@ class StartedHangingDecoder:
         yield "unreachable", None
 
 
+class SignalledDecoder:
+    """Hold an active stream until the parent creates a marker file."""
+
+    context_length = 64
+
+    def __init__(self, marker):
+        self.marker = marker
+
+    def generate_messages(self, messages, max_new_tokens):
+        yield "started", None
+        deadline = time.monotonic() + 4
+        while not Path(self.marker).exists():
+            if time.monotonic() >= deadline:
+                raise TimeoutError("test signal not received")
+            time.sleep(0.01)
+        yield "finished", {"generated_tokens": 2}
+
+
 class ToggleDecoder:
     """Fails while a marker file exists, otherwise completes normally.
 
@@ -380,7 +398,7 @@ def test_hard_process_timeout():
     engine = ProcessCompletionEngine(
         {"smollm2-135m-xdna1": HangingDecoder()},
         decoder_factory=None,
-        timeout=0.2,
+        timeout=5,
     )
     started = time.monotonic()
     try:
@@ -426,8 +444,10 @@ def test_queued_worker_request_respects_deadline():
 
 def test_queue_timeout_preserves_active_worker():
     """An expired queued request must not cancel another client's inference."""
+    directory = tempfile.TemporaryDirectory()
+    marker = Path(directory.name) / "continue"
     engine = ProcessCompletionEngine(
-        {"smollm2-135m-xdna1": StartedHangingDecoder()}, None, timeout=5
+        {"smollm2-135m-xdna1": SignalledDecoder(str(marker))}, None, timeout=5
     )
     active = engine.generate("smollm2-135m-xdna1", [], 1)
     try:
@@ -448,9 +468,13 @@ def test_queue_timeout_preserves_active_worker():
         assert len(errors) == 1 and isinstance(errors[0], InferenceTimeout)
         assert engine._process is process and process.is_alive()
         assert engine.worker_restarts == 0
+        marker.touch()
+        assert next(active) == ("finished", {"generated_tokens": 2})
+        assert list(active) == []
     finally:
         active.close()
         engine.close()
+        directory.cleanup()
 
 
 def test_multiple_choices_share_request_deadline():
@@ -504,6 +528,11 @@ def test_dead_worker_is_reaped_before_restart():
         assert not old_process.is_alive()
         list(engine.generate("smollm2-135m-xdna1", messages, 5))
         assert old_connection.closed
+        try:
+            old_process.is_alive()
+            raise AssertionError("old process handle was not closed")
+        except ValueError:
+            pass
         assert engine.worker_restarts == 1
         assert engine.ready
     finally:
