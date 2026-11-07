@@ -769,6 +769,8 @@ class ProcessCompletionEngine:
         """Create worker and pipe while holding lifecycle ownership."""
         if self._process is not None and self._process.is_alive():
             return
+        if self._process is not None:
+            self._terminate_locked(count_restart=True)
         parent, child = self._context.Pipe()
         self._process = self._context.Process(
             target=_worker_loop,
@@ -842,8 +844,13 @@ class ProcessCompletionEngine:
         logprobs=None,
     ):
         """Serialize model inference and yield text chunks with final statistics."""
-        deadline = time.monotonic() + (timeout or self.timeout)
-        with self._lock:
+        budget = self.timeout if timeout is None else timeout
+        deadline = time.monotonic() + budget
+        if budget <= 0 or not self._lock.acquire(timeout=budget):
+            raise InferenceTimeout("inference request exceeded its deadline while queued")
+        try:
+            if time.monotonic() >= deadline:
+                raise InferenceTimeout("inference request exceeded its deadline while queued")
             self._send_command(
                 {
                     "op": "generate",
@@ -871,12 +878,18 @@ class ProcessCompletionEngine:
             except GeneratorExit:
                 self._terminate()
                 raise
+        finally:
+            self._lock.release()
 
     def _send_command(self, command):
         """Start and dispatch atomically against permanent engine cancellation."""
         with self._lifecycle_lock:
             self._start()
-            self._connection.send(command)
+            try:
+                self._connection.send(command)
+            except (BrokenPipeError, EOFError, OSError, ValueError) as exc:
+                self._terminate_locked(count_restart=True)
+                raise RuntimeError("inference worker exited unexpectedly") from exc
 
     def close(self):
         """Close an idle engine; use abort when the drain deadline expires."""
@@ -1289,11 +1302,14 @@ def make_handler(engine, config=None, metrics=None):
 
         def _generation(self, model_id, messages, max_tokens, sampling, stop, logprobs):
             """Start engine generation, forwarding only the options in use."""
+            remaining = self._deadline - time.monotonic()
+            if remaining <= 0:
+                raise InferenceTimeout("inference request exceeded its deadline")
             return engine.generate(
                 model_id,
                 messages,
                 max_tokens,
-                timeout=config.request_timeout,
+                timeout=remaining,
                 **_generation_options(sampling, stop, logprobs),
             )
 

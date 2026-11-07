@@ -148,6 +148,24 @@ class StartedHangingDecoder:
         yield "unreachable", None
 
 
+class SignalledDecoder:
+    """Hold an active stream until the parent creates a marker file."""
+
+    context_length = 64
+
+    def __init__(self, marker):
+        self.marker = marker
+
+    def generate_messages(self, messages, max_new_tokens):
+        yield "started", None
+        deadline = time.monotonic() + 4
+        while not Path(self.marker).exists():
+            if time.monotonic() >= deadline:
+                raise TimeoutError("test signal not received")
+            time.sleep(0.01)
+        yield "finished", {"generated_tokens": 2}
+
+
 class ToggleDecoder:
     """Fails while a marker file exists, otherwise completes normally.
 
@@ -380,7 +398,7 @@ def test_hard_process_timeout():
     engine = ProcessCompletionEngine(
         {"smollm2-135m-xdna1": HangingDecoder()},
         decoder_factory=None,
-        timeout=0.2,
+        timeout=5,
     )
     started = time.monotonic()
     try:
@@ -399,6 +417,124 @@ def test_hard_process_timeout():
         assert time.monotonic() - started < 3
         assert engine.worker_restarts == 1
         assert not engine.ready
+    finally:
+        engine.close()
+
+
+def test_queued_worker_request_respects_deadline():
+    """A queued request times out without interrupting the current owner."""
+    engine = ProcessCompletionEngine(
+        {"smollm2-135m-xdna1": FakeDecoder()}, None, timeout=5
+    )
+    engine._lock.acquire()
+    try:
+        started = time.monotonic()
+        try:
+            list(engine.generate("smollm2-135m-xdna1", [], 1, timeout=0.1))
+            raise AssertionError("queued request unexpectedly completed")
+        except InferenceTimeout:
+            pass
+        assert time.monotonic() - started < 1
+        assert engine._process is None
+        assert engine.worker_restarts == 0
+    finally:
+        engine._lock.release()
+        engine.close()
+
+
+def test_queue_timeout_preserves_active_worker():
+    """An expired queued request must not cancel another client's inference."""
+    directory = tempfile.TemporaryDirectory()
+    marker = Path(directory.name) / "continue"
+    engine = ProcessCompletionEngine(
+        {"smollm2-135m-xdna1": SignalledDecoder(str(marker))}, None, timeout=5
+    )
+    active = engine.generate("smollm2-135m-xdna1", [], 1)
+    try:
+        assert next(active)[0] == "started"
+        process = engine._process
+        errors = []
+
+        def queued_request():
+            try:
+                list(engine.generate("smollm2-135m-xdna1", [], 1, timeout=0.1))
+            except Exception as exc:
+                errors.append(exc)
+
+        thread = threading.Thread(target=queued_request)
+        thread.start()
+        thread.join(timeout=2)
+        assert not thread.is_alive()
+        assert len(errors) == 1 and isinstance(errors[0], InferenceTimeout)
+        assert engine._process is process and process.is_alive()
+        assert engine.worker_restarts == 0
+        marker.touch()
+        assert next(active) == ("finished", {"generated_tokens": 2})
+        assert list(active) == []
+    finally:
+        active.close()
+        engine.close()
+        directory.cleanup()
+
+
+def test_multiple_choices_share_request_deadline():
+    """Every choice receives the remaining budget, not a fresh timeout."""
+    class RecordingEngine(CompletionEngine):
+        def __init__(self):
+            super().__init__({"smollm2-135m-xdna1": FakeDecoder()})
+            self.timeouts = []
+
+        def generate(self, model_id, messages, max_tokens, timeout=None, **kwargs):
+            self.timeouts.append(timeout)
+            time.sleep(0.05)
+            yield "ok", {"prompt_tokens": 1, "generated_tokens": 1}
+
+    engine = RecordingEngine()
+    server = BoundedHTTPServer(
+        ("127.0.0.1", 0), make_handler(engine, ServerConfig(api_key=API_KEY))
+    )
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        for endpoint, body in (
+            ("chat/completions", {"messages": [{"role": "user", "content": "Hello"}]}),
+            ("completions", {"prompt": "Hello"}),
+        ):
+            for stream in (False, True):
+                engine.timeouts.clear()
+                status, _, _ = fetch(
+                    f"http://127.0.0.1:{server.server_port}/v1/{endpoint}",
+                    {**body, "n": 2, "stream": stream},
+                )
+                assert status == 200
+                assert len(engine.timeouts) == 2
+                assert engine.timeouts[1] < engine.timeouts[0] - 0.03
+    finally:
+        stop_server(server, thread)
+
+
+def test_dead_worker_is_reaped_before_restart():
+    """An unexpectedly dead idle worker is disposed before replacement."""
+    engine = ProcessCompletionEngine(
+        {"smollm2-135m-xdna1": FakeDecoder()}, None, timeout=5
+    )
+    messages = [{"role": "user", "content": "Hello"}]
+    try:
+        list(engine.generate("smollm2-135m-xdna1", messages, 5))
+        old_process = engine._process
+        old_connection = engine._connection
+        old_process.terminate()
+        old_process.join(timeout=5)
+        assert not old_process.is_alive()
+        list(engine.generate("smollm2-135m-xdna1", messages, 5))
+        assert old_connection.closed
+        try:
+            old_process.is_alive()
+            raise AssertionError("old process handle was not closed")
+        except ValueError:
+            pass
+        assert engine.worker_restarts == 1
+        assert engine.ready
     finally:
         engine.close()
 
@@ -1183,6 +1319,10 @@ def main():
     test_sampling_parameters_reach_the_decoder()
     test_backpressure_and_safe_errors()
     test_hard_process_timeout()
+    test_queued_worker_request_respects_deadline()
+    test_queue_timeout_preserves_active_worker()
+    test_multiple_choices_share_request_deadline()
+    test_dead_worker_is_reaped_before_restart()
     test_worker_error_forces_restart()
     test_inference_error_recreates_worker()
     test_model_switch_releases_previous_decoder()

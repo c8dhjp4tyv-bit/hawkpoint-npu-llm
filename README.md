@@ -390,7 +390,12 @@ a JSON integer equal to `n`. Other values return `400` for text completions.
 `stream_options` is only accepted with streaming enabled. Invalid types return
 `400` before inference admission. Header and body reads are also bounded by
 `--request-timeout`; a stalled body receives `408` when the connection remains
-`writable`. Inference timeouts return `504` for non-streaming requests.
+writable. Once inference is admitted, one `--request-timeout` budget covers
+waiting for the worker and generating all `n` choices. A request that expires
+while queued does not interrupt the active request; a worker stalled during its
+own inference is terminated and recreated for a subsequent request. Command
+dispatch to a stalled worker is not currently bounded by this deadline.
+Inference timeouts return `504` for non-streaming requests.
 
 Responses include a unique `X-Request-ID`, `Cache-Control: no-store`, and
 `X-Content-Type-Options: nosniff`. Streaming responses additionally disable
@@ -608,12 +613,15 @@ timeout, 30 requests/minute/client rate limit, bearer authentication, safe
 internal errors, and an explicit browser-origin allowlist.
 
 The HTTP process never owns the XRT context. Inference runs in a persistent
-spawned worker process. If a request deadline expires, the worker is
+spawned worker process. If an active inference deadline expires, the worker is
 terminated, its NPU context is discarded, and the next request creates a fresh
 worker. A worker-side inference error also terminates that worker so a possibly
 corrupted XRT context is never reused. `GET /health` reports HTTP-process
 liveness; `GET /ready` returns `200` only while a warmed inference worker is
-available, and `503` after an error or timeout until recovery succeeds.
+available, and `503` after an error or an active inference timeout until recovery
+succeeds. A queued request timing out does not itself stop the active worker.
+Recovery currently requires a subsequent inference request; readiness-gated
+routers should account for this limitation.
 
 Both launcher modes bind the API to `127.0.0.1`; Open WebUI also binds only to
 localhost. To run the server directly with TLS, pass `--tls-cert CERT.pem
