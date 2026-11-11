@@ -274,7 +274,7 @@ jobs:
         with:
           subject-path: hawkpoint-npu-llm-${{ github.ref_name }}.tar.gz
       - name: Publish release
-        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64
+        uses: softprops/action-gh-release@8a0cd651e5b2365bd640854a3fa5dfc70e4875f3
         with:
           body: "Hardware evidence uses the quick profile: 100 native and 25 requests per Ollama placement. This release does not certify long-duration endurance."
           prerelease: ${{ contains(github.ref_name, '-') }}
