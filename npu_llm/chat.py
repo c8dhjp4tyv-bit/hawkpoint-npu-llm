@@ -124,9 +124,8 @@ def stream_chat_api(
 def list_api_models(base_url: str, api_key: str | None) -> list[str]:
     """Fetch installed model identifiers from the API server."""
     url = f"{base_url.rstrip('/')}/v1/models"
-    headers = {}
     validate_api_url(url, api_key)
-    req = urllib.request.Request(url, headers=headers, method="GET")
+    req = urllib.request.Request(url, method="GET")
     try:
         with open_api_request(req, api_key, timeout=3) as resp:
             data = json.loads(resp.read().decode("utf-8"))
@@ -246,27 +245,6 @@ def main(argv: list[str] | None = None) -> int:
             available = list_api_models(api_url, args.api_key)
             model_id = available[0] if available else "smollm2-135m-xdna1"
 
-        def complete(prompt: str) -> dict:
-            messages.append({"role": "user", "content": prompt})
-            print(f"[{model_id}]: ", end="", flush=True)
-            pieces = []
-            stats = None
-            for text, final_stats in stream_chat_api(
-                api_url,
-                args.api_key,
-                model_id,
-                messages,
-                args.max_new_tokens,
-                sampling=params,
-            ):
-                pieces.append(text)
-                print(text, end="", flush=True)
-                if final_stats is not None:
-                    stats = final_stats
-            print()
-            messages.append({"role": "assistant", "content": "".join(pieces)})
-            return stats or {}
-
     else:
         from runtime.generate import NPUDecoder
 
@@ -280,21 +258,32 @@ def main(argv: list[str] | None = None) -> int:
 
         decoder = NPUDecoder(model_path, npu_layers=npu_layers)
 
-        def complete(prompt: str) -> dict:
-            messages.append({"role": "user", "content": prompt})
-            print("SmolLM: ", end="", flush=True)
-            pieces = []
-            stats = None
-            for text, final_stats in decoder.generate_messages(
+    def complete(prompt: str) -> dict:
+        messages.append({"role": "user", "content": prompt})
+        print(f"[{model_id}]: " if use_api else "SmolLM: ", end="", flush=True)
+        pieces = []
+        stats = None
+        if use_api:
+            generation = stream_chat_api(
+                api_url,
+                args.api_key,
+                model_id,
+                messages,
+                args.max_new_tokens,
+                sampling=params,
+            )
+        else:
+            generation = decoder.generate_messages(
                 messages, args.max_new_tokens, sampling=params
-            ):
-                pieces.append(text)
-                print(text, end="", flush=True)
-                if final_stats is not None:
-                    stats = final_stats
-            print()
-            messages.append({"role": "assistant", "content": "".join(pieces)})
-            return stats or {}
+            )
+        for text, final_stats in generation:
+            pieces.append(text)
+            print(text, end="", flush=True)
+            if final_stats is not None:
+                stats = final_stats
+        print()
+        messages.append({"role": "assistant", "content": "".join(pieces)})
+        return stats or {}
 
     if args.prompt:
         stats = complete(args.prompt)

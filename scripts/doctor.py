@@ -260,23 +260,15 @@ def check_network_and_services(port: int = 8000) -> dict:
 
 def run_diagnostics(models_dir: Path | None = None) -> dict:
     """Execute all preflight diagnostic checks and aggregate results."""
-    m_dir = models_dir or (ROOT / "npu_llm/models")
-
-    os_res = check_os_and_cpu()
-    npu_res = check_npu_device_and_driver()
-    xrt_res = check_xrt_runtime()
-    py_res = check_python_dependencies()
-    mod_res = check_models_directory(m_dir)
-    net_res = check_network_and_services()
-
-    all_statuses = [
-        os_res["status"],
-        npu_res["status"],
-        xrt_res["status"],
-        py_res["status"],
-        mod_res["status"],
-        net_res["status"],
-    ]
+    checks = {
+        "os_and_cpu": check_os_and_cpu(),
+        "npu_hardware": check_npu_device_and_driver(),
+        "xrt_runtime": check_xrt_runtime(),
+        "python_environment": check_python_dependencies(),
+        "model_catalog": check_models_directory(models_dir or (ROOT / "npu_llm/models")),
+        "network_services": check_network_and_services(),
+    }
+    all_statuses = [check["status"] for check in checks.values()]
 
     if CheckStatus.FAIL in all_statuses:
         overall = CheckStatus.FAIL
@@ -287,14 +279,7 @@ def run_diagnostics(models_dir: Path | None = None) -> dict:
 
     return {
         "overall_status": overall,
-        "checks": {
-            "os_and_cpu": os_res,
-            "npu_hardware": npu_res,
-            "xrt_runtime": xrt_res,
-            "python_environment": py_res,
-            "model_catalog": mod_res,
-            "network_services": net_res,
-        },
+        "checks": checks,
     }
 
 
@@ -308,53 +293,52 @@ def _badge(status: str) -> str:
 
 def format_text_report(diag: dict) -> str:
     """Render human-readable formatted terminal diagnostic checklist."""
-    c = diag["checks"]
+    checks = diag["checks"]
     lines = [
         "==================================================",
         " HawkPoint NPU Preflight Diagnostics (Doctor)",
         "==================================================",
     ]
 
-    os_c = c["os_and_cpu"]
-    lines.append(f"{_badge(os_c['status'])} Operating System: {os_c['os']} {os_c['arch']} (kernel {os_c['kernel']})")
+    os_check = checks["os_and_cpu"]
+    lines.append(f"{_badge(os_check['status'])} Operating System: {os_check['os']} {os_check['arch']} (kernel {os_check['kernel']})")
 
-    npu_c = c["npu_hardware"]
-    if npu_c["accel_nodes"]:
-        lines.append(f"{_badge(npu_c['status'])} NPU Device Nodes: {', '.join(npu_c['accel_nodes'])} (rw={npu_c['user_accessible']})")
+    npu_check = checks["npu_hardware"]
+    if npu_check["accel_nodes"]:
+        lines.append(f"{_badge(npu_check['status'])} NPU Device Nodes: {', '.join(npu_check['accel_nodes'])} (rw={npu_check['user_accessible']})")
     else:
-        lines.append(f"{_badge(npu_c['status'])} NPU Device Nodes: None detected in /dev/accel")
+        lines.append(f"{_badge(npu_check['status'])} NPU Device Nodes: None detected in /dev/accel")
 
-    lines.append(f"{_badge(CheckStatus.OK if npu_c['driver_loaded'] else CheckStatus.WARN)} amdxdna Driver: {'loaded' if npu_c['driver_loaded'] else 'not loaded'}")
+    lines.append(f"{_badge(CheckStatus.OK if npu_check['driver_loaded'] else CheckStatus.WARN)} amdxdna Driver: {'loaded' if npu_check['driver_loaded'] else 'not loaded'}")
 
-    xrt_c = c["xrt_runtime"]
-    lines.append(f"{_badge(xrt_c['status'])} XRT Userspace: {'Installed' if xrt_c['xrt_installed'] else 'Missing'}")
+    xrt_check = checks["xrt_runtime"]
+    lines.append(f"{_badge(xrt_check['status'])} XRT Userspace: {'Installed' if xrt_check['xrt_installed'] else 'Missing'}")
 
-    py_c = c["python_environment"]
-    lines.append(f"{_badge(py_c['status'])} Python Packages: {len(py_c['installed'])} present" + (f", {len(py_c['missing'])} missing" if py_c['missing'] else ""))
+    python_check = checks["python_environment"]
+    lines.append(f"{_badge(python_check['status'])} Python Packages: {len(python_check['installed'])} present" + (f", {len(python_check['missing'])} missing" if python_check['missing'] else ""))
 
-    mod_c = c["model_catalog"]
-    lines.append(f"{_badge(mod_c['status'])} Converted Models: {mod_c['models_count']} found in {mod_c['models_dir']}")
+    model_check = checks["model_catalog"]
+    lines.append(f"{_badge(model_check['status'])} Converted Models: {model_check['models_count']} found in {model_check['models_dir']}")
 
-    net_c = c["network_services"]
-    if net_c["api_server_active"]:
-        state = "ready" if net_c["api_server_ready"] else "starting/draining"
+    network_check = checks["network_services"]
+    if network_check["api_server_active"]:
+        state = "ready" if network_check["api_server_ready"] else "starting/draining"
         lines.append(f"[✓] Local API Server: Active on port 8000 ({state})")
     else:
-        lines.append(f"[✓] Local API Server: Port 8000 {'in use' if net_c['port_8000_in_use'] else 'free'}")
+        lines.append(f"[✓] Local API Server: Port 8000 {'in use' if network_check['port_8000_in_use'] else 'free'}")
 
     lines.append("--------------------------------------------------")
 
     actions = []
-    for item in c.values():
+    for item in checks.values():
         actions.extend(item.get("remediation", []))
-        for issue in item.get("issues", []):
-            if not item.get("remediation"):
-                actions.append(issue)
+        if not item.get("remediation"):
+            actions.extend(item.get("issues", []))
 
     if actions:
         lines.append("Actionable Recommendations:")
-        for idx, act in enumerate(actions, 1):
-            lines.append(f"  {idx}. {act}")
+        for idx, action in enumerate(actions, 1):
+            lines.append(f"  {idx}. {action}")
         lines.append("--------------------------------------------------")
 
     if diag["overall_status"] == CheckStatus.OK:

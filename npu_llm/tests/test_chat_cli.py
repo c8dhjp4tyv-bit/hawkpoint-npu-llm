@@ -3,11 +3,15 @@
 
 from __future__ import annotations
 
+from contextlib import redirect_stdout
 from http.server import BaseHTTPRequestHandler, HTTPServer
+from io import StringIO
 import json
 from pathlib import Path
 import sys
 import threading
+from types import ModuleType
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
@@ -178,10 +182,49 @@ def test_main_cli_single_prompt(capsys=None):
         server.shutdown()
 
 
+def test_native_chat_conversation_and_reset():
+    calls = []
+
+    class FakeNativeDecoder:
+        def __init__(self, model_dir, npu_layers=None):
+            assert model_dir == Path("native-model")
+            assert npu_layers == 3
+
+        def generate_messages(self, messages, max_new_tokens, sampling=None):
+            assert max_new_tokens == 8
+            assert sampling == SamplingParams()
+            calls.append([dict(message) for message in messages])
+            yield "native answer", None
+            yield "", {"generated_tokens": 1}
+
+    runtime = ModuleType("runtime.generate")
+    runtime.NPUDecoder = FakeNativeDecoder
+    output = StringIO()
+    with (
+        patch.dict(sys.modules, {"runtime.generate": runtime}),
+        patch.dict("os.environ", {"HAWKPOINT_API_URL": ""}),
+        patch("builtins.input", side_effect=["first", "second", "/reset", "last", "/exit"]),
+        redirect_stdout(output),
+    ):
+        assert main(["--model", "native-model", "--npu-layers", "3", "--max-new-tokens", "8"]) == 0
+
+    system = {"role": "system", "content": "You are a helpful AI assistant."}
+    assert calls == [
+        [system, {"role": "user", "content": "first"}],
+        [system, {"role": "user", "content": "first"},
+         {"role": "assistant", "content": "native answer"},
+         {"role": "user", "content": "second"}],
+        [system, {"role": "user", "content": "last"}],
+    ]
+    assert output.getvalue().count("SmolLM: native answer") == 3
+    assert "Conversation reset." in output.getvalue()
+
+
 if __name__ == "__main__":
     test_list_api_models()
     test_is_local_api_available()
     test_parse_logit_bias()
     test_stream_chat_api()
     test_main_cli_single_prompt()
-    print("PASS 5 chat CLI tests")
+    test_native_chat_conversation_and_reset()
+    print("PASS 6 chat CLI tests")
