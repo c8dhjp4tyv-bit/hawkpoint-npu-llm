@@ -62,6 +62,7 @@ class _FrozenBias(dict):
     popitem = _read_only
     setdefault = _read_only
     update = _read_only
+    __ior__ = _read_only
 
     def __copy__(self):
         return self
@@ -152,8 +153,61 @@ class SamplingParams:
     seed: int | None = None
 
     def __post_init__(self):
-        # Direct construction bypasses ``build``; normalize here as well so a
-        # ``SamplingParams`` instance is always validated and immutable.
+        # Keep validation on the constructor path so direct callers and
+        # dataclasses.replace cannot bypass the request/transport checks.
+        temperature = self.temperature
+        top_p = self.top_p
+        top_k = self.top_k
+        repetition_penalty = self.repetition_penalty
+        presence_penalty = self.presence_penalty
+        frequency_penalty = self.frequency_penalty
+        seed = self.seed
+        if temperature is None:
+            temperature = 0.0
+        else:
+            temperature = _bounded(temperature, "temperature", TEMPERATURE_RANGE)
+        if top_p is None:
+            top_p = 1.0
+        else:
+            top_p = _bounded(top_p, "top_p", TOP_P_RANGE, exclusive_low=True)
+        if top_k is None:
+            top_k = 0
+        elif isinstance(top_k, bool) or not isinstance(top_k, int):
+            raise SamplingError("top_k must be an integer")
+        elif top_k < 0:
+            raise SamplingError("top_k cannot be negative")
+        if repetition_penalty is None:
+            repetition_penalty = 1.0
+        else:
+            repetition_penalty = _bounded(
+                repetition_penalty,
+                "repetition_penalty",
+                REPETITION_PENALTY_RANGE,
+            )
+        presence_penalty = (
+            0.0
+            if presence_penalty is None
+            else _bounded(presence_penalty, "presence_penalty", PENALTY_RANGE)
+        )
+        frequency_penalty = (
+            0.0
+            if frequency_penalty is None
+            else _bounded(frequency_penalty, "frequency_penalty", PENALTY_RANGE)
+        )
+        if seed is not None:
+            if isinstance(seed, bool) or not isinstance(seed, int):
+                raise SamplingError("seed must be an integer")
+            if not SEED_RANGE[0] <= seed <= SEED_RANGE[1]:
+                raise SamplingError(
+                    f"seed must be between {SEED_RANGE[0]} and {SEED_RANGE[1]}"
+                )
+        object.__setattr__(self, "temperature", temperature)
+        object.__setattr__(self, "top_p", top_p)
+        object.__setattr__(self, "top_k", top_k)
+        object.__setattr__(self, "repetition_penalty", repetition_penalty)
+        object.__setattr__(self, "presence_penalty", presence_penalty)
+        object.__setattr__(self, "frequency_penalty", frequency_penalty)
+        object.__setattr__(self, "seed", seed)
         object.__setattr__(
             self, "logit_bias", _normalize_logit_bias(self.logit_bias)
         )
@@ -228,45 +282,6 @@ class SamplingParams:
         seed=None,
     ):
         """Validate raw request values, treating ``None`` as "use the default"."""
-        if temperature is None:
-            temperature = 0.0
-        else:
-            temperature = _bounded(temperature, "temperature", TEMPERATURE_RANGE)
-        if top_p is None:
-            top_p = 1.0
-        else:
-            top_p = _bounded(top_p, "top_p", TOP_P_RANGE, exclusive_low=True)
-        if top_k is None:
-            top_k = 0
-        elif isinstance(top_k, bool) or not isinstance(top_k, int):
-            raise SamplingError("top_k must be an integer")
-        elif top_k < 0:
-            raise SamplingError("top_k cannot be negative")
-        if repetition_penalty is None:
-            repetition_penalty = 1.0
-        else:
-            repetition_penalty = _bounded(
-                repetition_penalty,
-                "repetition_penalty",
-                REPETITION_PENALTY_RANGE,
-            )
-        presence_penalty = (
-            0.0
-            if presence_penalty is None
-            else _bounded(presence_penalty, "presence_penalty", PENALTY_RANGE)
-        )
-        frequency_penalty = (
-            0.0
-            if frequency_penalty is None
-            else _bounded(frequency_penalty, "frequency_penalty", PENALTY_RANGE)
-        )
-        if seed is not None:
-            if isinstance(seed, bool) or not isinstance(seed, int):
-                raise SamplingError("seed must be an integer")
-            if not SEED_RANGE[0] <= seed <= SEED_RANGE[1]:
-                raise SamplingError(
-                    f"seed must be between {SEED_RANGE[0]} and {SEED_RANGE[1]}"
-                )
         return cls(
             temperature=temperature,
             top_p=top_p,
@@ -438,7 +453,7 @@ class Sampler:
     def stats(self):
         """Sampling metadata reported alongside generation statistics."""
         return {
+            **self.params.to_dict(),
             "mode": "greedy" if self.greedy else "sampled",
             "seed": self.seed,
-            **self.params.to_dict(),
         }

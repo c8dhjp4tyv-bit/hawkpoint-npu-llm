@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Host-side sampling tests. Pure NumPy: no NPU, no converted model."""
 
+from dataclasses import replace
 from pathlib import Path
 import json
 import sys
@@ -68,9 +69,12 @@ def test_unseeded_sampling_reports_its_seed():
     params = SamplingParams.build(temperature=1.0)
     sampler = Sampler(params)
     assert sampler.seed is not None
+    assert sampler.stats()["seed"] == sampler.seed
     assert not params.deterministic
     # Replaying the reported seed reproduces the run.
-    replay = Sampler(SamplingParams.build(temperature=1.0, seed=sampler.seed))
+    replay = Sampler(
+        SamplingParams.build(temperature=1.0, seed=sampler.stats()["seed"])
+    )
     assert [sampler.select(LOGITS) for _ in range(8)] == [
         replay.select(LOGITS) for _ in range(8)
     ]
@@ -179,6 +183,51 @@ def test_request_parsing_and_validation():
             continue
         raise AssertionError(f"{request} was accepted")
     assert issubclass(SamplingError, ValueError)
+
+
+def test_direct_construction_rejects_invalid_parameters():
+    rejected = [
+        {"temperature": -1}, {"temperature": float("nan")},
+        {"temperature": float("inf")}, {"temperature": True},
+        {"temperature": 10**400}, {"temperature": "hot"},
+        {"top_p": 0}, {"top_p": 1.1}, {"top_p": False},
+        {"top_k": -1}, {"top_k": 1.5}, {"top_k": True},
+        {"repetition_penalty": 0}, {"repetition_penalty": 3},
+        {"presence_penalty": -3}, {"frequency_penalty": 3},
+        {"seed": -1}, {"seed": 2**63}, {"seed": True}, {"seed": "1"},
+    ]
+    for values in rejected:
+        # dataclasses.replace also invokes the direct constructor.
+        for construct in (SamplingParams, lambda **kw: replace(GREEDY, **kw)):
+            try:
+                construct(**values)
+            except SamplingError:
+                continue
+            raise AssertionError(f"{values!r} bypassed constructor validation")
+
+
+def test_direct_construction_matches_factory():
+    values = dict(
+        temperature=1, top_p=0.9, top_k=3, repetition_penalty=1.2,
+        presence_penalty=0.5, frequency_penalty=-0.5,
+        logit_bias={"3": 2}, seed=42,
+    )
+    direct = SamplingParams(**values)
+    assert direct == SamplingParams.build(**values)
+    assert SamplingParams.from_dict(direct.to_dict()) == direct
+
+
+def test_logit_bias_rejects_in_place_union():
+    params = SamplingParams.build(logit_bias={3: 1.5})
+    bias = params.logit_bias
+    try:
+        bias |= {3: float("nan"), 1: 1000}
+    except TypeError:
+        pass
+    else:
+        raise AssertionError("logit_bias accepted an in-place union")
+    assert params.logit_bias == {3: 1.5}
+    assert GREEDY.logit_bias == {}
 
 
 def test_transport_round_trip_revalidates():
