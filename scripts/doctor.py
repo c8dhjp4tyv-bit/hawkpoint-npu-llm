@@ -260,12 +260,13 @@ def check_network_and_services(port: int = 8000) -> dict:
 
 def run_diagnostics(models_dir: Path | None = None) -> dict:
     """Execute all preflight diagnostic checks and aggregate results."""
+    models_dir = models_dir or (ROOT / "npu_llm/models")
     checks = {
         "os_and_cpu": check_os_and_cpu(),
         "npu_hardware": check_npu_device_and_driver(),
         "xrt_runtime": check_xrt_runtime(),
         "python_environment": check_python_dependencies(),
-        "model_catalog": check_models_directory(models_dir or (ROOT / "npu_llm/models")),
+        "model_catalog": check_models_directory(models_dir),
         "network_services": check_network_and_services(),
     }
     all_statuses = [check["status"] for check in checks.values()]
@@ -301,31 +302,53 @@ def format_text_report(diag: dict) -> str:
     ]
 
     os_check = checks["os_and_cpu"]
-    lines.append(f"{_badge(os_check['status'])} Operating System: {os_check['os']} {os_check['arch']} (kernel {os_check['kernel']})")
+    lines.append(
+        f"{_badge(os_check['status'])} Operating System: {os_check['os']} "
+        f"{os_check['arch']} (kernel {os_check['kernel']})"
+    )
 
     npu_check = checks["npu_hardware"]
     if npu_check["accel_nodes"]:
-        lines.append(f"{_badge(npu_check['status'])} NPU Device Nodes: {', '.join(npu_check['accel_nodes'])} (rw={npu_check['user_accessible']})")
+        lines.append(
+            f"{_badge(npu_check['status'])} NPU Device Nodes: "
+            f"{', '.join(npu_check['accel_nodes'])} (rw={npu_check['user_accessible']})"
+        )
     else:
         lines.append(f"{_badge(npu_check['status'])} NPU Device Nodes: None detected in /dev/accel")
 
-    lines.append(f"{_badge(CheckStatus.OK if npu_check['driver_loaded'] else CheckStatus.WARN)} amdxdna Driver: {'loaded' if npu_check['driver_loaded'] else 'not loaded'}")
+    driver_status = CheckStatus.OK if npu_check["driver_loaded"] else CheckStatus.WARN
+    lines.append(
+        f"{_badge(driver_status)} amdxdna Driver: "
+        f"{'loaded' if npu_check['driver_loaded'] else 'not loaded'}"
+    )
 
     xrt_check = checks["xrt_runtime"]
-    lines.append(f"{_badge(xrt_check['status'])} XRT Userspace: {'Installed' if xrt_check['xrt_installed'] else 'Missing'}")
+    lines.append(
+        f"{_badge(xrt_check['status'])} XRT Userspace: "
+        f"{'Installed' if xrt_check['xrt_installed'] else 'Missing'}"
+    )
 
     python_check = checks["python_environment"]
-    lines.append(f"{_badge(python_check['status'])} Python Packages: {len(python_check['installed'])} present" + (f", {len(python_check['missing'])} missing" if python_check['missing'] else ""))
+    packages = f"{len(python_check['installed'])} present"
+    if python_check["missing"]:
+        packages += f", {len(python_check['missing'])} missing"
+    lines.append(f"{_badge(python_check['status'])} Python Packages: {packages}")
 
     model_check = checks["model_catalog"]
-    lines.append(f"{_badge(model_check['status'])} Converted Models: {model_check['models_count']} found in {model_check['models_dir']}")
+    lines.append(
+        f"{_badge(model_check['status'])} Converted Models: "
+        f"{model_check['models_count']} found in {model_check['models_dir']}"
+    )
 
     network_check = checks["network_services"]
     if network_check["api_server_active"]:
         state = "ready" if network_check["api_server_ready"] else "starting/draining"
         lines.append(f"[✓] Local API Server: Active on port 8000 ({state})")
     else:
-        lines.append(f"[✓] Local API Server: Port 8000 {'in use' if network_check['port_8000_in_use'] else 'free'}")
+        lines.append(
+            f"[✓] Local API Server: Port 8000 "
+            f"{'in use' if network_check['port_8000_in_use'] else 'free'}"
+        )
 
     lines.append("--------------------------------------------------")
 

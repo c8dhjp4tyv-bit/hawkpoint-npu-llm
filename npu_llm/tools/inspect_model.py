@@ -214,10 +214,10 @@ def format_text(report: dict) -> str:
     """Format inspection report into terminal-friendly text."""
     arch = report["architecture"]
     params = report["parameter_metrics"]
-    hw = report["hardware_demands"]
-    integ = report["integrity"]
+    hardware = report["hardware_demands"]
+    integrity = report["integrity"]
 
-    status_str = "VALID [OK]" if integ["valid"] else "INVALID / CORRUPT [FAIL]"
+    status_str = "VALID [OK]" if integrity["valid"] else "INVALID / CORRUPT [FAIL]"
 
     lines = [
         "==================================================",
@@ -239,20 +239,20 @@ def format_text(report: dict) -> str:
         "Parameters & Footprint:",
         f"  Total Parameters:   {params['total_parameters_millions']}M ({params['total_parameters']:,} params)",
         f"  Weight Footprint:   {params['estimated_weights_mib']} MiB",
-        f"  KV Cache ({report['context_length']} ctx):  {hw['kv_cache_kib']} KiB",
-        f"  BW @ 75 tok/s:      {hw['streaming_bandwidth_gbps_at_75_tps']} GB/s",
-        f"  XDNA1 Compatible:   {'YES' if hw['xdna1_supported'] else 'NO'}",
+        f"  KV Cache ({report['context_length']} ctx):  {hardware['kv_cache_kib']} KiB",
+        f"  BW @ 75 tok/s:      {hardware['streaming_bandwidth_gbps_at_75_tps']} GB/s",
+        f"  XDNA1 Compatible:   {'YES' if hardware['xdna1_supported'] else 'NO'}",
         "--------------------------------------------------",
-        f"Files Verified:       {integ['verified_files_count']}/{integ['total_manifest_files']}",
-        f"Tokenizer:            {'Present' if integ['tokenizer_present'] else 'Missing'}",
+        f"Files Verified:       {integrity['verified_files_count']}/{integrity['total_manifest_files']}",
+        f"Tokenizer:            {'Present' if integrity['tokenizer_present'] else 'Missing'}",
     ]
-    lines.extend(f"Inventory Error:      {error}" for error in integ["inventory_errors"])
-    if integ["missing_files"]:
-        lines.append(f"Missing Files:        {', '.join(integ['missing_files'])}")
-    if integ["size_mismatches"]:
-        lines.append(f"Size Mismatches:      {len(integ['size_mismatches'])} file(s)")
-    if integ["checksum_failures"]:
-        lines.append(f"Checksum Failures:    {len(integ['checksum_failures'])} file(s)")
+    lines.extend(f"Inventory Error:      {error}" for error in integrity["inventory_errors"])
+    if integrity["missing_files"]:
+        lines.append(f"Missing Files:        {', '.join(integrity['missing_files'])}")
+    if integrity["size_mismatches"]:
+        lines.append(f"Size Mismatches:      {len(integrity['size_mismatches'])} file(s)")
+    if integrity["checksum_failures"]:
+        lines.append(f"Checksum Failures:    {len(integrity['checksum_failures'])} file(s)")
     lines.append("==================================================")
     return "\n".join(lines)
 
@@ -261,10 +261,10 @@ def format_markdown(report: dict) -> str:
     """Format inspection report into a GitHub Markdown table."""
     arch = report["architecture"]
     params = report["parameter_metrics"]
-    hw = report["hardware_demands"]
-    integ = report["integrity"]
+    hardware = report["hardware_demands"]
+    integrity = report["integrity"]
 
-    status_badge = "✅ Passed" if integ["valid"] else "❌ Failed"
+    status_badge = "✅ Passed" if integrity["valid"] else "❌ Failed"
 
     lines = [
         f"## Model Specification: `{report['model_id']}`",
@@ -280,12 +280,12 @@ def format_markdown(report: dict) -> str:
         f"| **Vocabulary Size** | `{arch['vocab_size']:,}` |",
         f"| **Total Parameters** | **`{params['total_parameters_millions']}M`** |",
         f"| **Weight Size** | `{params['estimated_weights_mib']} MiB` |",
-        f"| **KV Cache Capacity** | `{hw['kv_cache_kib']} KiB` |",
-        f"| **Streaming BW @ 75 tok/s** | `{hw['streaming_bandwidth_gbps_at_75_tps']} GB/s` |",
-        f"| **XDNA1 Hardware Ready** | `{'Yes' if hw['xdna1_supported'] else 'No'}` |",
+        f"| **KV Cache Capacity** | `{hardware['kv_cache_kib']} KiB` |",
+        f"| **Streaming BW @ 75 tok/s** | `{hardware['streaming_bandwidth_gbps_at_75_tps']} GB/s` |",
+        f"| **XDNA1 Hardware Ready** | `{'Yes' if hardware['xdna1_supported'] else 'No'}` |",
         "",
     ]
-    lines.extend(f"- Inventory error: {error}" for error in integ["inventory_errors"])
+    lines.extend(f"- Inventory error: {error}" for error in integrity["inventory_errors"])
     return "\n".join(lines)
 
 

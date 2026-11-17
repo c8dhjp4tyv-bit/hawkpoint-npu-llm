@@ -197,12 +197,9 @@ def evaluate_single_item(
     ]
 
     negative_log_likelihood, scored_tokens = logprob_totals(token_logprobs)
-    cross_entropy, ppl = loss_and_perplexity(negative_log_likelihood, scored_tokens)
+    cross_entropy, perplexity = loss_and_perplexity(negative_log_likelihood, scored_tokens)
 
-    # Check if expected target answer is matched (case-insensitive substring or exact word)
-    norm_expected = expected.strip().lower()
-    norm_gen = generated_text.strip().lower()
-    matched = norm_expected in norm_gen
+    matched = expected.strip().lower() in generated_text.strip().lower()
 
     usage = data.get("usage") or {}
     num_tokens = usage.get("completion_tokens", len(tokens))
@@ -219,7 +216,7 @@ def evaluate_single_item(
         tokens=tokens,
         token_logprobs=token_logprobs,
         cross_entropy=cross_entropy,
-        perplexity=ppl,
+        perplexity=perplexity,
         per_token_latency_ms=per_token_latency_ms,
         decode_tokens_per_second=tps,
         prompt_tokens=usage.get("prompt_tokens", 0),
@@ -238,45 +235,45 @@ def run_evaluation(
 ) -> EvalReport:
     """Execute model evaluation suite across all items and aggregate metrics."""
     items_to_eval = dataset if dataset is not None else DEFAULT_EVAL_DATASET
-    results: list[EvalItemResult] = []
-
-    for item in items_to_eval:
-        res = evaluate_single_item(
+    results: list[EvalItemResult] = [
+        evaluate_single_item(
             api_url=api_url,
             api_key=api_key,
             model=model,
             item=item,
             timeout=timeout,
         )
-        results.append(res)
+        for item in items_to_eval
+    ]
 
     total = len(results)
     matched = sum(1 for r in results if r.matched)
     accuracy = (matched / total) if total > 0 else 0.0
 
-    mean_loss, overall_ppl = aggregate_loss(results)
+    mean_loss, overall_perplexity = aggregate_loss(results)
 
-    mean_per_token_latency = sum(r.per_token_latency_ms for r in results) / total if total > 0 else 0.0
+    mean_per_token_latency = (
+        sum(r.per_token_latency_ms for r in results) / total if total > 0 else 0.0
+    )
     mean_tps = (
         sum(r.decode_tokens_per_second for r in results) / total
         if total > 0
         else 0.0
     )
 
-    # Breakdown by category
     categories: dict[str, dict[str, float]] = {}
-    cats = sorted(set(r.category for r in results))
-    for c in cats:
-        cat_items = [r for r in results if r.category == c]
-        cat_total = len(cat_items)
-        cat_matched = sum(1 for r in cat_items if r.matched)
-        cat_mean_loss, cat_ppl = aggregate_loss(cat_items)
-        categories[c] = {
-            "total": cat_total,
-            "matched": cat_matched,
-            "accuracy": cat_matched / cat_total if cat_total > 0 else 0.0,
-            "cross_entropy": cat_mean_loss,
-            "perplexity": cat_ppl,
+    category_names = sorted(set(r.category for r in results))
+    for category in category_names:
+        category_results = [r for r in results if r.category == category]
+        category_total = len(category_results)
+        category_matched = sum(1 for r in category_results if r.matched)
+        category_loss, category_perplexity = aggregate_loss(category_results)
+        categories[category] = {
+            "total": category_total,
+            "matched": category_matched,
+            "accuracy": category_matched / category_total if category_total > 0 else 0.0,
+            "cross_entropy": category_loss,
+            "perplexity": category_perplexity,
         }
 
     total_tokens = sum(r.completion_tokens for r in results)
@@ -287,7 +284,7 @@ def run_evaluation(
         matched_items=matched,
         accuracy=accuracy,
         mean_cross_entropy=mean_loss,
-        perplexity=overall_ppl,
+        perplexity=overall_perplexity,
         mean_per_token_latency_ms=mean_per_token_latency,
         mean_tokens_per_second=mean_tps,
         total_prompt_tokens=sum(r.prompt_tokens for r in results),
@@ -318,9 +315,9 @@ def format_text_report(report: EvalReport) -> str:
         f"  {'Category':<16} {'Accuracy':<12} {'Loss':<12} {'Perplexity':<12}",
         "-" * 78,
     ]
-    for cat, stats in report.categories.items():
+    for category, stats in report.categories.items():
         lines.append(
-            f"  {cat:<16} {stats['accuracy'] * 100:>5.1f}% ({stats['matched']}/{int(stats['total'])})   "
+            f"  {category:<16} {stats['accuracy'] * 100:>5.1f}% ({stats['matched']}/{int(stats['total'])})   "
             f"{format_optional(stats['cross_entropy'], ">6.4f")}     {format_optional(stats['perplexity'], ">7.2f")}"
         )
     lines.extend([
@@ -329,11 +326,13 @@ def format_text_report(report: EvalReport) -> str:
         f"  {'ID':<20} {'Category':<14} {'Status':<10} {'Loss':<8} {'PPL':<8} {'Output'}",
         "-" * 78,
     ])
-    for it in report.items:
-        status = "PASS" if it.matched else "FAIL"
-        clean_out = it.generated_text.replace("\n", "\\n")[:24]
+    for item in report.items:
+        status = "PASS" if item.matched else "FAIL"
+        generated_text = item.generated_text.replace("\n", "\\n")[:24]
         lines.append(
-            f"  {it.item_id:<20} {it.category:<14} {status:<10} {format_optional(it.cross_entropy, ">6.3f")}  {format_optional(it.perplexity, ">6.2f")}  {clean_out}"
+            f"  {item.item_id:<20} {item.category:<14} {status:<10} "
+            f"{format_optional(item.cross_entropy, ">6.3f")}  "
+            f"{format_optional(item.perplexity, ">6.2f")}  {generated_text}"
         )
     lines.append("=" * 78)
     return "\n".join(lines)
@@ -361,10 +360,12 @@ def format_markdown_report(report: EvalReport) -> str:
         "| Category | Items | Matched | Accuracy | Loss | Perplexity |",
         "| :--- | :---: | :---: | :---: | :---: | :---: |",
     ]
-    for cat, stats in report.categories.items():
+    for category, stats in report.categories.items():
         lines.append(
-            f"| `{cat}` | {int(stats['total'])} | {int(stats['matched'])} | "
-            f"{stats['accuracy'] * 100:.1f}% | {format_optional(stats['cross_entropy'], ".4f")} | {format_optional(stats['perplexity'], ".2f")} |"
+            f"| `{category}` | {int(stats['total'])} | {int(stats['matched'])} | "
+            f"{stats['accuracy'] * 100:.1f}% | "
+            f"{format_optional(stats['cross_entropy'], ".4f")} | "
+            f"{format_optional(stats['perplexity'], ".2f")} |"
         )
     lines.extend([
         "",
@@ -373,13 +374,13 @@ def format_markdown_report(report: EvalReport) -> str:
         "| ID | Category | Status | Expected | Generated | Loss | PPL |",
         "| :--- | :--- | :---: | :--- | :--- | :---: | :---: |",
     ])
-    for it in report.items:
-        status = "**PASS**" if it.matched else "*FAIL*"
-        clean_exp = it.expected.replace("\n", " ").replace("|", "\\|")
-        clean_gen = it.generated_text.replace("\n", " ").replace("|", "\\|")
+    for item in report.items:
+        status = "**PASS**" if item.matched else "*FAIL*"
+        expected_text = item.expected.replace("\n", " ").replace("|", "\\|")
+        generated_text = item.generated_text.replace("\n", " ").replace("|", "\\|")
         lines.append(
-            f"| `{it.item_id}` | `{it.category}` | {status} | `{clean_exp}` | `{clean_gen}` | "
-            f"{format_optional(it.cross_entropy, ".3f")} | {format_optional(it.perplexity, ".2f")} |"
+            f"| `{item.item_id}` | `{item.category}` | {status} | `{expected_text}` | `{generated_text}` | "
+            f"{format_optional(item.cross_entropy, ".3f")} | {format_optional(item.perplexity, ".2f")} |"
         )
     lines.append("")
     return "\n".join(lines)
@@ -399,7 +400,6 @@ class MockEvalServer(BaseHTTPRequestHandler):
             self.send_error(400, "logprobs must be a boolean")
             return
         prompt = body.get("prompt", "")
-        # Return deterministic expected answers matching prompt expectations
         if "capital of France" in prompt:
             text = " Paris, France."
             logprobs = [-0.15, -0.05, -0.01]
@@ -477,7 +477,6 @@ def run_self_test() -> int:
         assert report.mean_cross_entropy < 0.2
         assert report.perplexity < 1.5
 
-        # Format tests
         text_out = format_text_report(report)
         assert "HawkPoint NPU Model Quality" in text_out
         assert "100.0%" in text_out
@@ -591,7 +590,6 @@ def main(argv: list[str] | None = None) -> int:
     else:
         print(output_str)
 
-    # Check SLA gates
     failed_slas = []
     if args.max_perplexity is not None and report.perplexity is None:
         failed_slas.append("Perplexity is unavailable: the API returned no valid token logprobs")
