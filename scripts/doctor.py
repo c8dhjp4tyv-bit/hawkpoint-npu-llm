@@ -315,11 +315,9 @@ def format_text_report(diag: dict) -> str:
         "==================================================",
     ]
 
-    # OS
     os_c = c["os_and_cpu"]
     lines.append(f"{_badge(os_c['status'])} Operating System: {os_c['os']} {os_c['arch']} (kernel {os_c['kernel']})")
 
-    # NPU Hardware
     npu_c = c["npu_hardware"]
     if npu_c["accel_nodes"]:
         lines.append(f"{_badge(npu_c['status'])} NPU Device Nodes: {', '.join(npu_c['accel_nodes'])} (rw={npu_c['user_accessible']})")
@@ -328,19 +326,15 @@ def format_text_report(diag: dict) -> str:
 
     lines.append(f"{_badge(CheckStatus.OK if npu_c['driver_loaded'] else CheckStatus.WARN)} amdxdna Driver: {'loaded' if npu_c['driver_loaded'] else 'not loaded'}")
 
-    # XRT
     xrt_c = c["xrt_runtime"]
     lines.append(f"{_badge(xrt_c['status'])} XRT Userspace: {'Installed' if xrt_c['xrt_installed'] else 'Missing'}")
 
-    # Python
     py_c = c["python_environment"]
     lines.append(f"{_badge(py_c['status'])} Python Packages: {len(py_c['installed'])} present" + (f", {len(py_c['missing'])} missing" if py_c['missing'] else ""))
 
-    # Models
     mod_c = c["model_catalog"]
     lines.append(f"{_badge(mod_c['status'])} Converted Models: {mod_c['models_count']} found in {mod_c['models_dir']}")
 
-    # Network / Services
     net_c = c["network_services"]
     if net_c["api_server_active"]:
         state = "ready" if net_c["api_server_ready"] else "starting/draining"
@@ -350,11 +344,9 @@ def format_text_report(diag: dict) -> str:
 
     lines.append("--------------------------------------------------")
 
-    # Collect remediation actions
     actions = []
     for item in c.values():
-        for r in item.get("remediation", []):
-            actions.append(r)
+        actions.extend(item.get("remediation", []))
         for issue in item.get("issues", []):
             if not item.get("remediation"):
                 actions.append(issue)

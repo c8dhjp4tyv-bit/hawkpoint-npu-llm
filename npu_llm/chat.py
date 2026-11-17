@@ -225,7 +225,6 @@ def main(argv: list[str] | None = None) -> int:
     use_api = bool(api_url)
 
     if not use_api:
-        # Check if local NPU runtime is available
         try:
             from runtime.generate import NPUDecoder  # noqa: F401
         except (ImportError, ModuleNotFoundError):
@@ -242,7 +241,6 @@ def main(argv: list[str] | None = None) -> int:
     messages = [{"role": "system", "content": args.system_prompt}]
 
     if use_api:
-        # Determine model identifier
         model_id = args.model
         if not model_id:
             available = list_api_models(api_url, args.api_key)
