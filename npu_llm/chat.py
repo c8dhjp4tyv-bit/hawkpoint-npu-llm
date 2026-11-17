@@ -244,7 +244,6 @@ def main(argv: list[str] | None = None) -> int:
         if not model_id:
             available = list_api_models(api_url, args.api_key)
             model_id = available[0] if available else "smollm2-135m-xdna1"
-
     else:
         from runtime.generate import NPUDecoder
 
