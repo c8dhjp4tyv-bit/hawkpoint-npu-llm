@@ -1064,18 +1064,19 @@ class NPUDecoder:
         # their token starts in the generated text, until that text is emitted.
         # Entries for text a stop sequence discards are never reported.
         pending_logprobs = []
-        selected_entry = {}
+        selected_entry = None
         generated_bytes = 0
         emitted_bytes = 0
 
         def choose(logits):
+            nonlocal selected_entry
             token = (
                 int(np.argmax(logits))
                 if sampler.greedy
                 else sampler.select(logits, history)
             )
             if top_logprobs is not None:
-                selected_entry["entry"] = self._logprob_entry(
+                selected_entry = self._logprob_entry(
                     logits, token, top_logprobs
                 )
             return token
@@ -1129,7 +1130,8 @@ class NPUDecoder:
         while len(generated) < max_new_tokens:
             # The end-of-turn token is not part of the returned content, so
             # its log probability is dropped with it.
-            entry = selected_entry.pop("entry", None)
+            entry = selected_entry
+            selected_entry = None
             if next_token == self.tokenizer.eos_id:
                 finish_reason = "stop"
                 break

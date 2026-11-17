@@ -36,8 +36,7 @@ class RequestBenchmarkResult:
 def fetch_metrics(base_url: str, api_key: str | None = None) -> dict[str, float]:
     """Fetch and parse current Prometheus metrics from /metrics."""
     url = f"{base_url.rstrip('/')}/metrics"
-    headers = {}
-    req = urllib.request.Request(url, headers=headers, method="GET")
+    req = urllib.request.Request(url, method="GET")
     metrics: dict[str, float] = {}
     try:
         with open_api_request(req, api_key, timeout=5) as resp:
@@ -127,13 +126,13 @@ def execute_single_request(
                             if first_token_time is None:
                                 first_token_time = time.monotonic()
                     if "usage" in data and data["usage"]:
-                        u = data["usage"]
-                        count = u.get("completion_tokens")
+                        usage = data["usage"]
+                        count = usage.get("completion_tokens")
                         if type(count) is int and count >= 0:
                             generated_tokens = count
                             token_count_known = True
-                        if "prompt_tokens" in u:
-                            prompt_tokens = u["prompt_tokens"]
+                        if "prompt_tokens" in usage:
+                            prompt_tokens = usage["prompt_tokens"]
                 if not stream_done:
                     raise RuntimeError("Incomplete API stream: missing [DONE]")
             else:
@@ -197,6 +196,19 @@ def _percentile(data: list[float], pct: float) -> float:
     return sorted_data[floor_idx] * (1.0 - weight) + sorted_data[ceil_idx] * weight
 
 
+def _summarize_measurements(values, digits, *, include_p99=False):
+    summary = {
+        "min": round(min(values), digits) if values else None,
+        "p50": round(_percentile(values, 50), digits) if values else None,
+        "p95": round(_percentile(values, 95), digits) if values else None,
+    }
+    if include_p99:
+        summary["p99"] = round(_percentile(values, 99), digits) if values else None
+    summary["max"] = round(max(values), digits) if values else None
+    summary["mean"] = round(statistics.mean(values), digits) if values else None
+    return summary
+
+
 def run_benchmark(
     base_url: str,
     model: str,
@@ -227,8 +239,8 @@ def run_benchmark(
             )
             for _ in range(num_requests)
         ]
-        for f in as_completed(futures):
-            results.append(f.result())
+        for future in as_completed(futures):
+            results.append(future.result())
 
     wall_duration = time.monotonic() - wall_start
     final_metrics = fetch_metrics(base_url, api_key)
@@ -236,7 +248,7 @@ def run_benchmark(
     successful = [r for r in results if r.status_code == 200 and r.error is None]
     latencies = [r.total_latency_seconds for r in successful]
     ttfts = [r.ttft_seconds for r in successful if r.ttft_seconds is not None]
-    tps_list = [r.tokens_per_second for r in successful if r.token_count_known]
+    token_rates = [r.tokens_per_second for r in successful if r.token_count_known]
     total_tokens = sum(r.generated_tokens for r in successful)
     aggregate_tps = (total_tokens / wall_duration) if wall_duration > 0 else 0.0
 
@@ -260,31 +272,11 @@ def run_benchmark(
             "unknown_token_count_requests": sum(not r.token_count_known for r in successful),
             "aggregate_tokens_per_second": round(aggregate_tps, 2),
         },
-        "latency_seconds": {
-            "min": round(min(latencies), 4) if latencies else None,
-            "p50": round(_percentile(latencies, 50), 4) if latencies else None,
-            "p95": round(_percentile(latencies, 95), 4) if latencies else None,
-            "p99": round(_percentile(latencies, 99), 4) if latencies else None,
-            "max": round(max(latencies), 4) if latencies else None,
-            "mean": round(statistics.mean(latencies), 4) if latencies else None,
-        },
-        "ttft_seconds": {
-            "min": round(min(ttfts), 4) if ttfts else None,
-            "p50": round(_percentile(ttfts, 50), 4) if ttfts else None,
-            "p95": round(_percentile(ttfts, 95), 4) if ttfts else None,
-            "p99": round(_percentile(ttfts, 99), 4) if ttfts else None,
-            "max": round(max(ttfts), 4) if ttfts else None,
-            "mean": round(statistics.mean(ttfts), 4) if ttfts else None,
-        }
+        "latency_seconds": _summarize_measurements(latencies, 4, include_p99=True),
+        "ttft_seconds": _summarize_measurements(ttfts, 4, include_p99=True)
         if stream
         else None,
-        "tokens_per_second": {
-            "min": round(min(tps_list), 2) if tps_list else None,
-            "p50": round(_percentile(tps_list, 50), 2) if tps_list else None,
-            "p95": round(_percentile(tps_list, 95), 2) if tps_list else None,
-            "max": round(max(tps_list), 2) if tps_list else None,
-            "mean": round(statistics.mean(tps_list), 2) if tps_list else None,
-        },
+        "tokens_per_second": _summarize_measurements(token_rates, 2),
         "metrics_diff": {
             k: round(final_metrics.get(k, 0.0) - initial_metrics.get(k, 0.0), 2)
             for k in set(initial_metrics) | set(final_metrics)
@@ -297,25 +289,27 @@ def run_benchmark(
 
 def format_text_report(report: dict) -> str:
     """Format benchmark results into human-readable terminal text."""
-    c = report["configuration"]
-    s = report["summary"]
-    lat = report["latency_seconds"]
+    config = report["configuration"]
+    summary = report["summary"]
+    latency = report["latency_seconds"]
     ttft = report.get("ttft_seconds")
     tps = report["tokens_per_second"]
 
     lines = [
         "==================================================",
-        f" HawkPoint NPU API Benchmark: {c['model']}",
+        f" HawkPoint NPU API Benchmark: {config['model']}",
         "==================================================",
-        f"Endpoint:      {c['endpoint']} (stream={c['stream']})",
-        f"Requests:      {s['successful_requests']}/{s['total_requests']} succeeded ({s['success_rate_percent']:.1f}%)",
-        f"Concurrency:   {c['concurrency']}",
-        f"Wall Time:     {s['wall_time_seconds']:.2f}s",
-        f"Tokens Gen:    {s['total_generated_tokens']} tokens",
-        f"Aggregate TPS: {s['aggregate_tokens_per_second']:.2f} tok/s",
+        f"Endpoint:      {config['endpoint']} (stream={config['stream']})",
+        f"Requests:      {summary['successful_requests']}/{summary['total_requests']} "
+        f"succeeded ({summary['success_rate_percent']:.1f}%)",
+        f"Concurrency:   {config['concurrency']}",
+        f"Wall Time:     {summary['wall_time_seconds']:.2f}s",
+        f"Tokens Gen:    {summary['total_generated_tokens']} tokens",
+        f"Aggregate TPS: {summary['aggregate_tokens_per_second']:.2f} tok/s",
         "--------------------------------------------------",
         "Latency (s):",
-        f"  min: {lat['min']}  p50: {lat['p50']}  p95: {lat['p95']}  p99: {lat['p99']}  max: {lat['max']}",
+        f"  min: {latency['min']}  p50: {latency['p50']}  p95: {latency['p95']}  "
+        f"p99: {latency['p99']}  max: {latency['max']}",
     ]
     if ttft:
         lines.extend([
@@ -332,25 +326,26 @@ def format_text_report(report: dict) -> str:
 
 def format_markdown_report(report: dict) -> str:
     """Format benchmark results into GitHub Markdown table."""
-    c = report["configuration"]
-    s = report["summary"]
-    lat = report["latency_seconds"]
+    config = report["configuration"]
+    summary = report["summary"]
+    latency = report["latency_seconds"]
     ttft = report.get("ttft_seconds") or {}
     tps = report["tokens_per_second"]
 
     lines = [
-        f"## API Benchmark Report: `{c['model']}`",
+        f"## API Benchmark Report: `{config['model']}`",
         "",
         "| Metric | Value |",
         "|:-------|:------|",
-        f"| **Target Endpoint** | `{c['endpoint']}` |",
-        f"| **Concurrency** | `{c['concurrency']}` |",
-        f"| **Total / Success Requests** | `{s['successful_requests']} / {s['total_requests']}` ({s['success_rate_percent']:.1f}%) |",
-        f"| **Wall Time** | `{s['wall_time_seconds']}s` |",
-        f"| **Total Generated Tokens** | `{s['total_generated_tokens']}` |",
-        f"| **Aggregate Throughput** | **`{s['aggregate_tokens_per_second']} tok/s`** |",
+        f"| **Target Endpoint** | `{config['endpoint']}` |",
+        f"| **Concurrency** | `{config['concurrency']}` |",
+        f"| **Total / Success Requests** | `{summary['successful_requests']} / "
+        f"{summary['total_requests']}` ({summary['success_rate_percent']:.1f}%) |",
+        f"| **Wall Time** | `{summary['wall_time_seconds']}s` |",
+        f"| **Total Generated Tokens** | `{summary['total_generated_tokens']}` |",
+        f"| **Aggregate Throughput** | **`{summary['aggregate_tokens_per_second']} tok/s`** |",
         f"| **TTFT (p50 / p95)** | `{ttft.get('p50', 'N/A')}s / {ttft.get('p95', 'N/A')}s` |",
-        f"| **Latency (p50 / p95)** | `{lat.get('p50', 'N/A')}s / {lat.get('p95', 'N/A')}s` |",
+        f"| **Latency (p50 / p95)** | `{latency.get('p50', 'N/A')}s / {latency.get('p95', 'N/A')}s` |",
         f"| **Decode TPS (p50 / Mean)** | `{tps.get('p50', 'N/A')} / {tps.get('mean', 'N/A')} tok/s` |",
         "",
     ]

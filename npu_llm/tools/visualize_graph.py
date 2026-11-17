@@ -287,25 +287,14 @@ def generate_svg(design_name: str) -> str:
     margin_x = 40
     margin_y = 70
 
-    # Grid tile layout:
-    # 4 columns (col 0..3), rows 0..3 (Y flipped so row 0 is bottom or top)
-    # In AIE2 hardware architecture:
-    # Row 0: Shim DMA (bottom / physical interface)
-    # Row 1: MemTile
-    # Rows 2..3: Compute Cores
-    # To read naturally from top to bottom (compute flow):
-    # Let's arrange Row 0 (Shim) at top, Row 1 (MemTile) in middle, Rows 2 & 3 below, or
-    # Physical array view: Row 3 at top, Row 2, Row 1, Row 0 at bottom.
-    # Physical view is standard for hardware engineers.
     cell_w = 200
     cell_h = 110
     col_gap = 25
     row_gap = 35
 
     def get_coords(col: int, row: int) -> tuple[float, float]:
-        # Physical coordinates: row 0 is bottom (Y=520), row 1 (Y=380), row 2 (Y=240), row 3 (Y=100)
         x = margin_x + col * (cell_w + col_gap)
-        # Flip row so row 3 is topmost, row 0 is bottom
+        # Match the physical array: compute rows at the top, shim DMA at the bottom.
         y = margin_y + (3 - row) * (cell_h + row_gap)
         return x, y
 

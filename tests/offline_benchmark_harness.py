@@ -114,39 +114,17 @@ def run_offline_harness(
         raise ValueError("top_k must be at least 2")
     if not math.isfinite(margin_threshold) or margin_threshold <= 0:
         raise ValueError("margin_threshold must be finite and positive")
-    if scenario == "pass":
-        # Tolerates ambiguous flips, no high-margin divergence
-        data = build_synthetic_placement_data(
-            positions=positions,
-            top_k=top_k,
-            margin_threshold=margin_threshold,
-            diverge_on_confident=False,
-            diverge_on_ambiguous=True,
-            seed=seed,
-        )
-    elif scenario == "fail_confident":
-        # Introduces a confident mismatch on xdna_only
-        data = build_synthetic_placement_data(
-            positions=positions,
-            top_k=top_k,
-            margin_threshold=margin_threshold,
-            diverge_on_confident=True,
-            diverge_on_ambiguous=True,
-            seed=seed,
-        )
-    elif scenario == "exact":
-        # Exact agreement across all placements
-        data = build_synthetic_placement_data(
-            positions=positions,
-            top_k=top_k,
-            margin_threshold=margin_threshold,
-            diverge_on_confident=False,
-            diverge_on_ambiguous=False,
-            seed=seed,
-        )
-    else:
+    if scenario not in ("pass", "fail_confident", "exact"):
         raise ValueError(f"unknown scenario: {scenario!r}")
 
+    data = build_synthetic_placement_data(
+        positions=positions,
+        top_k=top_k,
+        margin_threshold=margin_threshold,
+        diverge_on_confident=scenario == "fail_confident",
+        diverge_on_ambiguous=scenario != "exact",
+        seed=seed,
+    )
     report, failures = evaluate_agreement(
         data,
         reference_name="cpu_only",

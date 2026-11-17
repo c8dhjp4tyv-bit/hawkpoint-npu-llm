@@ -377,40 +377,21 @@ def capability_report(observed, xrt_output, probe):
             if xrt_visible
             else "xrt-smi did not report an NPU",
         },
-        "xrt_can_open_device": {
-            "ok": probe_ok,
-            "required": True,
-            "detail": "covered by the known-good XRT probe"
-            if probe_ok
-            else probe.get("detail", "XRT probe failed"),
-        },
-        "xrt_can_create_hwctx": {
-            "ok": probe_ok,
-            "required": True,
-            "detail": "covered by the known-good XRT probe"
-            if probe_ok
-            else probe.get("detail", "XRT probe failed"),
-        },
-        "xrt_can_allocate_bo": {
-            "ok": probe_ok,
-            "required": True,
-            "detail": "covered by the known-good XRT probe"
-            if probe_ok
-            else probe.get("detail", "XRT probe failed"),
-        },
-        "xrt_can_sync_bo": {
-            "ok": probe_ok,
-            "required": True,
-            "detail": "covered by the known-good XRT probe"
-            if probe_ok
-            else probe.get("detail", "XRT probe failed"),
-        },
-        "xrt_can_load_xclbin": {
-            "ok": probe_ok,
-            "required": True,
-            "detail": "covered by the known-good XRT probe"
-            if probe_ok
-            else probe.get("detail", "XRT probe failed"),
+        **{
+            name: {
+                "ok": probe_ok,
+                "required": True,
+                "detail": "covered by the known-good XRT probe"
+                if probe_ok
+                else probe.get("detail", "XRT probe failed"),
+            }
+            for name in (
+                "xrt_can_open_device",
+                "xrt_can_create_hwctx",
+                "xrt_can_allocate_bo",
+                "xrt_can_sync_bo",
+                "xrt_can_load_xclbin",
+            )
         },
         "xrt_can_submit_kernel": {
             "ok": probe_ok,

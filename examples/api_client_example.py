@@ -108,9 +108,8 @@ def stream_chat(
                 usage = chunk["usage"]
 
     total_time = time.perf_counter() - start_time
-    print()  # newline after completion
+    print()
 
-    # Fallback token count from usage if available
     if usage and "completion_tokens" in usage:
         generated_tokens = usage["completion_tokens"]
 
@@ -255,21 +254,17 @@ def run_self_test() -> bool:
 
     base_url = f"http://127.0.0.1:{port}"
     try:
-        # 1. Health
         health = check_health(base_url)
         assert health["status"] == "ready"
 
-        # 2. Models
         models = list_models(base_url)
         assert len(models) == 1
         assert models[0]["id"] == "smollm2-135m-xdna1"
 
-        # 3. Stream chat
         metrics = stream_chat(base_url, "Tell me a joke")
         assert "Hello from HawkPoint NPU!" in metrics["text"]
         assert metrics["generated_tokens"] == 5
 
-        # 4. Text completion with echo
         out = complete_text(base_url, "Prefix:", echo=True)
         assert out == "Prefix: completed text"
 

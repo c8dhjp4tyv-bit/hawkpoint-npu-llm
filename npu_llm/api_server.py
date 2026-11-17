@@ -109,14 +109,14 @@ def _validate_prompt(value):
     if isinstance(value, list) and value:
         if len(value) > 1:
             raise ValueError("only a single prompt per request is supported")
-        for item in value:
-            if not isinstance(item, str):
-                raise ValueError("each prompt in array must be a string")
-            if not item:
-                raise ValueError("prompt in array cannot be empty")
-            if len(item) > 32_768:
-                raise ValueError("prompt item exceeds 32768 characters")
-        return value[0]
+        prompt = value[0]
+        if not isinstance(prompt, str):
+            raise ValueError("each prompt in array must be a string")
+        if not prompt:
+            raise ValueError("prompt in array cannot be empty")
+        if len(prompt) > 32_768:
+            raise ValueError("prompt item exceeds 32768 characters")
+        return prompt
     raise ValueError("prompt must be a non-empty string or array of strings")
 
 
@@ -154,6 +154,15 @@ def _usage(stats):
             "cached_tokens": int(stats["cached_prompt_tokens"])
         }
     return usage
+
+
+def _accumulate_usage(total, stats):
+    total["prompt_tokens"] += stats.get("prompt_tokens", 0)
+    total["generated_tokens"] += stats.get("generated_tokens", 0)
+    if "cached_prompt_tokens" in stats:
+        total["cached_prompt_tokens"] = (
+            total.get("cached_prompt_tokens", 0) + stats["cached_prompt_tokens"]
+        )
 
 
 def _generation_options(sampling=None, stop=None, logprobs=None):
@@ -1194,8 +1203,7 @@ def make_handler(engine, config=None, metrics=None):
                 is_text = endpoint == "/v1/completions"
                 echo = False
                 if is_text:
-                    prompt = _validate_prompt(request.get("prompt"))
-                    input_payload = prompt
+                    input_payload = _validate_prompt(request.get("prompt"))
                     echo = request.get("echo", False)
                     if not isinstance(echo, bool):
                         raise ValueError("echo must be a boolean")
@@ -1207,8 +1215,7 @@ def make_handler(engine, config=None, metrics=None):
                         if not isinstance(best_of, int) or best_of != n:
                             raise ValueError("best_of is not supported when different from n")
                 else:
-                    messages = _validate_messages(request.get("messages"))
-                    input_payload = messages
+                    input_payload = _validate_messages(request.get("messages"))
                 model_id = request.get("model") or engine.default_model_id
                 if not engine.has_model(model_id):
                     self._error(
@@ -1353,10 +1360,7 @@ def make_handler(engine, config=None, metrics=None):
                     return
                 stats = stats or {}
                 last_stats = stats
-                total_stats["prompt_tokens"] += stats.get("prompt_tokens", 0)
-                total_stats["generated_tokens"] += stats.get("generated_tokens", 0)
-                if "cached_prompt_tokens" in stats:
-                    total_stats["cached_prompt_tokens"] = total_stats.get("cached_prompt_tokens", 0) + stats["cached_prompt_tokens"]
+                _accumulate_usage(total_stats, stats)
                 finish_reason = stats.get("finish_reason", "stop")
                 choices.append(
                     {
@@ -1463,10 +1467,7 @@ def make_handler(engine, config=None, metrics=None):
                             if final_stats is not None:
                                 stats = final_stats
                     stats = stats or {}
-                    total_stats["prompt_tokens"] += stats.get("prompt_tokens", 0)
-                    total_stats["generated_tokens"] += stats.get("generated_tokens", 0)
-                    if "cached_prompt_tokens" in stats:
-                        total_stats["cached_prompt_tokens"] = total_stats.get("cached_prompt_tokens", 0) + stats["cached_prompt_tokens"]
+                    _accumulate_usage(total_stats, stats)
                     send(
                         {
                             "id": completion_id,
@@ -1571,10 +1572,7 @@ def make_handler(engine, config=None, metrics=None):
                     return
                 stats = stats or {}
                 last_stats = stats
-                total_stats["prompt_tokens"] += stats.get("prompt_tokens", 0)
-                total_stats["generated_tokens"] += stats.get("generated_tokens", 0)
-                if "cached_prompt_tokens" in stats:
-                    total_stats["cached_prompt_tokens"] = total_stats.get("cached_prompt_tokens", 0) + stats["cached_prompt_tokens"]
+                _accumulate_usage(total_stats, stats)
                 finish_reason = stats.get("finish_reason", "stop")
                 text_logprobs = None
                 if logprobs is not None:
@@ -1686,10 +1684,7 @@ def make_handler(engine, config=None, metrics=None):
                             if final_stats is not None:
                                 stats = final_stats
                     stats = stats or {}
-                    total_stats["prompt_tokens"] += stats.get("prompt_tokens", 0)
-                    total_stats["generated_tokens"] += stats.get("generated_tokens", 0)
-                    if "cached_prompt_tokens" in stats:
-                        total_stats["cached_prompt_tokens"] = total_stats.get("cached_prompt_tokens", 0) + stats["cached_prompt_tokens"]
+                    _accumulate_usage(total_stats, stats)
                     send(
                         {
                             "id": completion_id,

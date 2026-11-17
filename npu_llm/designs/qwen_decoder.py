@@ -163,7 +163,9 @@ def qwen_decoder(
         for _ in range_(layers):
             x, g, out = xp.acquire(1), gp.acquire(1), op.acquire(1)
             fn(x, g, out)
-            xp.release(1); gp.release(1); op.release(1)
+            xp.release(1)
+            gp.release(1)
+            op.release(1)
 
     def project64(wp, xp, op, fn, chunks):
         for _ in range_(layers):
@@ -181,19 +183,30 @@ def qwen_decoder(
         for _ in range_(layers):
             lut, bias, out = lp.acquire(1), bp.acquire(1), op.acquire(1)
             for head in range_(14):
-                row = ip.acquire(1); fn(row, lut, bias, out, head, 0); ip.release(1)
+                row = ip.acquire(1)
+                fn(row, lut, bias, out, head, 0)
+                ip.release(1)
             for head in range_(2):
-                row = ip.acquire(1); fn(row, lut, bias, out, head, 1); ip.release(1)
+                row = ip.acquire(1)
+                fn(row, lut, bias, out, head, 1)
+                ip.release(1)
             for head in range_(2):
-                row = ip.acquire(1); fn(row, lut, bias, out, head, 2); ip.release(1)
-            lp.release(1); bp.release(1); op.release(1)
+                row = ip.acquire(1)
+                fn(row, lut, bias, out, head, 2)
+                ip.release(1)
+            lp.release(1)
+            bp.release(1)
+            op.release(1)
 
     def attend(pp, cip, cop, op, fn):
         for _ in range_(layers):
             p, ci = pp.acquire(1), cip.acquire(1)
             co, out = cop.acquire(1), op.acquire(1)
             fn(p, ci, co, out)
-            pp.release(1); cip.release(1); cop.release(1); op.release(1)
+            pp.release(1)
+            cip.release(1)
+            cop.release(1)
+            op.release(1)
 
     def add64(pp, rp, op, fn):
         for _ in range_(layers):
@@ -202,15 +215,20 @@ def qwen_decoder(
                 projection = pp.acquire(1)
                 fn(projection, residual, out, block * 64)
                 pp.release(1)
-            rp.release(1); op.release(1)
+            rp.release(1)
+            op.release(1)
 
     def activate(ip, op, store_fn, up_fn):
         for _ in range_(layers):
             out = op.acquire(1)
             for block in range_(76):
-                gate = ip.acquire(1); store_fn(gate, out, block * 64); ip.release(1)
+                gate = ip.acquire(1)
+                store_fn(gate, out, block * 64)
+                ip.release(1)
             for block in range_(76):
-                up = ip.acquire(1); up_fn(up, out, block * 64); ip.release(1)
+                up = ip.acquire(1)
+                up_fn(up, out, block * 64)
+                ip.release(1)
             op.release(1)
 
     def project32(wp, xp, op, fn):
@@ -232,7 +250,8 @@ def qwen_decoder(
                 projection = pp.acquire(1)
                 fn(projection, residual, out, block * 32)
                 pp.release(1)
-            rp.release(1); op.release(1)
+            rp.release(1)
+            op.release(1)
 
     workers = [
         Worker(normalize, [finitial.cons(), fgq.cons(), fnorm_q.prod(), rms]),
