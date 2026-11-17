@@ -212,7 +212,9 @@ def decoder_layer(
         for _ in range_(layers):
             x, g, out = xp.acquire(1), gp.acquire(1), op.acquire(1)
             fn(x, g, out)
-            xp.release(1); gp.release(1); op.release(1)
+            xp.release(1)
+            gp.release(1)
+            op.release(1)
 
     def project64(wp, xp, op, fn, blocks):
         for _ in range_(layers):
@@ -226,7 +228,9 @@ def decoder_layer(
                     fn(w, x, out, 0)
                 wp.release(1)
                 if not quantized:
-                    w = wp.acquire(1); fn(w, x, out, 32); wp.release(1)
+                    w = wp.acquire(1)
+                    fn(w, x, out, 32)
+                    wp.release(1)
                 op.release(1)
             xp.release(1)
 
@@ -234,19 +238,31 @@ def decoder_layer(
         for _ in range_(layers):
             lut, out = lp.acquire(1), op.acquire(1)
             for head in range_(9):
-                row = ip.acquire(1); fn(row, lut, out, head, 0); ip.release(1)
+                row = ip.acquire(1)
+                fn(row, lut, out, head, 0)
+                ip.release(1)
             for head in range_(3):
-                row = ip.acquire(1); fn(row, lut, out, head, 1); ip.release(1)
+                row = ip.acquire(1)
+                fn(row, lut, out, head, 1)
+                ip.release(1)
             for head in range_(3):
-                row = ip.acquire(1); fn(row, lut, out, head, 2); ip.release(1)
-            lp.release(1); op.release(1)
+                row = ip.acquire(1)
+                fn(row, lut, out, head, 2)
+                ip.release(1)
+            lp.release(1)
+            op.release(1)
 
     def attention(pp, cip, cop, op, fn):
         for _ in range_(layers):
-            p = pp.acquire(1); ci = cip.acquire(1)
-            co = cop.acquire(1); out = op.acquire(1)
+            p = pp.acquire(1)
+            ci = cip.acquire(1)
+            co = cop.acquire(1)
+            out = op.acquire(1)
             fn(p, ci, co, out)
-            pp.release(1); cip.release(1); cop.release(1); op.release(1)
+            pp.release(1)
+            cip.release(1)
+            cop.release(1)
+            op.release(1)
 
     def residual64(pp, rp, op, fn):
         for _ in range_(layers):
@@ -255,15 +271,20 @@ def decoder_layer(
                 projection = pp.acquire(1)
                 fn(projection, residual, out, block * 64)
                 pp.release(1)
-            rp.release(1); op.release(1)
+            rp.release(1)
+            op.release(1)
 
     def activate(ip, op, store_fn, up_fn):
         for _ in range_(layers):
             out = op.acquire(1)
             for block in range_(24):
-                gate = ip.acquire(1); store_fn(gate, out, block * 64); ip.release(1)
+                gate = ip.acquire(1)
+                store_fn(gate, out, block * 64)
+                ip.release(1)
             for block in range_(24):
-                up = ip.acquire(1); up_fn(up, out, block * 64); ip.release(1)
+                up = ip.acquire(1)
+                up_fn(up, out, block * 64)
+                ip.release(1)
             op.release(1)
 
     def project32(wp, xp, op, fn):
@@ -278,7 +299,9 @@ def decoder_layer(
                     fn(w, x, out, 0)
                 wp.release(1)
                 if not quantized:
-                    w = wp.acquire(1); fn(w, x, out, 16); wp.release(1)
+                    w = wp.acquire(1)
+                    fn(w, x, out, 16)
+                    wp.release(1)
                 op.release(1)
             xp.release(1)
 
@@ -291,7 +314,8 @@ def decoder_layer(
                 for part in parts:
                     src, dst = part.acquire(1), op.acquire(1)
                     fn(src, dst)
-                    part.release(1); op.release(1)
+                    part.release(1)
+                    op.release(1)
 
     def residual32(pp, rp, op, fn):
         for _ in range_(layers):
@@ -300,22 +324,26 @@ def decoder_layer(
                 projection = pp.acquire(1)
                 fn(projection, residual, out, block * 32)
                 pp.release(1)
-            rp.release(1); op.release(1)
+            rp.release(1)
+            op.release(1)
 
     def route_hidden(initial_port, feedback_port, current_port, final_port, fn):
         initial = initial_port.acquire(1)
         current = current_port.acquire(1)
         fn(initial, current)
-        initial_port.release(1); current_port.release(1)
+        initial_port.release(1)
+        current_port.release(1)
         for _ in range(layers - 1):
             feedback = feedback_port.acquire(1)
             current = current_port.acquire(1)
             fn(feedback, current)
-            feedback_port.release(1); current_port.release(1)
+            feedback_port.release(1)
+            current_port.release(1)
         feedback = feedback_port.acquire(1)
         final = final_port.acquire(1)
         fn(feedback, final)
-        feedback_port.release(1); final_port.release(1)
+        feedback_port.release(1)
+        final_port.release(1)
 
     workers = [
         Worker(normalize, [finitial.cons(), fgq.cons(), fnorm_q.prod(), rms]),
