@@ -26,7 +26,11 @@ from designs.qkv_rope import qkv_rope
 from designs.qwen_decoder import qwen_decoder
 from designs.rmsnorm import rmsnorm
 from designs.tensor_copy import slice_bf16
-from context_window import DEFAULT_CONTEXT_LENGTH, validate_context_length
+from context_window import (
+    DEFAULT_CONTEXT_LENGTH,
+    resolve_context_length,
+    validate_context_length,
+)
 from runtime.model import XDNA1Model
 from runtime.cpu_backend import CPUDecoderStage, _bf16 as _bf16_cpu
 from runtime.sampling import GREEDY, Sampler, SamplingParams
@@ -46,14 +50,13 @@ class NPUDecoder:
         # The engine streams the K/V cache in tiles, so the context length is
         # a runtime choice bounded only by memory. An explicit argument wins,
         # then HAWKPOINT_CONTEXT, then the converted model's declaration.
-        requested = (
-            context_length
+        context_length = (
+            validate_context_length(int(context_length))
             if context_length is not None
-            else os.environ.get("HAWKPOINT_CONTEXT")
-            or self.model.metadata.get("context_length")
-            or DEFAULT_CONTEXT_LENGTH
+            else resolve_context_length(
+                self.model.metadata.get("context_length")
+            )
         )
-        context_length = validate_context_length(int(requested))
         self.model_family = self.model.metadata.get("model_family", "llama")
         default_system = (
             "You are Qwen, created by Alibaba Cloud. You are a helpful assistant."

@@ -9,6 +9,8 @@ context length; a 64-token model simply uses one partially filled tile.
 Dependency-free so both the designs and the model catalog can import it.
 """
 
+import os
+
 DEFAULT_CONTEXT_LENGTH = 8192
 MAX_CONTEXT_LENGTH = 8192
 KV_TILE = 128
@@ -27,6 +29,20 @@ def validate_context_length(value):
             f"context_length must be between 1 and {MAX_CONTEXT_LENGTH}"
         )
     return value
+
+
+def resolve_context_length(declared=None):
+    """Context a decoder runs with: ``HAWKPOINT_CONTEXT``, then the model.
+
+    Callers that need a number before a decoder exists (the API's per-request
+    token limit) use this too, so the bound they advertise is the one the
+    decoder will actually apply. An unusable override raises, exactly where the
+    decoder would; the API turns that into the model's own declaration.
+    """
+    override = os.environ.get("HAWKPOINT_CONTEXT")
+    if override:
+        return validate_context_length(int(override))
+    return validate_context_length(int(declared or DEFAULT_CONTEXT_LENGTH))
 
 
 def context_tiles(context_length):

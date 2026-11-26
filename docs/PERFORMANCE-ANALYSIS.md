@@ -26,7 +26,8 @@ decoder engine described below. They remain the reference for
 | Historical decoder-step median before accounting fix | 18.42 token/s |
 | Native W8 TTFT, 35-token prompt | 1.47–1.62 s session medians |
 | End-to-end TTFT for acceptance prompt | 2.56 s |
-| Context window (W8 and decoder engine) | 8192 tokens |
+| Context window (row-split decoder engine) | 8192 tokens |
+| Context window (chunked graphs, including W8) | 64 tokens |
 
 For the 32-token streaming measurement, 15.93 token/s corresponds to about
 63 ms/token. The native benchmark can now be run with
@@ -248,8 +249,9 @@ exponentials, and the weighted values. Two DMA input channels per tile cannot
 hold "keys of pass 1", "keys of pass 2" and "key/value pairs" open at the
 same time, so each (layer, KV head) slice is streamed as four objects and the
 whole cache is one contiguous walk: two copies of the keys, then key/value
-pairs. The host writes every new key into both copies, which costs 138 MB of
-cache for 8192 positions (`4 × 8192 × 576` BF16 per layer over 30 layers).
+pairs. The host writes every new key into both copies, which costs 360 MiB of
+cache for 8192 positions: `4 × 8192 × 3 KV heads × 64 dim` BF16 per layer
+(4 × 8192 × 192 × 2 bytes = 12.6 MB) over 30 layers.
 
 Because the stream layout is fixed when the graph is compiled, the window is
 dispatched in steps of 128, 512, 2048 and 8192 tokens: the host reallocates

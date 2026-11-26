@@ -832,7 +832,9 @@ products.
 
 `HAWKPOINT_ENGINE=0` switches both models back to the chunked layer graphs
 described below, which also run hybrid NPU/CPU placements and the opt-in W8
-decoder. The engine's projections, norms, and final RMSNorm compute the same
+decoder. Those graphs hold a head's whole cache in tile memory and are built
+for 64 positions, so pair the switch with `HAWKPOINT_CONTEXT=64` (the decoder
+rejects a longer context rather than running it wrongly). The engine's projections, norms, and final RMSNorm compute the same
 BF16 values as the chunked path; its attention softmax runs on the vector unit
 with a lookup-table exponential, so a few near-tie tokens can differ. See the
 [performance analysis](docs/PERFORMANCE-ANALYSIS.md) for the measurements and
@@ -844,7 +846,7 @@ With the chunked layer graphs, each generated token follows this path:
 2. Run SmolLM decoder layers in persistent two-layer graph chunks (the Phoenix
    firmware reliably completes this chunk size); Qwen uses its own two-layer
    BF16 program.
-3. Keep the 8192-token K/V cache in NPU-addressable XRT buffers.
+3. Keep the 64-position K/V cache in NPU-addressable XRT buffers.
 4. Apply final RMSNorm and the model-specific LM head. SmolLM keeps the
    49k-vocabulary projection on host BLAS by default because it is faster on
    Hawk Point; set `HAWKPOINT_NPU_LM_HEAD=1` to force the NPU path.
@@ -878,16 +880,18 @@ statistics. The benchmark reports whether the measured median reaches the
   enough to hold the 8192-token version. Going past 512 on Qwen needs a
   different attention decomposition (a second hub core, or a cache staged
   through the MemTile), not a bigger buffer.
-- **8192-token context window, streamed per token**: The KV cache for 8192
-  positions (`4 × 8192 × 576 BF16` per layer, about 138 MB) lives in one
-  NPU-addressable XRT buffer; only one 128-token slice of it fits in tile
+- **8192-token context window, streamed per token**: The cache stream for 8192
+  positions (`4 × 8192 × 3 KV heads × 64 dim` BF16 per layer — two key copies
+  plus a key/value pair per position — about 360 MiB over 30 layers) lives in
+  one NPU-addressable XRT buffer; only one 128-token slice of it fits in tile
   memory at a time, so the hub tile reads the cache as a DDR stream, four
   objects per (layer, KV head, slice): two key passes and one key/value pair
   for each. The DMA window grows with the sequence through 128, 512, 2048 and
   8192 tokens, and a dispatch streams the whole window, so decode slows from
   about 10 ms to about 80 ms per token as the window grows. The chunked layer
   graphs (`HAWKPOINT_ENGINE=0`) still target 64 positions and refuse longer
-  prompts.
+  prompts; because a converted model now declares 8192, pair the fallback with
+  `HAWKPOINT_CONTEXT=64`, e.g. `HAWKPOINT_ENGINE=0 HAWKPOINT_CONTEXT=64`.
 - **Padlocked to XDNA1 (`npu1`, AIE2, 4 columns).** XDNA2 silicon (`npu2`,
   AIE2P: Strix Point, Strix Halo — 8 columns, larger local memory, shared
   caches) is not targeted. The IRON graph layouts, tile counts, and ObjectFifo

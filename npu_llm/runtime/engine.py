@@ -72,14 +72,17 @@ class DecoderEngine:
             np.array(view) for view in self._key_copies
         ]
         old_pairs = None if self._pairs is None else np.array(self._pairs)
-        self._key_copies = self._pairs = self._cache_host = None
-        self.cache = iron.zeros(
+        # Allocate first: if the NPU does not have room for the wider window the
+        # decoder is left exactly as it was, with its old views and tile count.
+        cache = iron.zeros(
             cache_elements(self.layers, tiles * KV_TILE),
             dtype=bfloat16,
             device="npu",
         )
+        self._key_copies = self._pairs = self._cache_host = None
+        self.cache = cache
         self.tiles = tiles
-        self._cache_host = self.cache.data
+        self._cache_host = cache.data
         # Host view of the cache stream: the header tile, then per layer and
         # KV head the two key passes followed by the key/value pairs, in the
         # order the hub consumes them.

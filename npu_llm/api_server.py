@@ -33,6 +33,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 from context_window import (  # noqa: E402
     DEFAULT_CONTEXT_LENGTH,
+    resolve_context_length,
     validate_context_length,
 )
 from runtime.sampling import GREEDY, SamplingParams  # noqa: E402
@@ -593,10 +594,21 @@ class CompletionEngine:
         return model_id in self.models
 
     def context_length(self, model_id):
-        """Return the configured model context length."""
-        return int(
-            self.models[model_id].get("context_length", DEFAULT_CONTEXT_LENGTH)
+        """Return the context this model would actually decode with.
+
+        ``HAWKPOINT_CONTEXT`` overrides the model's declaration inside the
+        decoder, so the per-request token limit has to apply the same rule;
+        otherwise a shorter override passes validation here and fails later.
+        """
+        declared = self.models[model_id].get(
+            "context_length", DEFAULT_CONTEXT_LENGTH
         )
+        try:
+            return resolve_context_length(declared)
+        except (TypeError, ValueError):
+            # An unusable override fails the decoder loudly when it loads; the
+            # token limit falls back to what the model itself declares.
+            return validate_context_length(int(declared))
 
     def _close_active(self):
         """Deterministically release the currently loaded decoder, if any.
@@ -761,10 +773,14 @@ class ProcessCompletionEngine:
         return model_id in self.models
 
     def context_length(self, model_id):
-        """Return the configured model context length."""
-        return int(
-            self.models[model_id].get("context_length", DEFAULT_CONTEXT_LENGTH)
+        """Return the context this model would actually decode with."""
+        declared = self.models[model_id].get(
+            "context_length", DEFAULT_CONTEXT_LENGTH
         )
+        try:
+            return resolve_context_length(declared)
+        except (TypeError, ValueError):
+            return validate_context_length(int(declared))
 
     @property
     def ready(self):
