@@ -6,12 +6,18 @@ import json
 import os
 from pathlib import Path
 import shutil
+import sys
 import tempfile
 import uuid
 
 import numpy as np
 from ml_dtypes import bfloat16  # noqa: F401 - registers BF16 with NumPy
 from safetensors import safe_open
+
+_PACKAGE_ROOT = Path(__file__).resolve().parents[1]
+if str(_PACKAGE_ROOT) not in sys.path:
+    sys.path.insert(0, str(_PACKAGE_ROOT))
+from context_window import DEFAULT_CONTEXT_LENGTH  # noqa: E402
 
 
 SMOLLM_ARCHITECTURE = {
@@ -203,7 +209,7 @@ def _convert_into(
         "vocab_size": int(config["vocab_size"]),
         "rope_theta": float(config.get("rope_theta", 10000.0)),
         "rms_norm_eps": float(config.get("rms_norm_eps", 1e-5)),
-        "context_length": 64,
+        "context_length": DEFAULT_CONTEXT_LENGTH,
         "activation_dtype": "bfloat16",
         "accumulator_dtype": "float32",
         "tensors": {},

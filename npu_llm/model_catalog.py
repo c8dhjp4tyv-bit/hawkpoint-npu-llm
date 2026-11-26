@@ -3,6 +3,11 @@
 import json
 from pathlib import Path
 
+try:  # imported as npu_llm.model_catalog
+    from .context_window import DEFAULT_CONTEXT_LENGTH, MAX_CONTEXT_LENGTH
+except ImportError:  # imported with npu_llm itself on sys.path
+    from context_window import DEFAULT_CONTEXT_LENGTH, MAX_CONTEXT_LENGTH
+
 
 MODEL_PRESETS = {
     "smollm2-135m-xdna1": {
@@ -63,11 +68,11 @@ def discover_models(models_dir):
         model_format = metadata.get("format", "")
         if not isinstance(model_format, str) or not model_format.startswith("xdna1-"):
             continue
-        context_length = metadata.get("context_length", 64)
+        context_length = metadata.get("context_length", DEFAULT_CONTEXT_LENGTH)
         if (
             isinstance(context_length, bool)
             or not isinstance(context_length, int)
-            or not 1 < context_length <= 64
+            or not 1 <= context_length <= MAX_CONTEXT_LENGTH
         ):
             continue
         if model_id in discovered:

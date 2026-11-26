@@ -154,6 +154,10 @@ def test_supported_architectures():
     assert L.supports(METADATA)
     smollm = dict(METADATA, hidden_size=576, model_family="llama")
     assert not L.supports(smollm)
+    assert L.supports(dict(METADATA, context_length=8192))
+    assert not L.supports(
+        dict(METADATA, context_length=L.MAX_CONTEXT_LENGTH + 1)
+    )
 
 
 def main():

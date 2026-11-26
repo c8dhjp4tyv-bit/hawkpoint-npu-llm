@@ -70,16 +70,17 @@ Validated on a Hawk Point XDNA1 NPU (`RyzenAI-npu1`, AIE2, 4 columns):
 |---|---:|
 | CPU/BF16 reference first-token argmax | 198 |
 | NPU first-token argmax | 198 |
-| Native 16-token decode, 5-run median | 74.61 token/s |
-| Individual runs | 73.17–75.83 token/s |
-| TTFT, 35-token prompt | 0.28–0.29 s |
+| Native 16-token decode, 5-run median | 62.50 token/s |
+| Individual runs | 56.09–64.44 token/s |
+| TTFT, 35-token prompt | 0.30 s |
 | TTFT, repeated prompt with `--prefix-cache` | 0.014 s |
-| NPU time per token (all 30 layers, one dispatch) | 7.6–8.9 ms |
+| NPU time per token (all 30 layers, one dispatch) | 10.0 ms |
 | CPU LM head per token | about 5 ms |
 | Warmup (engine compile cached) | 5.1 s |
 | Peak host RAM during the benchmark | 354 MiB |
 | Quick soak / model-switch stress | 100/100 completions, 100 switches, 0 NPU errors |
-| Fixed hardware context | 64 tokens |
+| Context window | 8192 tokens, streamed in 128-token slices |
+| Context the window grows through | 128, 512, 2048, 8192 tokens |
 
 The chunked layer graphs (`HAWKPOINT_ENGINE=0`) measured 17.1 token/s with
 1.71–1.81 s TTFT on the same machine and benchmark.
@@ -162,7 +163,7 @@ analysis](docs/PERFORMANCE-ANALYSIS.md).
 - AIE2 C++ kernels and IRON graph definitions
 
 Conversation history is retained by the client. When it no longer fits the
-64-token hardware context, the host keeps the newest message whole for as long
+8192-token hardware context, the host keeps the newest message whole for as long
 as possible: it drops whole older turns first, then shortens the system prompt
 from its end (dropping it if not even its first word fits), and only then
 removes the oldest characters of the newest message. The chat template's
@@ -836,7 +837,7 @@ With the chunked layer graphs, each generated token follows this path:
 2. Run SmolLM decoder layers in persistent two-layer graph chunks (the Phoenix
    firmware reliably completes this chunk size); Qwen uses its own two-layer
    BF16 program.
-3. Keep the 64-token K/V cache in NPU-addressable XRT buffers.
+3. Keep the 8192-token K/V cache in NPU-addressable XRT buffers.
 4. Apply final RMSNorm and the model-specific LM head. SmolLM keeps the
    49k-vocabulary projection on host BLAS by default because it is faster on
    Hawk Point; set `HAWKPOINT_NPU_LM_HEAD=1` to force the NPU path.
@@ -862,13 +863,16 @@ statistics. The benchmark reports whether the measured median reaches the
 
 ### Hardware
 
-- **Fixed 64-token context window**: The KV cache is allocated as NPU/XRT
-  buffer objects sized for 64 positions (`2 × 4096 BF16 per KV head`).
-  This limit is currently hard-coded in the IRON graph and kernel definitions;
-  it is not imposed by the physical tile memory itself. Extending it would
-  require rebalancing the weight stream and cache buffer layout across the
-  AIE tiles and recompiling the xclbin. Prompts longer than 64 tokens are
-  shortened by the host at turn boundaries.
+- **8192-token context window, streamed per token**: The KV cache for 8192
+  positions (`4 × 8192 × 576 BF16` per layer, about 138 MB) lives in one
+  NPU-addressable XRT buffer; only one 128-token slice of it fits in tile
+  memory at a time, so the hub tile reads the cache as a DDR stream, four
+  objects per (layer, KV head, slice): two key passes and one key/value pair
+  for each. The DMA window grows with the sequence through 128, 512, 2048 and
+  8192 tokens, and a dispatch streams the whole window, so decode slows from
+  about 10 ms to about 80 ms per token as the window grows. The chunked layer
+  graphs (`HAWKPOINT_ENGINE=0`) still target 64 positions and refuse longer
+  prompts.
 - **Padlocked to XDNA1 (`npu1`, AIE2, 4 columns).** XDNA2 silicon (`npu2`,
   AIE2P: Strix Point, Strix Halo — 8 columns, larger local memory, shared
   caches) is not targeted. The IRON graph layouts, tile counts, and ObjectFifo

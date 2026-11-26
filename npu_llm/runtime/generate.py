@@ -26,6 +26,7 @@ from designs.qkv_rope import qkv_rope
 from designs.qwen_decoder import qwen_decoder
 from designs.rmsnorm import rmsnorm
 from designs.tensor_copy import slice_bf16
+from context_window import DEFAULT_CONTEXT_LENGTH, validate_context_length
 from runtime.model import XDNA1Model
 from runtime.cpu_backend import CPUDecoderStage, _bf16 as _bf16_cpu
 from runtime.sampling import GREEDY, Sampler, SamplingParams
@@ -39,11 +40,20 @@ from runtime.tokenizer import SmolLMTokenizer, StreamDetokenizer
 
 
 class NPUDecoder:
-    def __init__(self, model_dir, context_length=64, npu_layers=None):
-        if context_length != 64:
-            raise ValueError("the current NPU attention kernel has a fixed 64-token cache")
+    def __init__(self, model_dir, context_length=None, npu_layers=None):
         self._closed = False
         self.model = XDNA1Model(model_dir)
+        # The engine streams the K/V cache in tiles, so the context length is
+        # a runtime choice bounded only by memory. An explicit argument wins,
+        # then HAWKPOINT_CONTEXT, then the converted model's declaration.
+        requested = (
+            context_length
+            if context_length is not None
+            else os.environ.get("HAWKPOINT_CONTEXT")
+            or self.model.metadata.get("context_length")
+            or DEFAULT_CONTEXT_LENGTH
+        )
+        context_length = validate_context_length(int(requested))
         self.model_family = self.model.metadata.get("model_family", "llama")
         default_system = (
             "You are Qwen, created by Alibaba Cloud. You are a helpful assistant."
@@ -177,6 +187,19 @@ class NPUDecoder:
         # one dispatch with six parallel weight streams (designs/engine.py).
         # It computes the same BF16 results as the chunked layer graphs.
         self._engine = None
+        # The chunked decoder graphs hold a head's whole cache in tile memory
+        # and are compiled per context length, so they stay at 64 tokens. Only
+        # the row-split engine can run a longer window.
+        if (
+            self.npu_layers
+            and context_length > 64
+            and os.environ.get("HAWKPOINT_ENGINE", "1") == "0"
+        ):
+            raise ValueError(
+                "the chunked decoder graphs support 64 tokens; unset "
+                "HAWKPOINT_ENGINE=0 to use the row-split engine for "
+                f"a {context_length}-token context"
+            )
         if (
             self._fused_smollm
             and self.npu_layers == self.layers
@@ -190,7 +213,7 @@ class NPUDecoder:
 
             if engine_module.supports(self.model.metadata):
                 self._engine = engine_module.DecoderEngine(
-                    self.model, self._rope_inv_freq
+                    self.model, self._rope_inv_freq, context_length
                 )
         elif (
             self.model_family == "qwen2"
@@ -200,7 +223,9 @@ class NPUDecoder:
             from runtime import qwen_engine as qwen_engine_module
 
             if qwen_engine_module.supports(self.model.metadata):
-                self._engine = qwen_engine_module.QwenDecoderEngine(self.model)
+                self._engine = qwen_engine_module.QwenDecoderEngine(
+                    self.model, context_length
+                )
         self.cpu_stage = (
             CPUDecoderStage(self.model, self.npu_layers, context_length)
             if (
@@ -221,8 +246,15 @@ class NPUDecoder:
             if self.npu_layers == 0
             else None
         )
+        if self.npu_layers and self._engine is None and context_length > 64:
+            raise ValueError(
+                "the chunked decoder graphs support 64 tokens; this model "
+                "runs them instead of the row-split engine"
+            )
         self.kv_cache = {}
-        for first, count in self._smollm_chunks:
+        for first, count in (
+            self._smollm_chunks if self._engine is None else []
+        ):
             self.kv_cache[first] = iron.zeros(
                 (
                     count,
@@ -233,7 +265,7 @@ class NPUDecoder:
                 device="npu",
             )
         self._qwen_cache = {}
-        if self.model_family == "qwen2":
+        if self.model_family == "qwen2" and self._engine is None:
             for first in range(0, self.npu_layers, 2):
                 count = min(2, self.npu_layers - first)
                 self._qwen_cache[first] = iron.zeros(
@@ -748,7 +780,9 @@ class NPUDecoder:
         normalization and 49k-row LM head are skipped.
         """
         if not 0 <= position < self.context_length:
-            raise ValueError("position outside the 64-token context")
+            raise ValueError(
+                f"position outside the {self.context_length}-token context"
+            )
         # This step overwrites the cache at ``position``; later positions were
         # computed from a different history and are no longer reusable.
         del self._cached_prefix[position:]
@@ -897,6 +931,10 @@ class NPUDecoder:
         if not self.npu_layers:
             return
         self.decode_token(self.tokenizer.eos_id, 0)
+        if self._engine is not None:
+            self._engine.reset()
+            self._cached_prefix.clear()
+            return
         if self.model_family == "qwen2":
             for first in range(0, self.npu_layers, 2):
                 count = min(2, self.npu_layers - first)
@@ -1008,10 +1046,10 @@ class NPUDecoder:
     ):
         """Generate a response for an OpenAI-style list of chat messages.
 
-        The hardware attention cache is fixed at 64 tokens. When a conversation
-        grows beyond that window, it is shortened at turn boundaries so the
-        newest message stays whole for as long as possible (see
-        :meth:`SmolLMTokenizer.encode_chat_window`).
+        The attention cache holds ``context_length`` positions. When a
+        conversation grows beyond that window, it is shortened at turn
+        boundaries so the newest message stays whole for as long as possible
+        (see :meth:`SmolLMTokenizer.encode_chat_window`).
 
         ``sampling`` accepts a :class:`~runtime.sampling.SamplingParams` (or a
         transport dict) and defaults to greedy decoding. ``stop`` is a string

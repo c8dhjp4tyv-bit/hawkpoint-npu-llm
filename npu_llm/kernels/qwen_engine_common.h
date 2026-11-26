@@ -23,6 +23,7 @@ static constexpr int Q_HIDDEN = 896;
 static constexpr int Q_SLICE = 896;
 static constexpr int Q_VECTOR = 6 * 896;
 static constexpr int Q_QKV_ROWS = 192;
+static constexpr int Q_Q_PER_KV = 7;
 static constexpr int Q_PARAM_GAMMA_POST = 896;
 static constexpr int Q_PARAM_BIAS = 1792;
 static constexpr int Q_HEADER_SIN = 96;

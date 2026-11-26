@@ -134,11 +134,28 @@ def test_slices_fit_the_join_and_kernel_constants():
     assert L.BLOCK == 8 * L.HIDDEN == 3 * L.INTERMEDIATE
 
 
+def test_cache_layout_grows_with_context():
+    tiles = L.context_tiles(8192)
+    assert L.TILE_ELEMENTS == L.KV_TILE * L.HEAD_DIM
+    assert L.cache_elements(LAYERS, 8192) == (
+        L.CACHE_HEAD
+        + L.STREAM_COPIES * L.KV_HEADS * LAYERS * tiles * L.TILE_ELEMENTS
+    )
+    assert L.cache_elements(LAYERS, 8192) > L.cache_elements(LAYERS, 64)
+    # Two key passes and then one key/value pair per tile, so the stream is
+    # four equal-sized regions after the header.
+    assert L.STREAM_COPIES == 4
+    assert (L.cache_elements(LAYERS, 8192) - L.CACHE_HEAD) % 4 == 0
+
+
 def test_supported_architectures():
     assert L.supports(FakeModel().metadata)
     qwen = dict(FakeModel().metadata, hidden_size=896, intermediate_size=4864)
     assert not L.supports(qwen)
-    assert not L.supports(dict(FakeModel().metadata, context_length=128))
+    assert L.supports(dict(FakeModel().metadata, context_length=8192))
+    assert not L.supports(
+        dict(FakeModel().metadata, context_length=L.MAX_CONTEXT_LENGTH + 1)
+    )
 
 
 def main():
