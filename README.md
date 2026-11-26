@@ -98,6 +98,13 @@ LM head:
 Each Qwen token reads about 1 GB of BF16 weights (24 layers plus the
 151,936-row LM head), so the engine is bound by weight streaming.
 
+The Qwen engine streams the same way, but its hub tile is the constraint: three
+passes over the cache plus the current token's own softmax bookkeeping fill the
+tile's 16 KB of *program* memory at four 128-token slices (512 positions), and
+the streaming window is compiled per slice count. Qwen therefore tops out at
+512 positions; asking for more fails with an explicit error instead of an aiecc
+program-memory overflow. The SmolLM hub fits the full 8192-token window.
+
 The acceptance prompt generated:
 
 ```text
@@ -863,6 +870,14 @@ statistics. The benchmark reports whether the measured median reaches the
 
 ### Hardware
 
+- **Qwen2.5 0.5B streams at most 512 positions.** The hub tile scores every
+  cached position three times (maximum, summed exponentials, weighted values)
+  and carries the current token's bookkeeping too; at four 128-token slices
+  those kernels plus the core's tile loops fill all 16 KB of hub program
+  memory, and the window is compiled per slice count. The SmolLM hub is small
+  enough to hold the 8192-token version. Going past 512 on Qwen needs a
+  different attention decomposition (a second hub core, or a cache staged
+  through the MemTile), not a bigger buffer.
 - **8192-token context window, streamed per token**: The KV cache for 8192
   positions (`4 × 8192 × 576 BF16` per layer, about 138 MB) lives in one
   NPU-addressable XRT buffer; only one 128-token slice of it fits in tile

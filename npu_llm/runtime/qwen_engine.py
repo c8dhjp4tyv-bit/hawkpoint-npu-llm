@@ -17,6 +17,7 @@ from designs.qwen_engine_layout import (
     HIDDEN,
     KV_HEADS,
     KV_NEW,
+    MAX_CONTEXT_LENGTH,
     TILE_ELEMENTS,
     VOCAB,
     cache_elements,
@@ -42,6 +43,15 @@ class QwenDecoderEngine:
     def __init__(self, model, context_length):
         if not supports(model.metadata):
             raise ValueError("the Qwen engine supports Qwen2.5 0.5B layouts only")
+        # The hub's program memory, not the cache, bounds the streamed window
+        # (see designs/qwen_engine_layout.py). Say so here instead of letting
+        # the build fail with an aiecc program-memory overflow.
+        if not 1 <= int(context_length) <= MAX_CONTEXT_LENGTH:
+            raise ValueError(
+                "the Qwen engine streams at most "
+                f"{MAX_CONTEXT_LENGTH} positions; {context_length} does not "
+                "fit the hub tile's program memory"
+            )
         self.layers = int(model.metadata["layers"])
         self.context_length = int(context_length)
         self.max_tiles = context_tiles(self.context_length)

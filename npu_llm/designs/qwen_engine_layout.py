@@ -14,12 +14,7 @@ line up with those slices, so the MLP activation never needs compacting.
 import numpy as np
 from ml_dtypes import bfloat16
 
-from context_window import (
-    DEFAULT_CONTEXT_LENGTH,
-    KV_TILE,
-    MAX_CONTEXT_LENGTH,
-    context_tiles,
-)
+from context_window import DEFAULT_CONTEXT_LENGTH, KV_TILE, context_tiles
 
 
 GEMV_TILES = 6
@@ -72,6 +67,14 @@ STATE_SIZE = 32 + 16 * Q_HEADS
 # One tile's normalized weights per query head, as three BF16 parts each.
 WEIGHTS_SIZE = Q_PER_KV * 3 * KV_TILE
 ACC_SIZE = Q_HEADS * HEAD_DIM
+
+# The streamed window is capped by the hub tile's *program* memory, not by its
+# data memory: attention scores every cached position three times (maximum,
+# summed exponentials, weighted values) and also carries the current token's
+# own bookkeeping, which fills 16 KB of instructions at four 128-position
+# tiles. The SmolLM engine's hub is smaller and streams the full 8K.
+MAX_CONTEXT_TILES = 4
+MAX_CONTEXT_LENGTH = KV_TILE * MAX_CONTEXT_TILES
 
 SUPPORTED = {
     "hidden_size": HIDDEN,

@@ -18,6 +18,9 @@ _PACKAGE_ROOT = Path(__file__).resolve().parents[1]
 if str(_PACKAGE_ROOT) not in sys.path:
     sys.path.insert(0, str(_PACKAGE_ROOT))
 from context_window import DEFAULT_CONTEXT_LENGTH  # noqa: E402
+from designs.qwen_engine_layout import (  # noqa: E402
+    MAX_CONTEXT_LENGTH as QWEN_CONTEXT_LENGTH,
+)
 
 
 SMOLLM_ARCHITECTURE = {
@@ -209,7 +212,14 @@ def _convert_into(
         "vocab_size": int(config["vocab_size"]),
         "rope_theta": float(config.get("rope_theta", 10000.0)),
         "rms_norm_eps": float(config.get("rms_norm_eps", 1e-5)),
-        "context_length": DEFAULT_CONTEXT_LENGTH,
+        # The Qwen hub streams fewer slices (its attention kernels fill the
+        # tile's program memory first), so declare what each engine can run
+        # rather than one number for both families.
+        "context_length": (
+            QWEN_CONTEXT_LENGTH
+            if model_family == "qwen2"
+            else DEFAULT_CONTEXT_LENGTH
+        ),
         "activation_dtype": "bfloat16",
         "accumulator_dtype": "float32",
         "tensors": {},

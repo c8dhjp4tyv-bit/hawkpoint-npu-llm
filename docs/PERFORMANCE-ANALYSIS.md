@@ -275,6 +275,28 @@ still small.
 chunked graphs, so it passes `context_length=64`: the chunked path remains a
 64-position implementation.
 
+### Why the Qwen engine stops at 512 positions
+
+The Qwen2.5 hub runs the same three passes, but each one covers seven query
+heads instead of three and also carries the current token's own score,
+exponential and weighted value. Those kernels plus the core's tile loops fill
+the hub's 16 KB of program memory at four 128-token slices; a fifth slice does
+not link. This is a code-size limit, not a data limit: the cache, the joined
+vector and the broadcast vector all still fit in tile data memory.
+
+The kernels were merged to get that far (the score-and-exponential loop is one
+out-of-line function used by both the sums and the weights pass, the current
+token's sums and the inverse of its total are one kernel, the values pass
+shares the tile pass's accumulation, and the BF16 rounding is one function),
+and the hub is compiled with `-Os`. At `-O2` even a one-slice graph overflows;
+`-Oz` builds but miscompiles the FP32 emulation into NaNs, which is why the
+engine is capped by an explicit check instead of a smaller object.
+
+What was measured on the Qwen engine at 512 positions: a 480-token run through
+the 1 → 4 slice step compared against a run that always streams four slices
+produced bit-identical logits at every position, and the 32-token CPU BF16
+reference gate still agrees 32/32.
+
 ## Static Decoder Projection Arithmetic
 
 For Qwen2.5-0.5B, the native fused graph uses hidden size `896`, intermediate

@@ -1,4 +1,11 @@
 // Hub-tile kernels of the Qwen2.5 0.5B decoder engine (designs/qwen_engine.py).
+//
+// The hub tile has 16 KB of program memory and this file fills nearly all of
+// it: the three attention passes, the current token's own bookkeeping, and the
+// softmax emulation together with the core's startup code and the libgcc
+// routines the core needs. Everything here is out of line or shared on
+// purpose; an extra inlined copy shows up as "Overflow of program memory" at
+// build time. The arithmetic is the CPU reference's, unchanged.
 #include "qwen_engine_common.h"
 
 extern "C" {
@@ -48,13 +55,16 @@ static __attribute__((noinline)) void q_rope64(const bfloat16 *__restrict row,
 }
 
 // qkv row r of the layer lives at slot (r / 192) * 896 + r % 192; heads are
-// 64-row aligned inside a tile's 192 rows.
+// 64-row aligned inside a tile's 192 rows, so head / 3 and head % 3 pick the
+// slice and the row. Dividing by the small constant rather than by 192 keeps
+// the soft-float integer division routines out of the hub program.
 static inline const bfloat16 *q_head(const bfloat16 *joined, int head) {
-  const int row = head * 64;
-  return joined + (row / Q_QKV_ROWS) * Q_SLICE + row % Q_QKV_ROWS;
+  return joined + (head / 3) * Q_SLICE + (head % 3) * 64;
 }
 
-static inline float q_dot64(const bfloat16 *__restrict a,
+// Out of line on purpose: every pass scores the same keys, and an inlined
+// copy per pass does not fit in the hub tile's program memory.
+static __attribute__((noinline)) float q_dot64(const bfloat16 *__restrict a,
                             const bfloat16 *__restrict b) {
   aie::accum<accfloat, 32> total = aie::zeros<accfloat, 32>();
   total = aie::mac(total, aie::load_v<32>(a), aie::load_v<32>(b));
@@ -94,15 +104,35 @@ static inline int q_tile_count(const bfloat16 *__restrict lut, int32_t tile) {
 
 // Unscaled dot products of the first ``count`` tile positions. Padding lanes
 // repeat the first score, as the untiled kernel pads its last vector.
-static inline void q_tile_scores(const bfloat16 *__restrict query,
-                                 const bfloat16 *__restrict keys, int count,
-                                 float *__restrict score) {
+static __attribute__((noinline)) void q_tile_scores(
+    const bfloat16 *__restrict query, const bfloat16 *__restrict keys,
+    int count, float *__restrict score) {
   for (int token = 0; token < count; ++token)
     score[token] = q_dot64(query, keys + token * 64);
   for (int token = count; token < Q_TILE; ++token)
     score[token] = score[0];
 }
 
+// The same scores as exponentials against the global maximum. The sums and
+// weights passes share this; one inlined copy per pass does not fit.
+static __attribute__((noinline)) void q_tile_exps(
+    const bfloat16 *__restrict query, const bfloat16 *__restrict keys,
+    int count, float maximum, float *__restrict score) {
+  const int vectors = (count + 15) / 16;
+  q_tile_scores(query, keys, count, score);
+  for (int v = 0; v < vectors; ++v) {
+    const emu_f32 scaled =
+        emu_mul_fb(aie::load_v<16>(score + v * 16),
+                   aie::broadcast<bfloat16, 16>(0.125f));
+    aie::store_v(score + v * 16,
+                 emu_exp(aie::sub(scaled, emu_splat(maximum))));
+  }
+}
+
+// Scores the current token while it still holds the layer's qkv rows, so the
+// softmax bookkeeping starts from that score instead of waiting for a separate
+// pass over the state. A maximum is order independent, so the passes that
+// follow see the same value they would after a dedicated maximum kernel.
 void q_attention_prepare(const bfloat16 *__restrict joined,
                          const bfloat16 *__restrict lut,
                          bfloat16 *__restrict queries,
@@ -111,6 +141,7 @@ void q_attention_prepare(const bfloat16 *__restrict joined,
                          int32_t kv_head) {
   bfloat16 *new_key = kv_new + kv_head * 128;
   bfloat16 *new_value = new_key + 64;
+#pragma clang loop unroll(disable)
   for (int q = 0; q < Q_Q_PER_KV; ++q)
     q_rope64(q_head(joined, kv_head * Q_Q_PER_KV + q), lut, queries + q * 64);
   q_rope64(q_head(joined, 14 + kv_head), lut, new_key);
@@ -118,14 +149,17 @@ void q_attention_prepare(const bfloat16 *__restrict joined,
 #pragma clang loop unroll(disable)
   for (int i = 0; i < 64; i += 32)
     aie::store_v(new_value + i, aie::load_v<32>(value_row + i));
+  const emu_f32 zero = emu_splat(0.0f);
+#pragma clang loop unroll(disable)
   for (int q = 0; q < Q_Q_PER_KV; ++q) {
     const int entry = kv_head * Q_Q_PER_KV + q;
-    state[Q_STATE_MAX + entry] = -3.4e38f;
+    state[Q_STATE_MAX + entry] =
+        q_dot64(queries + q * 64, new_key) * 0.125f;
     state[Q_STATE_INV + entry] = 0.0f;
-    for (int lane = 0; lane < 16; ++lane)
-      state[Q_STATE_LANES + entry * 16 + lane] = 0.0f;
-    for (int dim = 0; dim < 64; ++dim)
-      acc[entry * 64 + dim] = 0.0f;
+    aie::store_v(state + Q_STATE_LANES + entry * 16, zero);
+#pragma clang loop unroll(disable)
+    for (int dim = 0; dim < 64; dim += 16)
+      aie::store_v(acc + entry * 64 + dim, zero);
   }
 }
 
@@ -136,6 +170,7 @@ void q_attention_max(const bfloat16 *__restrict queries,
   const int count = q_tile_count(lut, tile);
   if (count <= 0) return;
   alignas(64) float score[Q_TILE];
+#pragma clang loop unroll(disable)
   for (int q = 0; q < Q_Q_PER_KV; ++q) {
     q_tile_scores(queries + q * 64, keys, count, score);
     emu_f32 peak = aie::load_v<16>(score);
@@ -144,17 +179,6 @@ void q_attention_max(const bfloat16 *__restrict queries,
     const float tile_max = aie::reduce_max(peak) * 0.125f;
     float *slot = state + Q_STATE_MAX + kv_head * Q_Q_PER_KV + q;
     if (tile_max > *slot) *slot = tile_max;
-  }
-}
-
-void q_attention_max_new(const bfloat16 *__restrict queries,
-                         const bfloat16 *__restrict kv_new,
-                         float *__restrict state, int32_t kv_head) {
-  const bfloat16 *new_key = kv_new + kv_head * 128;
-  for (int q = 0; q < Q_Q_PER_KV; ++q) {
-    const float value = q_dot64(queries + q * 64, new_key) * 0.125f;
-    float *slot = state + Q_STATE_MAX + kv_head * Q_Q_PER_KV + q;
-    if (value > *slot) *slot = value;
   }
 }
 
@@ -167,17 +191,11 @@ void q_attention_sums(const bfloat16 *__restrict queries,
   if (count <= 0) return;
   const int vectors = (count + 15) / 16;
   alignas(64) float score[Q_TILE];
+#pragma clang loop unroll(disable)
   for (int q = 0; q < Q_Q_PER_KV; ++q) {
     const int entry = kv_head * Q_Q_PER_KV + q;
-    q_tile_scores(queries + q * 64, keys, count, score);
-    for (int v = 0; v < vectors; ++v) {
-      const emu_f32 scaled =
-          emu_mul_fb(aie::load_v<16>(score + v * 16),
-                     aie::broadcast<bfloat16, 16>(0.125f));
-      aie::store_v(score + v * 16,
-                   emu_exp(aie::sub(
-                       scaled, emu_splat(state[Q_STATE_MAX + entry]))));
-    }
+    q_tile_exps(queries + q * 64, keys, count, state[Q_STATE_MAX + entry],
+                score);
     for (int i = count; i < vectors * 16; ++i) score[i] = 0.0f;
     float *lanes = state + Q_STATE_LANES + entry * 16;
     emu_f32 total = aie::load_v<16>(lanes);
@@ -187,13 +205,19 @@ void q_attention_sums(const bfloat16 *__restrict queries,
   }
 }
 
-void q_attention_sums_new(const bfloat16 *__restrict queries,
+// The current token's exponential joins its lane and, once every lane has its
+// contribution, the inverse of the summed exponentials lands in the state. The
+// two used to be separate kernels; together they exceeded the hub tile's
+// program memory.
+void q_attention_new_sums(const bfloat16 *__restrict queries,
                           const bfloat16 *__restrict kv_new,
                           const bfloat16 *__restrict lut,
                           float *__restrict state, int32_t kv_head) {
   const bfloat16 *new_key = kv_new + kv_head * 128;
-  const int lane = q_position(lut) % 16;
+  const int lane = q_position(lut) & 15;
   alignas(64) float score[16];
+  alignas(64) float parts[16];
+#pragma clang loop unroll(disable)
   for (int q = 0; q < Q_Q_PER_KV; ++q) {
     const int entry = kv_head * Q_Q_PER_KV + q;
     const emu_f32 scaled =
@@ -206,18 +230,40 @@ void q_attention_sums_new(const bfloat16 *__restrict queries,
     float *lanes = state + Q_STATE_LANES + entry * 16;
     aie::store_v(lanes, aie::add(aie::load_v<16>(lanes),
                                  aie::load_v<16>(score)));
+    // The last lane has its contribution, so the inverse of the summed
+    // exponentials is final for this head.
+    aie::store_v(parts, emu_reciprocal(
+                           emu_splat(aie::reduce_add(aie::load_v<16>(
+                               state + Q_STATE_LANES + entry * 16)))));
+    state[Q_STATE_INV + entry] = parts[0];
   }
 }
 
-void q_attention_sums_finish(float *__restrict state, int32_t kv_head) {
-  for (int q = 0; q < Q_Q_PER_KV; ++q) {
-    const int entry = kv_head * Q_Q_PER_KV + q;
-    const emu_f32 inv = emu_reciprocal(
-        emu_splat(aie::reduce_add(aie::load_v<16>(
-            state + Q_STATE_LANES + entry * 16))));
-    alignas(64) float parts[16];
-    aie::store_v(parts, inv);
-    state[Q_STATE_INV + entry] = parts[0];
+// Round 64 accumulated values to the BF16 vector attention hands on.
+static __attribute__((noinline)) void q_round_row(const float *__restrict src,
+                                                 bfloat16 *__restrict dst) {
+#pragma clang loop unroll(disable)
+  for (int dim = 0; dim < 64; dim += 16)
+    aie::store_v(dst + dim, emu_round(aie::load_v<16>(src + dim)));
+}
+
+// One tile's worth of the values pass: acc += sum(weight * value), the weight
+// carried as three BF16 parts so its FP32 mantissa survives the vector
+// multiply. Additions stay in ascending position order.
+static __attribute__((noinline)) void q_accumulate(
+    const bfloat16 *__restrict hi, const bfloat16 *__restrict mid,
+    const bfloat16 *__restrict lo, const bfloat16 *__restrict values,
+    int count, float *__restrict slot) {
+  for (int dim = 0; dim < 64; dim += 16) {
+    emu_acc result;
+    result.from_vector(aie::load_v<16>(slot + dim));
+    for (int token = 0; token < count; ++token) {
+      const emu_bf16 value = aie::load_v<16>(values + token * 64 + dim);
+      result = aie::mac(result, value, aie::broadcast<bfloat16, 16>(lo[token]));
+      result = aie::mac(result, value, aie::broadcast<bfloat16, 16>(mid[token]));
+      result = aie::mac(result, value, aie::broadcast<bfloat16, 16>(hi[token]));
+    }
+    aie::store_v(slot + dim, result.template to_vector<float>());
   }
 }
 
@@ -234,20 +280,14 @@ void q_attention_weights(const bfloat16 *__restrict queries,
   if (count <= 0) return;
   const int vectors = (count + 15) / 16;
   alignas(64) float score[Q_TILE];
+#pragma clang loop unroll(disable)
   for (int q = 0; q < Q_Q_PER_KV; ++q) {
     const int entry = kv_head * Q_Q_PER_KV + q;
     bfloat16 *p_hi = tile_weights + q * 3 * Q_TILE;
     bfloat16 *p_mid = p_hi + Q_TILE;
     bfloat16 *p_lo = p_mid + Q_TILE;
-    q_tile_scores(queries + q * 64, keys, count, score);
-    for (int v = 0; v < vectors; ++v) {
-      const emu_f32 scaled =
-          emu_mul_fb(aie::load_v<16>(score + v * 16),
-                     aie::broadcast<bfloat16, 16>(0.125f));
-      aie::store_v(score + v * 16,
-                   emu_exp(aie::sub(
-                       scaled, emu_splat(state[Q_STATE_MAX + entry]))));
-    }
+    q_tile_exps(queries + q * 64, keys, count, state[Q_STATE_MAX + entry],
+                score);
     const emu_f32 inv = emu_splat(state[Q_STATE_INV + entry]);
     for (int v = 0; v < vectors; ++v) {
       const emu_split parts =
@@ -265,33 +305,29 @@ void q_attention_apply(const bfloat16 *__restrict tile_weights,
                        int32_t kv_head, int32_t tile) {
   const int count = q_tile_count(lut, tile);
   if (count <= 0) return;
+#pragma clang loop unroll(disable)
   for (int q = 0; q < Q_Q_PER_KV; ++q) {
     const int entry = kv_head * Q_Q_PER_KV + q;
-    const bfloat16 *p_hi = tile_weights + q * 3 * Q_TILE;
-    const bfloat16 *p_mid = p_hi + Q_TILE;
-    const bfloat16 *p_lo = p_mid + Q_TILE;
-    float *slot = acc + entry * 64;
-    for (int dim = 0; dim < 64; dim += 16) {
-      emu_acc result;
-      result.from_vector(aie::load_v<16>(slot + dim));
-      for (int token = 0; token < count; ++token) {
-        const emu_bf16 value = aie::load_v<16>(values + token * 64 + dim);
-        result = aie::mac(result, value, aie::broadcast<bfloat16, 16>(p_lo[token]));
-        result = aie::mac(result, value, aie::broadcast<bfloat16, 16>(p_mid[token]));
-        result = aie::mac(result, value, aie::broadcast<bfloat16, 16>(p_hi[token]));
-      }
-      aie::store_v(slot + dim, result.template to_vector<float>());
-    }
+    // One head's weights at a time: the weights pass rewrites this buffer for
+    // every head before its values tiles arrive.
+    const bfloat16 *planes = tile_weights + q * 3 * Q_TILE;
+    q_accumulate(planes, planes + Q_TILE, planes + 2 * Q_TILE, values, count,
+                 acc + entry * 64);
   }
 }
 
+// The head's weighted values plus the rounding to BF16 the broadcast vector
+// carries out of attention; the two were separate kernels until the hub's
+// program memory ran out.
 void q_attention_values_new(const bfloat16 *__restrict queries,
                             const bfloat16 *__restrict kv_new,
                             const bfloat16 *__restrict lut,
                             const float *__restrict state,
-                            float *__restrict acc, int32_t kv_head) {
+                            float *__restrict acc,
+                            bfloat16 *__restrict attended, int32_t kv_head) {
   const bfloat16 *new_key = kv_new + kv_head * 128;
   const bfloat16 *new_value = new_key + 64;
+#pragma clang loop unroll(disable)
   for (int q = 0; q < Q_Q_PER_KV; ++q) {
     const int entry = kv_head * Q_Q_PER_KV + q;
     const emu_f32 scaled =
@@ -301,31 +337,15 @@ void q_attention_values_new(const bfloat16 *__restrict queries,
         emu_exp(aie::sub(scaled, emu_splat(state[Q_STATE_MAX + entry])));
     const emu_split parts =
         emu_split3(emu_mul_ff(e, emu_splat(state[Q_STATE_INV + entry])));
+    // The weight is one token wide, but the accumulate path is the tile
+    // pass's, so both add up in the same order and round at the same points.
     alignas(64) bfloat16 weight[3][16];
     aie::store_v(weight[0], parts.lo);
     aie::store_v(weight[1], parts.mid);
     aie::store_v(weight[2], parts.hi);
     float *slot = acc + entry * 64;
-    for (int dim = 0; dim < 64; dim += 16) {
-      emu_acc result;
-      result.from_vector(aie::load_v<16>(slot + dim));
-      const emu_bf16 value = aie::load_v<16>(new_value + dim);
-      result = aie::mac(result, value, aie::broadcast<bfloat16, 16>(weight[0][0]));
-      result = aie::mac(result, value, aie::broadcast<bfloat16, 16>(weight[1][0]));
-      result = aie::mac(result, value, aie::broadcast<bfloat16, 16>(weight[2][0]));
-      aie::store_v(slot + dim, result.template to_vector<float>());
-    }
-  }
-}
-
-void q_attention_emit(const float *__restrict acc,
-                      bfloat16 *__restrict broadcast, int32_t kv_head) {
-  for (int q = 0; q < Q_Q_PER_KV; ++q) {
-    const int entry = kv_head * Q_Q_PER_KV + q;
-    const float *slot = acc + entry * 64;
-    for (int dim = 0; dim < 64; dim += 16)
-      aie::store_v(broadcast + entry * 64 + dim,
-                   emu_round(aie::load_v<16>(slot + dim)));
+    q_accumulate(weight[2], weight[1], weight[0], new_value, 1, slot);
+    q_round_row(slot, attended + entry * 64);
   }
 }
 

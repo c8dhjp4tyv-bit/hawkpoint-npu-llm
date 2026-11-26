@@ -120,9 +120,15 @@ def qwen_engine(
         arg_types=[vector_ty, hidden_ty], include_dirs=include_dirs,
     )
     obj = load_hidden.object_file_name
+    # The hub tile's attention kernels live in their own object, compiled with
+    # -Os: at -O2 three passes over the cache plus the current token's
+    # bookkeeping overflow the tile's 16 KB of program memory, and -Oz
+    # miscompiles the FP32 emulation into NaNs (see designs/engine.py for the
+    # SmolLM equivalent, which fits at -Os).
     hub_init = _KernelSource(
         "q_hub_init", source_file=str(HUB_SRC),
-        arg_types=[header_ty, lut_ty, vector_ty], include_dirs=include_dirs,
+        arg_types=[header_ty, lut_ty, vector_ty],
+        compile_flags=["-Os"], include_dirs=include_dirs,
     )
     hub_obj = hub_init.object_file_name
     norm_params = Kernel("q_norm_params", obj, [hidden_ty, block_ty, hidden_ty])
@@ -146,18 +152,14 @@ def qwen_engine(
         "q_attention_max", hub_obj,
         [query_ty, tile_ty, lut_ty, state_ty, np.int32, np.int32],
     )
-    attn_max_new = Kernel(
-        "q_attention_max_new", hub_obj, [query_ty, kv_ty, state_ty, np.int32]
-    )
     attn_sums = Kernel(
         "q_attention_sums", hub_obj,
         [query_ty, tile_ty, lut_ty, state_ty, np.int32, np.int32],
     )
-    attn_sums_new = Kernel(
-        "q_attention_sums_new", hub_obj,
+    attn_new_sums = Kernel(
+        "q_attention_new_sums", hub_obj,
         [query_ty, kv_ty, lut_ty, state_ty, np.int32],
     )
-    sums_finish = Kernel("q_attention_sums_finish", hub_obj, [state_ty, np.int32])
     attn_weights = Kernel(
         "q_attention_weights", hub_obj,
         [query_ty, tile_ty, lut_ty, state_ty, weights_ty, np.int32, np.int32],
@@ -168,9 +170,8 @@ def qwen_engine(
     )
     attn_values_new = Kernel(
         "q_attention_values_new", hub_obj,
-        [query_ty, kv_ty, lut_ty, state_ty, acc_ty, np.int32],
+        [query_ty, kv_ty, lut_ty, state_ty, acc_ty, vector_ty, np.int32],
     )
-    emit = Kernel("q_attention_emit", hub_obj, [acc_ty, vector_ty, np.int32])
 
     weight_fifos = [
         ObjectFifo(block_ty, depth=2, name=f"qweights{i}") for i in range(GEMV_TILES)
@@ -282,9 +283,8 @@ def qwen_engine(
 
     def hub_tile(
         cf, jn, bc, kv, lut, queries, state, acc, tile_weights,
-        hub_init, prepare, attn_max, attn_max_new, attn_sums, attn_sums_new,
-        sums_finish, attn_weights, attn_apply, attn_values_new, emit,
-        copy_vector,
+        hub_init, prepare, attn_max, attn_sums, attn_new_sums,
+        attn_weights, attn_apply, attn_values_new, copy_vector,
     ):
         first = cf.acquire(1)
         start = bc.acquire(1)
@@ -302,14 +302,12 @@ def qwen_engine(
                     keys = cf.acquire(1)
                     attn_max(queries, keys, lut, state, head, tile)
                     cf.release(1)
-                attn_max_new(queries, new_rows, state, head)
                 # Pass 2: the exponential sum against that maximum.
                 for tile in range_(tiles):
                     keys = cf.acquire(1)
                     attn_sums(queries, keys, lut, state, head, tile)
                     cf.release(1)
-                attn_sums_new(queries, new_rows, lut, state, head)
-                sums_finish(state, head)
+                attn_new_sums(queries, new_rows, lut, state, head)
                 # Pass 3: the normalized weights against the value tiles.
                 for tile in range_(tiles):
                     keys = cf.acquire(1)
@@ -318,8 +316,9 @@ def qwen_engine(
                     values = cf.acquire(1)
                     attn_apply(tile_weights, values, lut, acc, head, tile)
                     cf.release(1)
-                attn_values_new(queries, new_rows, lut, state, acc, head)
-                emit(acc, attended, head)
+                attn_values_new(
+                    queries, new_rows, lut, state, acc, attended, head
+                )
             kv.release(1)
             jn.release(1)
             bc.release(1)
@@ -361,9 +360,8 @@ def qwen_engine(
          Buffer(lut_ty, name="qlut"), Buffer(query_ty, name="qqueries"),
          Buffer(state_ty, name="qstate"), Buffer(acc_ty, name="qacc"),
          Buffer(weights_ty, name="qtile_weights"),
-         hub_init, prepare, attn_max, attn_max_new, attn_sums, attn_sums_new,
-         sums_finish, attn_weights, attn_apply, attn_values_new, emit,
-         copy_vector],
+         hub_init, prepare, attn_max, attn_sums, attn_new_sums,
+         attn_weights, attn_apply, attn_values_new, copy_vector],
         tile=HUB_PLACEMENT, stack_size=4096,
         dynamic_objfifo_lowering=True,
     ))
