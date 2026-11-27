@@ -30,7 +30,7 @@ from aie.iron.device import Tile
 from aie.iron.kernel import ExternalFunction, Kernel
 from aie.utils import config
 
-from context_window import DEFAULT_CONTEXT_LENGTH, KV_TILE, context_tiles
+from context_window import KV_TILE
 from designs.qwen_engine_layout import (
     ACC_SIZE,
     BLOCK,
@@ -43,6 +43,7 @@ from designs.qwen_engine_layout import (
     LM_GROUP,
     LM_GROUPS,
     LM_START,
+    MAX_CONTEXT_TILES,
     MLP_ROWS,
     OUT_ROWS,
     Q_HEADS,
@@ -105,8 +106,12 @@ def qwen_engine(
     state_ty = np.ndarray[(STATE_SIZE,), f32]
     acc_ty = np.ndarray[(ACC_SIZE,), f32]
     weights_ty = np.ndarray[(WEIGHTS_SIZE,), bf16]
-    # ``tiles`` is the window this graph streams and reads.
-    tiles = tiles or context_tiles(DEFAULT_CONTEXT_LENGTH)
+    # ``tiles`` is the window this graph streams and reads. The hub's program
+    # memory links at most MAX_CONTEXT_TILES of them (qwen_engine_layout.py).
+    if not tiles:
+        tiles = MAX_CONTEXT_TILES
+    if not 1 <= tiles <= MAX_CONTEXT_TILES:
+        raise ValueError(f"tiles must be between 1 and {MAX_CONTEXT_TILES}")
 
     include_dirs = [
         config.cxx_header_path(),
