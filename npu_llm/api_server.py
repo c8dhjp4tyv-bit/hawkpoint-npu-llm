@@ -599,10 +599,12 @@ class CompletionEngine:
         ``HAWKPOINT_CONTEXT`` overrides the model's declaration inside the
         decoder, so the per-request token limit has to apply the same rule;
         otherwise a shorter override passes validation here and fails later.
+        A decoder supplied ready-made already settled its context.
         """
-        declared = self.models[model_id].get(
-            "context_length", DEFAULT_CONTEXT_LENGTH
-        )
+        record = self.models[model_id]
+        if "decoder" in record:
+            return int(record["decoder"].context_length)
+        declared = record.get("context_length", DEFAULT_CONTEXT_LENGTH)
         try:
             return resolve_context_length(declared)
         except (TypeError, ValueError):

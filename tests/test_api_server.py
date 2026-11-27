@@ -634,6 +634,25 @@ def test_model_switch_releases_previous_decoder():
     assert factory.created[1].closed is True
 
 
+def test_supplied_decoder_context_wins_over_override():
+    """A ready-made decoder's context bounds requests, not HAWKPOINT_CONTEXT."""
+    previous = os.environ.get("HAWKPOINT_CONTEXT")
+    os.environ["HAWKPOINT_CONTEXT"] = "8192"
+    try:
+        supplied = CompletionEngine({"fake": FakeDecoder()})
+        assert supplied.context_length("fake") == 64
+        factory_backed = CompletionEngine(
+            {"model-a": {"path": "model-a", "context_length": 64}},
+            decoder_factory=TrackingFactory([]),
+        )
+        assert factory_backed.context_length("model-a") == 8192
+    finally:
+        if previous is None:
+            os.environ.pop("HAWKPOINT_CONTEXT", None)
+        else:
+            os.environ["HAWKPOINT_CONTEXT"] = previous
+
+
 def test_sampling_parameters_reach_the_decoder():
     """Check sampling forwarding, greedy defaults, and rejected parameter ranges."""
     decoder = RecordingDecoder()
@@ -1326,6 +1345,7 @@ def main():
     test_worker_error_forces_restart()
     test_inference_error_recreates_worker()
     test_model_switch_releases_previous_decoder()
+    test_supplied_decoder_context_wins_over_override()
     test_multiple_choices_generation()
     test_completions_endpoint()
     test_metrics_and_health_probes()

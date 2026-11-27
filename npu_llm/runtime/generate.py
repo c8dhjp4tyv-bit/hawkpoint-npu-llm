@@ -191,15 +191,16 @@ class NPUDecoder:
         # It computes the same BF16 results as the chunked layer graphs.
         self._engine = None
         # The chunked decoder graphs hold a head's whole cache in tile memory
-        # and are compiled per context length, so they stay at 64 tokens. Only
-        # the row-split engine can run a longer window.
+        # and are compiled for exactly 64 positions, so their cache buffers
+        # must be that size too. Only the row-split engine can run another
+        # window.
         if (
             self.npu_layers
-            and context_length > 64
+            and context_length != 64
             and os.environ.get("HAWKPOINT_ENGINE", "1") == "0"
         ):
             raise ValueError(
-                "the chunked decoder graphs support 64 tokens; unset "
+                "the chunked decoder graphs need a 64-token context; unset "
                 "HAWKPOINT_ENGINE=0 to use the row-split engine for "
                 f"a {context_length}-token context"
             )
@@ -249,10 +250,10 @@ class NPUDecoder:
             if self.npu_layers == 0
             else None
         )
-        if self.npu_layers and self._engine is None and context_length > 64:
+        if self.npu_layers and self._engine is None and context_length != 64:
             raise ValueError(
-                "the chunked decoder graphs support 64 tokens; this model "
-                "runs them instead of the row-split engine"
+                "the chunked decoder graphs need a 64-token context; this "
+                "model runs them instead of the row-split engine"
             )
         self.kv_cache = {}
         for first, count in (
