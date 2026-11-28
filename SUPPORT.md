@@ -19,7 +19,7 @@ tags through `v0.1.0-rc.9`, so the next candidate from this line is
 | NPU firmware | `1.5.5.391` release-certified; a different firmware is accepted only when it can load and execute the probe | Exact only in `--strict-release` mode |
 | Ollama | `v0.33.3`, commit `b79067b0db7417f20108363bc22adb97f35c966a` | Patched target; hosted port and upstream Go tests required before publication |
 | Ollama benchmark model | `qwen2.5:0.5b`, manifest `sha256:a8b0c51577010a279d933d14c2a8ab4b268079d44c5c8830c0a93900f1827c67` | Exact RC gate |
-| NVIDIA stack | RTX 5060 Laptop, driver `610.43.03`, CUDA UMD `13.3` for the release evidence | Exact in release mode; optional for XDNA-only compatibility |
+| NVIDIA stack | RTX 5060 Laptop, driver `610.57.04`, CUDA UMD `13.3` for the release evidence | Exact in release mode; optional for XDNA-only compatibility |
 | GPU backends | CPU; CUDA v12/v13, ROCm v7.2, Vulkan build options | CPU and CUDA v13 exercised locally; others need reports |
 | Python | CPython 3.12 | CI target |
 | Open WebUI | `v0.11.0`, OCI index `sha256:72c0ba641ba75e7aa52655cb242570906ececd09b1140fb736483038a22b3228` | Pinned tag and digest |
