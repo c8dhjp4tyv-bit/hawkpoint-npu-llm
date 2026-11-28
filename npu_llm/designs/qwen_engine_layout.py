@@ -14,6 +14,8 @@ line up with those slices, so the MLP activation never needs compacting.
 import numpy as np
 from ml_dtypes import bfloat16
 
+from context_window import DEFAULT_CONTEXT_LENGTH, KV_TILE, context_tiles
+
 
 GEMV_TILES = 6
 HIDDEN = 896
@@ -22,7 +24,7 @@ QKV = 1152
 HEAD_DIM = 64
 Q_HEADS = 14
 KV_HEADS = 2
-CONTEXT = 64
+Q_PER_KV = Q_HEADS // KV_HEADS
 SLICE = HIDDEN                   # result slots per tile and round
 VECTOR = GEMV_TILES * SLICE      # joined / broadcast vector
 ROWS = 4                         # projection rows per weight block
@@ -45,7 +47,11 @@ PARAM_GAMMA_IN = 0
 PARAM_GAMMA_POST = HIDDEN
 PARAM_BIAS = 2 * HIDDEN
 
-CACHE_HEAD = 2 * CONTEXT * HEAD_DIM           # keys [64 x 64] then values
+TILE_ELEMENTS = KV_TILE * HEAD_DIM           # one streamed K or V tile
+# The header travels as the first object of the key stream, so it is exactly
+# one tile; the fields below need 1152 slots and the rest stays unused.
+CACHE_HEAD = TILE_ELEMENTS
+STREAM_COPIES = 4           # two key passes, then one key/value pair per tile
 KV_NEW = KV_HEADS * 2 * HEAD_DIM
 # Header object (first cache-stream object): RoPE cos/sin split into three
 # BF16 parts each, the position, and the token's embedding.
@@ -53,6 +59,22 @@ HEADER_COS = 0          # cos hi, mid, lo (3 x 32)
 HEADER_SIN = 96         # sin hi, mid, lo (3 x 32)
 HEADER_POSITION = 192
 HEADER_HIDDEN = 256
+# Softmax bookkeeping the hub keeps across streamed tiles: the running score
+# maximum, the inverse of the summed exponentials, and 16 partial sums per
+# query head. Laid out exactly as the STATE_* constants in
+# kernels/qwen_engine_hub_bf16.cc.
+STATE_SIZE = 32 + 16 * Q_HEADS
+# One tile's normalized weights per query head, as three BF16 parts each.
+WEIGHTS_SIZE = Q_PER_KV * 3 * KV_TILE
+ACC_SIZE = Q_HEADS * HEAD_DIM
+
+# The streamed window is capped by the hub tile's *program* memory, not by its
+# data memory: attention scores every cached position three times (maximum,
+# summed exponentials, weighted values) and also carries the current token's
+# own bookkeeping, which fills 16 KB of instructions at four 128-position
+# tiles. The SmolLM engine's hub is smaller and streams the full 8K.
+MAX_CONTEXT_TILES = 4
+MAX_CONTEXT_LENGTH = KV_TILE * MAX_CONTEXT_TILES
 
 SUPPORTED = {
     "hidden_size": HIDDEN,
@@ -60,7 +82,6 @@ SUPPORTED = {
     "attention_heads": Q_HEADS,
     "kv_heads": KV_HEADS,
     "head_dim": HEAD_DIM,
-    "context_length": CONTEXT,
     "model_family": "qwen2",
     "vocab_size": VOCAB,
 }
@@ -72,7 +93,14 @@ assert sum(LM_GROUPS) * LM_GROUP == VOCAB
 
 
 def supports(metadata):
-    return all(metadata.get(key) == value for key, value in SUPPORTED.items())
+    if not all(metadata.get(key) == value for key, value in SUPPORTED.items()):
+        return False
+    context_length = metadata.get("context_length", DEFAULT_CONTEXT_LENGTH)
+    return (
+        isinstance(context_length, int)
+        and not isinstance(context_length, bool)
+        and 1 <= context_length <= MAX_CONTEXT_LENGTH
+    )
 
 
 def layer_blocks(tile):
@@ -108,8 +136,15 @@ def tile_offsets(layers):
     return offsets, total
 
 
-def cache_elements(layers):
-    return (1 + KV_HEADS * layers) * CACHE_HEAD
+def cache_elements(layers, context_length=DEFAULT_CONTEXT_LENGTH):
+    """Slots of the cache stream: the header, then ``STREAM_COPIES`` regions.
+
+    Keys are stored three times because attention reads them once per pass and
+    a single DMA pattern cannot loop back; the copies make the whole key
+    stream one contiguous walk and leave the hub two input channels.
+    """
+    tiles = KV_HEADS * layers * context_tiles(context_length)
+    return CACHE_HEAD + STREAM_COPIES * tiles * TILE_ELEMENTS
 
 
 def down_padded(down):

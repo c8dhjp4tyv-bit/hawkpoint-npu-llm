@@ -70,16 +70,17 @@ Validated on a Hawk Point XDNA1 NPU (`RyzenAI-npu1`, AIE2, 4 columns):
 |---|---:|
 | CPU/BF16 reference first-token argmax | 198 |
 | NPU first-token argmax | 198 |
-| Native 16-token decode, 5-run median | 74.61 token/s |
-| Individual runs | 73.17–75.83 token/s |
-| TTFT, 35-token prompt | 0.28–0.29 s |
+| Native 16-token decode, 5-run median | 62.50 token/s |
+| Individual runs | 56.09–64.44 token/s |
+| TTFT, 35-token prompt | 0.30 s |
 | TTFT, repeated prompt with `--prefix-cache` | 0.014 s |
-| NPU time per token (all 30 layers, one dispatch) | 7.6–8.9 ms |
+| NPU time per token (all 30 layers, one dispatch) | 10.0 ms |
 | CPU LM head per token | about 5 ms |
 | Warmup (engine compile cached) | 5.1 s |
 | Peak host RAM during the benchmark | 354 MiB |
 | Quick soak / model-switch stress | 100/100 completions, 100 switches, 0 NPU errors |
-| Fixed hardware context | 64 tokens |
+| Context window | 8192 tokens, streamed in 128-token slices |
+| Context the window grows through | 128, 512, 2048, 8192 tokens |
 
 The chunked layer graphs (`HAWKPOINT_ENGINE=0`) measured 17.1 token/s with
 1.71–1.81 s TTFT on the same machine and benchmark.
@@ -96,6 +97,13 @@ LM head:
 
 Each Qwen token reads about 1 GB of BF16 weights (24 layers plus the
 151,936-row LM head), so the engine is bound by weight streaming.
+
+The Qwen engine streams the same way, but its hub tile is the constraint: three
+passes over the cache plus the current token's own softmax bookkeeping fill the
+tile's 16 KB of *program* memory at four 128-token slices (512 positions), and
+the streaming window is compiled per slice count. Qwen therefore tops out at
+512 positions; asking for more fails with an explicit error instead of an aiecc
+program-memory overflow. The SmolLM hub fits the full 8192-token window.
 
 The acceptance prompt generated:
 
@@ -162,7 +170,7 @@ analysis](docs/PERFORMANCE-ANALYSIS.md).
 - AIE2 C++ kernels and IRON graph definitions
 
 Conversation history is retained by the client. When it no longer fits the
-64-token hardware context, the host keeps the newest message whole for as long
+8192-token hardware context, the host keeps the newest message whole for as long
 as possible: it drops whole older turns first, then shortens the system prompt
 from its end (dropping it if not even its first word fits), and only then
 removes the oldest characters of the newest message. The chat template's
@@ -824,7 +832,9 @@ products.
 
 `HAWKPOINT_ENGINE=0` switches both models back to the chunked layer graphs
 described below, which also run hybrid NPU/CPU placements and the opt-in W8
-decoder. The engine's projections, norms, and final RMSNorm compute the same
+decoder. Those graphs hold a head's whole cache in tile memory and are built
+for 64 positions, so pair the switch with `HAWKPOINT_CONTEXT=64` (the decoder
+rejects a longer context rather than running it wrongly). The engine's projections, norms, and final RMSNorm compute the same
 BF16 values as the chunked path; its attention softmax runs on the vector unit
 with a lookup-table exponential, so a few near-tie tokens can differ. See the
 [performance analysis](docs/PERFORMANCE-ANALYSIS.md) for the measurements and
@@ -836,7 +846,7 @@ With the chunked layer graphs, each generated token follows this path:
 2. Run SmolLM decoder layers in persistent two-layer graph chunks (the Phoenix
    firmware reliably completes this chunk size); Qwen uses its own two-layer
    BF16 program.
-3. Keep the 64-token K/V cache in NPU-addressable XRT buffers.
+3. Keep the 64-position K/V cache in NPU-addressable XRT buffers.
 4. Apply final RMSNorm and the model-specific LM head. SmolLM keeps the
    49k-vocabulary projection on host BLAS by default because it is faster on
    Hawk Point; set `HAWKPOINT_NPU_LM_HEAD=1` to force the NPU path.
@@ -862,13 +872,26 @@ statistics. The benchmark reports whether the measured median reaches the
 
 ### Hardware
 
-- **Fixed 64-token context window**: The KV cache is allocated as NPU/XRT
-  buffer objects sized for 64 positions (`2 × 4096 BF16 per KV head`).
-  This limit is currently hard-coded in the IRON graph and kernel definitions;
-  it is not imposed by the physical tile memory itself. Extending it would
-  require rebalancing the weight stream and cache buffer layout across the
-  AIE tiles and recompiling the xclbin. Prompts longer than 64 tokens are
-  shortened by the host at turn boundaries.
+- **Qwen2.5 0.5B streams at most 512 positions.** The hub tile scores every
+  cached position three times (maximum, summed exponentials, weighted values)
+  and carries the current token's bookkeeping too; at four 128-token slices
+  those kernels plus the core's tile loops fill all 16 KB of hub program
+  memory, and the window is compiled per slice count. The SmolLM hub is small
+  enough to hold the 8192-token version. Going past 512 on Qwen needs a
+  different attention decomposition (a second hub core, or a cache staged
+  through the MemTile), not a bigger buffer.
+- **8192-token context window, streamed per token**: The cache stream for 8192
+  positions (`4 × 8192 × 3 KV heads × 64 dim` BF16 per layer — two key copies
+  plus a key/value pair per position — about 360 MiB over 30 layers) lives in
+  one NPU-addressable XRT buffer; only one 128-token slice of it fits in tile
+  memory at a time, so the hub tile reads the cache as a DDR stream, four
+  objects per (layer, KV head, slice): two key passes and one key/value pair
+  for each. The DMA window grows with the sequence through 128, 512, 2048 and
+  8192 tokens, and a dispatch streams the whole window, so decode slows from
+  about 10 ms to about 80 ms per token as the window grows. The chunked layer
+  graphs (`HAWKPOINT_ENGINE=0`) still target 64 positions and refuse longer
+  prompts; because a converted model now declares 8192, pair the fallback with
+  `HAWKPOINT_CONTEXT=64`, e.g. `HAWKPOINT_ENGINE=0 HAWKPOINT_CONTEXT=64`.
 - **Padlocked to XDNA1 (`npu1`, AIE2, 4 columns).** XDNA2 silicon (`npu2`,
   AIE2P: Strix Point, Strix Halo — 8 columns, larger local memory, shared
   caches) is not targeted. The IRON graph layouts, tile counts, and ObjectFifo

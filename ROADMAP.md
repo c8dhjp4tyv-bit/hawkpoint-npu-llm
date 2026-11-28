@@ -90,4 +90,4 @@ XDNA1's 4), new shared L2 buffer, and next-gen DMA. The current IRON graphs hard
 - Training / fine-tuning on NPU
 - CUDA / ROCm / oneAPI NPU delegates
 - Windows or macOS support
-- LLM evaluation bench (MMLU, HumanEval) — 64-token context insufficient
+- LLM evaluation bench (MMLU, HumanEval) — 8192-token context reaches only a few dozen questions per run

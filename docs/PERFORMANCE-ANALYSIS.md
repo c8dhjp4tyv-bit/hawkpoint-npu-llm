@@ -26,7 +26,8 @@ decoder engine described below. They remain the reference for
 | Historical decoder-step median before accounting fix | 18.42 token/s |
 | Native W8 TTFT, 35-token prompt | 1.47–1.62 s session medians |
 | End-to-end TTFT for acceptance prompt | 2.56 s |
-| Fixed hardware context | 64 tokens |
+| Context window (row-split decoder engine) | 8192 tokens |
+| Context window (chunked graphs, including W8) | 64 tokens |
 
 For the 32-token streaming measurement, 15.93 token/s corresponds to about
 63 ms/token. The native benchmark can now be run with
@@ -168,8 +169,9 @@ fixed-length copy and elementwise loop, so no such hardware loop is emitted.
 | TTFT | 1.71–1.81 s | 0.28–0.29 s |
 | NPU time per token | about 50 ms | 7.6–8.9 ms |
 
-The remaining per-token cost is about 8 ms of NPU time and about 5 ms of CPU
-LM head (a 49152 x 576 FP32 matrix-vector product). A quick soak of 100
+The remaining per-token cost is about 10 ms of NPU time and about 5 ms of CPU
+LM head (a 49152 x 576 FP32 matrix-vector product) at a 35-token prompt; the
+NPU time grows with the streamed context window (see below). A quick soak of 100
 completions and a 100-switch model-switch stress test through the API ran
 without NPU errors.
 
@@ -232,6 +234,70 @@ streaming limit.
   out of line.
 * With llvm-aie `21.0.0.2026072001`, an out-of-line helper that takes two FP32
   vectors by value returns wrong results; those helpers stay inline.
+
+## Streaming an 8192-Token Context
+
+Both engines keep the K/V cache in DDR and stream it to the hub tile, one
+128-token slice at a time, because a whole head's cache stops fitting in tile
+memory after a few hundred positions. The hub only ever holds one slice plus
+the softmax bookkeeping (a running maximum, the summed exponentials, 16
+partial sums per query head, and one slice of weights), so the slice size and
+the context are independent of the tile data memory.
+
+Attention needs three passes over the keys: the maximum, the sum of the
+exponentials, and the weighted values. Two DMA input channels per tile cannot
+hold "keys of pass 1", "keys of pass 2" and "key/value pairs" open at the
+same time, so each (layer, KV head) slice is streamed as four objects and the
+whole cache is one contiguous walk: two copies of the keys, then key/value
+pairs. The host writes every new key into both copies, which costs 360 MiB of
+cache for 8192 positions: `4 × 8192 × 3 KV heads × 64 dim` BF16 per layer
+(4 × 8192 × 192 × 2 bytes = 12.6 MB) over 30 layers.
+
+Because the stream layout is fixed when the graph is compiled, the window is
+dispatched in steps of 128, 512, 2048 and 8192 tokens: the host reallocates
+the cache buffer at each step and copies the rows cached so far into the wider
+layout. A 2100-token run through the 1 → 4, 4 → 16 and 16 → 64 steps,
+compared against a run that always streams the full window, produced
+identical hidden states at every position checked and identical top-1 tokens
+for all 2100.
+
+Measured on the SmolLM2 135M engine:
+
+| Window | NPU time per token |
+|---|---:|
+| 128 tokens (35-token prompt) | 10.0 ms |
+| 8192 tokens (full window) | about 80 ms |
+
+The 80 ms figure is the DMA floor for the design: a dispatch streams 368 MB
+(four objects per slice, 64 slices, 30 layers, 3 KV heads, 16 KB per object)
+at the measured 4.8 GB/s. Short prompts do not pay it because the window is
+still small.
+
+`npu_llm/tests/validate_engine_npu.py` still compares the engine against the
+chunked graphs, so it passes `context_length=64`: the chunked path remains a
+64-position implementation.
+
+### Why the Qwen engine stops at 512 positions
+
+The Qwen2.5 hub runs the same three passes, but each one covers seven query
+heads instead of three and also carries the current token's own score,
+exponential and weighted value. Those kernels plus the core's tile loops fill
+the hub's 16 KB of program memory at four 128-token slices; a fifth slice does
+not link. This is a code-size limit, not a data limit: the cache, the joined
+vector and the broadcast vector all still fit in tile data memory.
+
+The kernels were merged to get that far (the score-and-exponential loop is one
+out-of-line function used by both the sums and the weights pass, the current
+token's sums and the inverse of its total are one kernel, the values pass
+shares the tile pass's accumulation, and the BF16 rounding is one function),
+and the hub is compiled with `-Os`. At `-O2` even a one-slice graph overflows;
+`-Oz` builds but miscompiles the FP32 emulation into NaNs, which is why the
+engine is capped by an explicit check instead of a smaller object.
+
+What was measured on the Qwen engine at 512 positions: a 480-token run through
+the 1 → 4 slice step compared against a run that always streams four slices
+produced bit-identical logits at every position, and the 32-token CPU BF16
+reference gate still agrees 32/32.
 
 ## Static Decoder Projection Arithmetic
 

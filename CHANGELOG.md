@@ -1,5 +1,18 @@
 # Changelog
 
+- Raise the hardware context from a fixed 64 tokens to 8192. The decoder engine
+  now streams the K/V cache from DDR in 128-token slices and keeps only one
+  slice plus the softmax bookkeeping in tile memory; attention makes three
+  passes over the streamed keys (maximum, summed exponentials, weighted
+  values), which leaves the 64-token arithmetic unchanged. The streamed window
+  grows through 128, 512, 2048 and 8192 tokens, so short prompts keep their
+  per-token cost. Context length comes from the decoder argument,
+  `HAWKPOINT_CONTEXT`, or the converted model's declaration, up to 8192; the
+  chunked layer graphs (`HAWKPOINT_ENGINE=0`) remain a 64-position path. The
+  Qwen2.5 engine streams the same way but its hub tile's program memory caps
+  the window at 512 positions, and it now says so instead of failing the
+  build; its attention kernels were also merged and shared to fit in 16 KB.
+
 - Add OpenAI-compatible `logit_bias` support to the sampling runtime, both
   completion endpoints, and the terminal chat (`--logit-bias TOKEN=BIAS`): a
   per-token additive bias in `-100`–`100` (at most 1024 entries) applied after

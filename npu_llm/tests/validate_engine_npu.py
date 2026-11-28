@@ -35,7 +35,7 @@ def reference_sequences(model_dir, tokens):
     from runtime.generate import NPUDecoder
 
     os.environ["HAWKPOINT_ENGINE"] = "0"
-    cpu = NPUDecoder(model_dir, npu_layers=0)
+    cpu = NPUDecoder(model_dir, npu_layers=0, context_length=64)
     sequences, references = [], []
     for prompt in PROMPTS:
         ids = cpu.tokenizer.encode_chat([{"role": "user", "content": prompt}])
@@ -67,7 +67,9 @@ def agreement(model_dir, engine, sequences, references):
     from runtime.generate import NPUDecoder
 
     os.environ["HAWKPOINT_ENGINE"] = "1" if engine else "0"
-    decoder = NPUDecoder(model_dir)
+    # 64 positions: the chunked graphs are a 64-token implementation, and the
+    # sequences below are at most that long.
+    decoder = NPUDecoder(model_dir, context_length=64)
     if (decoder._engine is not None) != engine:
         raise AssertionError(f"engine={engine} was not selected for {model_dir}")
     decoder.warmup()

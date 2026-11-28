@@ -31,6 +31,11 @@ except ImportError:
 
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
+from context_window import (  # noqa: E402
+    DEFAULT_CONTEXT_LENGTH,
+    resolve_context_length,
+    validate_context_length,
+)
 from runtime.sampling import GREEDY, SamplingParams  # noqa: E402
 from runtime.stopping import normalize_logprobs, normalize_stop  # noqa: E402
 
@@ -589,8 +594,23 @@ class CompletionEngine:
         return model_id in self.models
 
     def context_length(self, model_id):
-        """Return the configured model context length, defaulting to 64."""
-        return int(self.models[model_id].get("context_length", 64))
+        """Return the context this model would actually decode with.
+
+        ``HAWKPOINT_CONTEXT`` overrides the model's declaration inside the
+        decoder, so the per-request token limit has to apply the same rule;
+        otherwise a shorter override passes validation here and fails later.
+        A decoder supplied ready-made already settled its context.
+        """
+        record = self.models[model_id]
+        if "decoder" in record:
+            return int(record["decoder"].context_length)
+        declared = record.get("context_length", DEFAULT_CONTEXT_LENGTH)
+        try:
+            return resolve_context_length(declared)
+        except (TypeError, ValueError):
+            # An unusable override fails the decoder loudly when it loads; the
+            # token limit falls back to what the model itself declares.
+            return validate_context_length(int(declared))
 
     def _close_active(self):
         """Deterministically release the currently loaded decoder, if any.
@@ -755,8 +775,14 @@ class ProcessCompletionEngine:
         return model_id in self.models
 
     def context_length(self, model_id):
-        """Return the configured model context length, defaulting to 64."""
-        return int(self.models[model_id].get("context_length", 64))
+        """Return the context this model would actually decode with."""
+        declared = self.models[model_id].get(
+            "context_length", DEFAULT_CONTEXT_LENGTH
+        )
+        try:
+            return resolve_context_length(declared)
+        except (TypeError, ValueError):
+            return validate_context_length(int(declared))
 
     @property
     def ready(self):
@@ -940,6 +966,17 @@ class NPUDecoderFactory:
         if self.npu_percent is not None:
             selected = round(layers * self.npu_percent / 100.0)
         return NPUDecoder(path, npu_layers=selected)
+
+
+def _declared_context_length(model_dir):
+    """Context a converted model declares, or the runtime default."""
+    try:
+        metadata = json.loads((Path(model_dir) / "metadata.json").read_text())
+        return validate_context_length(
+            int(metadata.get("context_length", DEFAULT_CONTEXT_LENGTH))
+        )
+    except (OSError, TypeError, ValueError, json.JSONDecodeError):
+        return DEFAULT_CONTEXT_LENGTH
 
 
 def make_handler(engine, config=None, metrics=None):
@@ -1883,7 +1920,7 @@ def main():
             DEFAULT_MODEL_ID: {
                 "path": args.model,
                 "display_name": DEFAULT_MODEL_ID,
-                "context_length": 64,
+                "context_length": _declared_context_length(args.model),
             }
         }
     else:

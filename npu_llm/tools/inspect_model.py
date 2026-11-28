@@ -13,6 +13,11 @@ import sys
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 
+from npu_llm.context_window import (  # noqa: E402
+    DEFAULT_CONTEXT_LENGTH,
+    MAX_CONTEXT_LENGTH,
+)
+
 
 def compute_parameter_breakdown(metadata: dict) -> dict:
     """Calculate exact parameter counts for each sub-block of the transformer."""
@@ -169,7 +174,7 @@ def inspect_model(model_dir: Path, verify_checksums: bool = False) -> dict:
 
     # Hardware & Performance Estimates on XDNA1 (4 columns AIE2)
     # AIE2 core clock: ~1.0 - 1.3 GHz. 4 columns * 4 tiles = 16 compute tiles.
-    context_length = int(manifest.get("context_length", 64))
+    context_length = int(manifest.get("context_length", DEFAULT_CONTEXT_LENGTH))
     layers = int(manifest.get("layers", 30))
     hidden = int(manifest.get("hidden_size", 576))
 
@@ -204,7 +209,8 @@ def inspect_model(model_dir: Path, verify_checksums: bool = False) -> dict:
             "kv_cache_kib": round(kv_cache_kib, 2),
             "weights_size_mib": params["estimated_weights_mib"],
             "streaming_bandwidth_gbps_at_75_tps": round(bandwidth_gb_at_75_tps, 2),
-            "xdna1_supported": context_length <= 64 and (hidden % 64 == 0),
+            "xdna1_supported": context_length <= MAX_CONTEXT_LENGTH
+            and (hidden % 64 == 0),
         },
         "integrity": file_check,
     }
