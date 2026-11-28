@@ -177,6 +177,7 @@ jobs:
             --tag "$ollama_tag" \
             --backend "$backend" \
             --jobs 8 \
+            --rebuild-runtime \
             --build-root "$RUNNER_TEMP/ollama-release-build" \
             --no-install
           python tests/benchmark_ollama_matrix.py \
