@@ -25,6 +25,10 @@ PROMPT = [
         ),
     }
 ]
+# The pinned token sequence was generated when the context was 64 positions, so
+# the prompt was cut to its newest 64 - count tokens. Keep that window fixed so
+# the reference does not move whenever the model's context grows.
+REFERENCE_CONTEXT = 64
 EXPECTED_CPU_BF16_TOKENS = [
     785,
     12884,
@@ -66,7 +70,7 @@ def sequence(model_dir, npu_layers, count):
     if npu_layers:
         decoder.warmup()
     prompt_ids = decoder.tokenizer.encode_chat(PROMPT)
-    prompt_ids = prompt_ids[-(decoder.context_length - count) :]
+    prompt_ids = prompt_ids[-(REFERENCE_CONTEXT - count) :]
     next_token = None
     timings = []
     position = 0
